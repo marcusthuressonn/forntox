@@ -59,7 +59,7 @@ function Hero() {
   return (
     <section className="relative overflow-hidden" style={{ background: "var(--gradient-hero)" }}>
       <div className="mx-auto max-w-[1200px] px-6 pt-20 pb-24 md:pt-32 md:pb-36">
-        <div className="grid md:grid-cols-12 gap-10 lg:gap-14 items-end">
+        <div className="grid md:grid-cols-12 gap-10 lg:gap-14 items-start">
           <div className="md:col-span-7">
             <p className="text-[12px] uppercase tracking-[0.18em] text-muted-foreground">
               För småföretagare som bokför själva
@@ -176,7 +176,7 @@ function HeroMockup() {
           <span className="text-[11px] text-muted-foreground tabular-nums">#2041</span>
         </div>
 
-        <div className="p-5 space-y-4">
+        <div className="p-5 space-y-4 min-h-[420px]">
           <div className="rounded-xl border border-border/70 p-4 bg-background/40">
             <div className="flex items-center gap-3">
               <div className="relative h-12 w-10 rounded-md border border-border overflow-hidden bg-paper text-paper-foreground shrink-0 transition">
@@ -210,8 +210,8 @@ function HeroMockup() {
             <label className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
               Beskrivning
             </label>
-            <div className="mt-1.5 flex items-center gap-2 rounded-lg border border-border bg-background/40 px-3 py-2.5 text-[14px]">
-              <span className="truncate">{typed}</span>
+            <div className="mt-1.5 flex items-center gap-2 rounded-lg border border-border bg-background/40 px-3 py-2.5 text-[14px] h-[42px]">
+              <span className="truncate">{typed || " "}</span>
               <span className="inline-block h-4 w-[2px] bg-foreground/70 animate-[blink_1s_steps(1)_infinite]" />
             </div>
           </div>
@@ -222,7 +222,7 @@ function HeroMockup() {
             </label>
             <div
               className={
-                "mt-1.5 flex items-center justify-between gap-2 rounded-lg border px-3 py-2.5 text-[14px] transition " +
+                "mt-1.5 flex items-center justify-between gap-2 rounded-lg border px-3 py-2.5 text-[14px] h-[42px] transition " +
                 (step >= 4
                   ? "border-primary/60 bg-primary/10"
                   : step >= 2
@@ -230,7 +230,7 @@ function HeroMockup() {
                     : "border-border bg-background/40")
               }
             >
-              <span className={step < 2 ? "text-muted-foreground" : ""}>
+              <span className={"truncate " + (step < 2 ? "text-muted-foreground" : "")}>
                 {step >= 4 ? "5811 — Representation, avdragsgill" : step >= 2 ? "Osäker — be om hjälp?" : "Välj konto…"}
               </span>
               {step === 2 && (
@@ -242,8 +242,8 @@ function HeroMockup() {
 
           <div
             className={
-              "rounded-xl border border-border/70 p-3.5 bg-background/40 flex items-start gap-3 transition-all duration-500 " +
-              (step >= 3 ? "opacity-100 translate-y-0" : "opacity-0 translate-y-2 pointer-events-none")
+              "rounded-xl border border-border/70 p-3.5 bg-background/40 flex items-start gap-3 transition-opacity duration-500 " +
+              (step >= 3 ? "opacity-100" : "opacity-0 pointer-events-none")
             }
           >
             <div className="h-8 w-8 rounded-full bg-primary text-primary-foreground grid place-items-center font-display text-sm shrink-0">
@@ -262,8 +262,8 @@ function HeroMockup() {
             </div>
           </div>
 
-          <div className="flex items-center justify-between pt-1">
-            <div className="flex items-center gap-2 text-[12px]">
+          <div className="flex items-center justify-between pt-1 h-9">
+            <div className="flex items-center gap-2 text-[12px] whitespace-nowrap">
               {step >= 5 ? (
                 <>
                   <span className="h-2 w-2 rounded-full bg-primary animate-pulse" />

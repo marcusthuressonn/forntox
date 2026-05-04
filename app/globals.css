@@ -15,8 +15,8 @@
   --popover: oklch(0.97 0.020 95);
   --popover-foreground: oklch(0.20 0.03 160);
 
-  --primary: oklch(0.88 0.18 118);                        /* lime */
-  --primary-foreground: oklch(0.18 0.03 160);             /* dark forest */
+  --primary: oklch(0.55 0.17 118);                        /* deep lime (AA on white) */
+  --primary-foreground: oklch(0.98 0.015 95);             /* cream */
 
   --secondary: oklch(0.90 0.020 130);                     /* pale sage */
   --secondary-foreground: oklch(0.24 0.030 160);
@@ -32,7 +32,7 @@
 
   --border: oklch(0.85 0.018 130);
   --input: oklch(0.85 0.018 130);
-  --ring: oklch(0.88 0.18 118);                           /* lime */
+  --ring: oklch(0.55 0.17 118);                           /* deep lime */
 
   /* Radius */
   --radius: 1rem;
