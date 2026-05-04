@@ -44,6 +44,17 @@
 
   --warm-accent: hsl(38 45% 52%);
 
+  /* Lovable landing-page tokens */
+  --primary-soft: oklch(0.94 0.04 150);
+  --accent-cta: oklch(0.88 0.18 118);
+  --accent-cta-foreground: oklch(0.18 0.03 160);
+  --paper: oklch(0.94 0.025 95);
+  --paper-foreground: oklch(0.20 0.03 160);
+  --gradient-hero: radial-gradient(1200px 600px at 80% -10%, oklch(0.88 0.18 118 / 0.18), transparent 60%), linear-gradient(180deg, oklch(0.985 0.012 95) 0%, oklch(0.97 0.012 95) 100%);
+  --gradient-soft: linear-gradient(180deg, oklch(0.97 0.012 95), oklch(0.94 0.025 95));
+  --shadow-soft: 0 1px 2px oklch(0 0 0 / 0.06), 0 8px 30px oklch(0 0 0 / 0.05);
+  --shadow-card: 0 1px 0 oklch(0 0 0 / 0.04), 0 30px 60px -25px oklch(0 0 0 / 0.18);
+
   /* Chart colors */
   --chart-1: oklch(0.869 0.005 56.366);
   --chart-2: oklch(0.553 0.013 58.071);
@@ -117,6 +128,17 @@
 
   --warm-accent: hsl(38 42% 58%);
 
+  /* Lovable landing-page tokens (dark forest palette) */
+  --primary-soft: oklch(0.32 0.05 160);
+  --accent-cta: oklch(0.88 0.18 118);
+  --accent-cta-foreground: oklch(0.18 0.03 160);
+  --paper: oklch(0.94 0.025 95);
+  --paper-foreground: oklch(0.20 0.03 160);
+  --gradient-hero: radial-gradient(1200px 600px at 80% -10%, oklch(0.32 0.05 145 / 0.7), transparent 60%), linear-gradient(180deg, oklch(0.22 0.025 160) 0%, oklch(0.20 0.025 160) 100%);
+  --gradient-soft: linear-gradient(180deg, oklch(0.24 0.028 160), oklch(0.22 0.025 160));
+  --shadow-soft: 0 1px 2px oklch(0 0 0 / 0.2), 0 8px 30px oklch(0 0 0 / 0.18);
+  --shadow-card: 0 1px 0 oklch(0 0 0 / 0.2), 0 30px 60px -25px oklch(0 0 0 / 0.5);
+
   --chart-1: oklch(0.869 0.005 56.366);
   --chart-2: oklch(0.553 0.013 58.071);
   --chart-3: oklch(0.444 0.011 73.639);
@@ -161,6 +183,11 @@
   --color-warning: var(--warning);
   --color-warning-foreground: var(--warning-foreground);
   --color-warm-accent: var(--warm-accent);
+  --color-primary-soft: var(--primary-soft);
+  --color-accent-cta: var(--accent-cta);
+  --color-accent-cta-foreground: var(--accent-cta-foreground);
+  --color-paper: var(--paper);
+  --color-paper-foreground: var(--paper-foreground);
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
   --color-chart-3: var(--chart-3);
@@ -168,7 +195,7 @@
   --radius-lg: var(--radius);
   --radius-md: calc(var(--radius) - 2px);
   --radius-sm: calc(var(--radius) - 4px);
-  --font-sans: var(--font-body);
+  --font-sans: var(--font-inter-tight), Inter, system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), monospace;
   --font-serif: var(--font-display);
   --color-sidebar-ring: var(--sidebar-ring);
@@ -276,6 +303,17 @@
 @keyframes gentlePulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }
+}
+
+@keyframes scanline {
+  0%   { top: 0; opacity: 0.9; }
+  50%  { top: calc(100% - 2px); opacity: 1; }
+  100% { top: 0; opacity: 0.9; }
+}
+
+@keyframes blink {
+  0%, 50%   { opacity: 1; }
+  51%, 100% { opacity: 0; }
 }
 
 /* Staggered entrance animation */

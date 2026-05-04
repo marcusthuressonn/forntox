@@ -70,6 +70,12 @@ export async function updateSession(request: NextRequest) {
     return supabaseResponse
   }
 
+  // Public marketing route — accessible to everyone, signed in or not.
+  // Authed users are not redirected away; they can browse it like any visitor.
+  if (pathname === '/landing' || pathname.startsWith('/landing/')) {
+    return supabaseResponse
+  }
+
   // Public auth routes — allow access
   if (
     pathname.startsWith('/login') ||
