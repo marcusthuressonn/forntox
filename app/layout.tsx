@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Geist, Geist_Mono, Figtree } from "next/font/google";
 import { Fraunces } from "next/font/google";
 import Script from "next/script";
 import { Toaster } from "@/components/ui/toaster";
@@ -20,6 +20,11 @@ const fraunces = Fraunces({
   variable: "--font-fraunces",
   subsets: ["latin"],
   display: "swap",
+});
+
+const figtree = Figtree({
+  variable: "--font-figtree",
+  subsets: ["latin"],
 });
 
 export const metadata: Metadata = {
@@ -46,7 +51,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="sv" translate="no" suppressHydrationWarning className={`${geistSans.variable} ${geistMono.variable} ${fraunces.variable}`}>
+    <html lang="sv" translate="no" suppressHydrationWarning className={`${geistSans.variable} ${geistMono.variable} ${fraunces.variable} ${figtree.variable}`}>
       <head>
         <meta name="google" content="notranslate" />
         <link rel="apple-touch-icon" href="/icons/icon-192.png" />

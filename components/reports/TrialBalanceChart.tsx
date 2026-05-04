@@ -58,7 +58,7 @@ export function TrialBalanceChart({ rows }: TrialBalanceChartProps) {
               {chartData.map((entry) => (
                 <Cell
                   key={entry.account}
-                  fill={entry.net >= 0 ? 'hsl(var(--chart-1))' : 'hsl(var(--chart-2))'}
+                  fill={entry.net >= 0 ? 'var(--chart-1)' : 'var(--chart-2)'}
                 />
               ))}
             </Bar>

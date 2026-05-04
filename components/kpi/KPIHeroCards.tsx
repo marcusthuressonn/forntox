@@ -69,14 +69,14 @@ function getValueColor(
   if (colorLogic === 'neutral') return ''
   if (colorLogic === 'positive-good') {
     return value >= 0
-      ? 'text-[hsl(var(--chart-1))]'
-      : 'text-[hsl(var(--chart-2))]'
+      ? 'text-chart-1'
+      : 'text-chart-2'
   }
   // negative-good (e.g. VAT: negative = refund = good, expense ratio: lower = better)
   if (colorLogic === 'negative-good') {
     return value <= 0
-      ? 'text-[hsl(var(--chart-1))]'
-      : 'text-[hsl(var(--chart-2))]'
+      ? 'text-chart-1'
+      : 'text-chart-2'
   }
   return ''
 }

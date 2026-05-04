@@ -52,8 +52,8 @@ export function KPITrendChart({ months }: KPITrendChartProps) {
               contentStyle={{
                 fontSize: '12px',
                 borderRadius: '8px',
-                border: '1px solid hsl(var(--border))',
-                backgroundColor: 'hsl(var(--card))',
+                border: '1px solid var(--border)',
+                backgroundColor: 'var(--card)',
               }}
             />
             <Legend
@@ -68,23 +68,23 @@ export function KPITrendChart({ months }: KPITrendChartProps) {
             <Area
               type="monotone"
               dataKey="income"
-              fill="hsl(var(--chart-1))"
+              fill="var(--chart-1)"
               fillOpacity={0.15}
-              stroke="hsl(var(--chart-1))"
+              stroke="var(--chart-1)"
               strokeWidth={1.5}
             />
             <Area
               type="monotone"
               dataKey="expenses"
-              fill="hsl(var(--chart-2))"
+              fill="var(--chart-2)"
               fillOpacity={0.15}
-              stroke="hsl(var(--chart-2))"
+              stroke="var(--chart-2)"
               strokeWidth={1.5}
             />
             <Line
               type="monotone"
               dataKey="net"
-              stroke="hsl(var(--chart-3))"
+              stroke="var(--chart-3)"
               strokeWidth={2}
               dot={false}
             />

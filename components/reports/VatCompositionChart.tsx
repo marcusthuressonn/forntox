@@ -11,13 +11,13 @@ interface VatCompositionChartProps {
 }
 
 const COLORS = [
-  'hsl(var(--chart-1))',
-  'hsl(var(--chart-2))',
-  'hsl(var(--chart-3))',
-  'hsl(var(--chart-4))',
-  'hsl(var(--chart-1) / 0.6)',
-  'hsl(var(--chart-2) / 0.6)',
-  'hsl(var(--chart-3) / 0.6)',
+  'var(--chart-1)',
+  'var(--chart-2)',
+  'var(--chart-3)',
+  'var(--chart-4)',
+  'color-mix(in srgb, var(--chart-1) 60%, transparent)',
+  'color-mix(in srgb, var(--chart-2) 60%, transparent)',
+  'color-mix(in srgb, var(--chart-3) 60%, transparent)',
 ]
 
 export function VatCompositionChart({ rutor }: VatCompositionChartProps) {

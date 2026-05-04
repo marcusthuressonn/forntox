@@ -42,8 +42,8 @@ export function IncomeExpenseChart({ months }: IncomeExpenseChartProps) {
             <Legend
               formatter={(value) => (value === 'income' ? 'Intäkter' : 'Kostnader')}
             />
-            <Bar dataKey="income" fill="hsl(var(--chart-1))" radius={[4, 4, 0, 0]} />
-            <Bar dataKey="expenses" fill="hsl(var(--chart-2))" radius={[4, 4, 0, 0]} />
+            <Bar dataKey="income" fill="var(--chart-1)" radius={[4, 4, 0, 0]} />
+            <Bar dataKey="expenses" fill="var(--chart-2)" radius={[4, 4, 0, 0]} />
           </BarChart>
         </ResponsiveContainer>
       </CardContent>
