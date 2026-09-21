@@ -1,4 +1,6 @@
 import { Document, Page, Text, View, StyleSheet } from '@react-pdf/renderer'
+import { pdfNumberText, pdfText } from '@/lib/pdf/number-text'
+import { getBranding } from '@/lib/branding/service'
 
 /**
  * Pay slip PDF template (Lönespecifikation).
@@ -10,7 +12,7 @@ import { Document, Page, Text, View, StyleSheet } from '@react-pdf/renderer'
  * - Company + employee identification
  * - Line items (salary, absence, benefits, deductions)
  * - Gross → Tax → Net summary with tax table reference
- * - Employer cost breakdown (avgifter, vacation accrual) — transparency feature
+ * - Employer cost breakdown (avgifter, vacation accrual): transparency feature
  * - YTD totals (cumulative year-to-date)
  * - Calculation breakdown (optional detail showing every formula step)
  */
@@ -202,13 +204,15 @@ export interface PayslipData {
 
   // Employee
   employeeName: string
-  personnummerMasked: string // XXXXXXXX-XXXX
+  personnummerMasked: string // YYYYMMDD-XXXX
   employmentType: string
 
   // Period
   periodYear: number
   periodMonth: number
   paymentDate: string
+  /** Avvikelseperiod "YYYY-MM-DD - YYYY-MM-DD" when it is not the pay month itself. */
+  deviationPeriodLabel?: string | null
 
   // Line items
   lineItems: PayslipLineItem[]
@@ -226,10 +230,11 @@ export interface PayslipData {
   vacationAccrualAvgifter: number
   totalEmployerCost: number
 
-  // YTD
+  // YTD. ytdNet is null when the cutover opening balance had no historical
+  // net: the accumulator then prints "Underlag saknas" instead of a false 0.
   ytdGross: number
   ytdTax: number
-  ytdNet: number
+  ytdNet: number | null
 
   // Bank
   bankAccount?: string // masked
@@ -246,7 +251,14 @@ export interface PayslipLineItem {
 }
 
 function fmt(amount: number): string {
-  return new Intl.NumberFormat('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount)
+  // pdfNumberText: Intl's U+2212 has no glyph in the bundled Helvetica, so a
+  // negative line (deduction, absence) would print as an addition (issue
+  // #1982). The two other U+2212 sources on this page are handled at their
+  // render sites: the Preliminär skatt prefix (an ASCII hyphen) and the
+  // breakdown formula strings from the calculation engine (pdfText).
+  return pdfNumberText(
+    new Intl.NumberFormat('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount),
+  )
 }
 
 const MONTH_NAMES = [
@@ -284,6 +296,12 @@ export function PayslipPDF({ data }: { data: PayslipData }) {
           <View style={styles.infoColumn}>
             <Text style={styles.infoLabel}>Period</Text>
             <Text style={styles.infoValue}>{periodLabel}</Text>
+            {data.deviationPeriodLabel ? (
+              <>
+                <Text style={styles.infoLabel}>Avvikelseperiod</Text>
+                <Text style={styles.infoValue}>{data.deviationPeriodLabel}</Text>
+              </>
+            ) : null}
             <Text style={styles.infoLabel}>Utbetalningsdag</Text>
             <Text style={styles.infoValue}>{data.paymentDate}</Text>
           </View>
@@ -326,7 +344,7 @@ export function PayslipPDF({ data }: { data: PayslipData }) {
           </View>
           <View style={styles.summaryRow}>
             <Text style={styles.summaryLabel}>Preliminär skatt ({data.taxReference})</Text>
-            <Text style={styles.summaryValue}>−{fmt(data.taxWithheld)}</Text>
+            <Text style={styles.summaryValue}>-{fmt(data.taxWithheld)}</Text>
           </View>
           <View style={styles.totalRow}>
             <Text style={styles.totalLabel}>Nettolön (utbetalas)</Text>
@@ -334,7 +352,7 @@ export function PayslipPDF({ data }: { data: PayslipData }) {
           </View>
         </View>
 
-        {/* Employer cost (transparency feature — our differentiator) */}
+        {/* Employer cost (transparency feature: our differentiator) */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Arbetsgivarkostnad</Text>
           <View style={styles.summaryRow}>
@@ -368,7 +386,7 @@ export function PayslipPDF({ data }: { data: PayslipData }) {
           </View>
           <View style={styles.ytdRow}>
             <Text style={styles.ytdLabel}>Netto</Text>
-            <Text style={styles.ytdValue}>{fmt(data.ytdNet)}</Text>
+            <Text style={styles.ytdValue}>{data.ytdNet === null ? 'Underlag saknas' : fmt(data.ytdNet)}</Text>
           </View>
         </View>
 
@@ -379,7 +397,7 @@ export function PayslipPDF({ data }: { data: PayslipData }) {
             {data.breakdownSteps.map((step, i) => (
               <View key={i} style={styles.breakdownRow}>
                 <Text style={styles.breakdownLabel}>{step.label}</Text>
-                <Text style={styles.breakdownFormula}>{step.formula}</Text>
+                <Text style={styles.breakdownFormula}>{pdfText(step.formula)}</Text>
                 <Text style={styles.breakdownValue}>{fmt(step.output)}</Text>
               </View>
             ))}
@@ -388,7 +406,7 @@ export function PayslipPDF({ data }: { data: PayslipData }) {
 
         {/* Footer */}
         <Text style={styles.footer}>
-          {data.companyName} · Org.nr {data.companyOrgNumber} · Lönespecifikation {periodLabel} · Genererad av gnubok
+          {data.companyName} · Org.nr {data.companyOrgNumber} · Lönespecifikation {periodLabel} · Genererad av {getBranding().appName.toLowerCase()}
         </Text>
       </Page>
     </Document>

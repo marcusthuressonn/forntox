@@ -2,12 +2,17 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import {
   generateInputVatLine,
   generateReverseChargeLines,
+  generateReverseChargeBasisLines,
 } from './vat-entries'
+// Aliased: this file already has a local resolveSekAmountOrNull(transaction)
+// for account-selection decisions, which refuses when unconvertible.
+import { resolveSekAmount as resolveSekAmountLenient } from './currency-utils'
 import { findMatchingTemplates, buildMappingResultFromTemplate } from './booking-templates'
 import {
   findCounterpartyTemplate,
   buildMappingResultFromCounterpartyTemplate,
 } from './counterparty-templates'
+import { detectOwnAccountTransfer } from './own-account-detector'
 import type {
   MappingRule,
   MappingResult,
@@ -16,6 +21,8 @@ import type {
   VatJournalLine,
 } from '@/types'
 import { createLogger } from '@/lib/logger'
+import { ownerSettlementAccount } from '@/lib/company/entity-type'
+import { vatTreatmentForRegistration, type VatRegistration } from './vat-registration'
 
 const log = createLogger('mapping-engine')
 
@@ -35,6 +42,33 @@ function getCapitalizationThreshold(year: number): number {
 }
 
 /**
+ * Resolve the SEK value of a transaction, or null when it cannot be
+ * established.
+ *
+ * Deliberately stricter than `resolveSekAmount()` in currency-utils: that
+ * helper falls back to the raw foreign amount for legacy rows, which is
+ * tolerable for a line amount (the entry still balances against itself) but
+ * never for a comparison against a SEK limit. Both the halva-prisbasbeloppet
+ * threshold and a rule's amount_min/amount_max band are SEK figures; feeding
+ * them an unconverted foreign number silently picks the wrong branch. When no
+ * rate is known we return null so the caller declines instead of guessing.
+ */
+function resolveSekAmountOrNull(transaction: Transaction): number | null {
+  const currency = (transaction.currency || 'SEK').toUpperCase()
+  if (currency === 'SEK') return transaction.amount
+
+  if (transaction.amount_sek != null) {
+    return Math.round(transaction.amount_sek * 100) / 100
+  }
+
+  if (transaction.exchange_rate != null && transaction.exchange_rate > 0) {
+    return Math.round(transaction.amount * transaction.exchange_rate * 100) / 100
+  }
+
+  return null
+}
+
+/**
  * Evaluate all mapping rules against a transaction and return the best match
  *
  * Evaluation order (by priority):
@@ -50,10 +84,44 @@ export async function evaluateMappingRules(
   supabase: SupabaseClient,
   companyId: string,
   transaction: Transaction,
-  entityType?: EntityType,
-  settlementAccount?: string
+  entityType: EntityType,
+  settlementAccount?: string,
+  /** company_settings.vat_registered as the caller loaded it (lib/bookkeeping/vat-registration.ts). */
+  vatRegistered?: VatRegistration
 ): Promise<MappingResult> {
   const bankAccount = settlementAccount || '1930'
+
+  // Pre-step: detect intra-company transfers. When the counterparty IBAN
+  // matches another cash_accounts row for the same company, book both legs
+  // as a transfer between the two ledger accounts instead of running the
+  // priority rules (which would mis-categorize the outflow as an expense).
+  try {
+    const transfer = await detectOwnAccountTransfer(supabase, companyId, transaction)
+    // A "transfer" whose counter leg is the settlement account itself is not a
+    // transfer (debit == credit on one ledger): it happens when the bank stamps
+    // the account's own IBAN as counterparty (interest, fees) and a sibling
+    // cash_accounts row still carries that IBAN (issue #1643). Fall through to
+    // normal categorization instead of proposing a cash ledger as the counter.
+    if (transfer && transfer.counterLedgerAccount !== bankAccount) {
+      const isFx =
+        (transaction.currency || '').toUpperCase() !==
+        (transfer.counterCurrency || '').toUpperCase()
+      return buildOwnAccountTransferResult(
+        transaction,
+        bankAccount,
+        transfer.counterLedgerAccount,
+        isFx,
+      )
+    }
+  } catch (err) {
+    // Non-fatal: falling through to normal categorization is correct when
+    // the detector fails. We log so an unexpected upstream error is visible.
+    log.warn('own-account transfer detection failed', {
+      companyId,
+      transactionId: transaction.id,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
 
   // Fetch all active rules (user-specific + system defaults), ordered by priority
   const { data: rules, error } = await supabase
@@ -65,10 +133,12 @@ export async function evaluateMappingRules(
 
   if (error || !rules || rules.length === 0) {
     // Try counterparty templates before static template fallback
-    const counterpartyResult = await evaluateCounterpartyTemplates(supabase, companyId, transaction, entityType)
+    const counterpartyResult = await evaluateCounterpartyTemplates(
+      supabase, companyId, transaction, entityType, vatRegistered,
+    )
     if (counterpartyResult) return applySettlementAccount(counterpartyResult, bankAccount)
 
-    const templateResult = evaluateTemplateRules(transaction, entityType)
+    const templateResult = evaluateTemplateRules(transaction, entityType, vatRegistered)
     if (templateResult) return applySettlementAccount(templateResult, bankAccount)
     return getDefaultResult(transaction, bankAccount)
   }
@@ -76,16 +146,18 @@ export async function evaluateMappingRules(
   // Evaluate each rule in priority order
   for (const rule of rules as MappingRule[]) {
     if (matchesRule(rule, transaction)) {
-      return applySettlementAccount(buildResult(rule, transaction, entityType), bankAccount)
+      return applySettlementAccount(buildResult(rule, transaction, entityType, vatRegistered), bankAccount)
     }
   }
 
   // Try counterparty templates before static template fallback
-  const counterpartyResult = await evaluateCounterpartyTemplates(supabase, companyId, transaction, entityType)
+  const counterpartyResult = await evaluateCounterpartyTemplates(
+    supabase, companyId, transaction, entityType, vatRegistered,
+  )
   if (counterpartyResult) return applySettlementAccount(counterpartyResult, bankAccount)
 
   // Try template-based matching before default fallback
-  const templateResult = evaluateTemplateRules(transaction, entityType)
+  const templateResult = evaluateTemplateRules(transaction, entityType, vatRegistered)
   if (templateResult) return applySettlementAccount(templateResult, bankAccount)
 
   return getDefaultResult(transaction, bankAccount)
@@ -97,7 +169,8 @@ export async function evaluateMappingRules(
  */
 function evaluateTemplateRules(
   transaction: Transaction,
-  entityType?: EntityType
+  entityType: EntityType,
+  vatRegistered?: VatRegistration
 ): MappingResult | null {
   const matches = findMatchingTemplates(transaction, entityType)
   if (matches.length === 0 || matches[0].confidence < 0.3) return null
@@ -106,7 +179,8 @@ function evaluateTemplateRules(
   const result = buildMappingResultFromTemplate(
     best.template,
     transaction,
-    entityType || 'enskild_firma'
+    entityType,
+    vatRegistered
   )
   // Override the confidence with the auto-match confidence (not 1.0)
   result.confidence = best.confidence
@@ -122,7 +196,8 @@ async function evaluateCounterpartyTemplates(
   supabase: SupabaseClient,
   companyId: string,
   transaction: Transaction,
-  entityType?: EntityType
+  entityType: EntityType,
+  vatRegistered?: VatRegistration
 ): Promise<MappingResult | null> {
   try {
     const match = await findCounterpartyTemplate(supabase, companyId, transaction)
@@ -134,10 +209,11 @@ async function evaluateCounterpartyTemplates(
     return buildMappingResultFromCounterpartyTemplate(
       match,
       transaction,
-      entityType || 'enskild_firma'
+      entityType,
+      vatRegistered
     )
   } catch {
-    // Non-critical — fall through to next fallback
+    // Non-critical: fall through to next fallback
     return null
   }
 }
@@ -153,43 +229,84 @@ function matchesRule(rule: MappingRule, transaction: Transaction): boolean {
     }
   }
 
-  // Merchant name pattern matching (case-insensitive)
+  // Merchant name pattern matching (case-insensitive). The description leg
+  // also tests original_description: since the ingest boundary started
+  // stripping the trailing channel phrase off the working title
+  // (classifyTransactionMethod), a rule written against the bank's full text
+  // ("Överföring via internet") only matches the immutable original.
   if (rule.merchant_pattern) {
     const merchantName = transaction.merchant_name || transaction.description || ''
+    const originalName = transaction.original_description || ''
     try {
       const regex = new RegExp(rule.merchant_pattern, 'i')
-      if (!regex.test(merchantName)) {
+      if (!regex.test(merchantName) && !(originalName && regex.test(originalName))) {
         return false
       }
     } catch {
       // Invalid regex, try simple includes
-      if (!merchantName.toLowerCase().includes(rule.merchant_pattern.toLowerCase())) {
+      const needle = rule.merchant_pattern.toLowerCase()
+      if (
+        !merchantName.toLowerCase().includes(needle) &&
+        !originalName.toLowerCase().includes(needle)
+      ) {
         return false
       }
     }
   }
 
-  // Description pattern matching
+  // Description pattern matching: the working title OR the full bank original
+  // (see the merchant_pattern note above).
   if (rule.description_pattern) {
+    const originalDescription = transaction.original_description || ''
     try {
       const regex = new RegExp(rule.description_pattern, 'i')
-      if (!regex.test(transaction.description)) {
+      if (
+        !regex.test(transaction.description) &&
+        !(originalDescription && regex.test(originalDescription))
+      ) {
         return false
       }
     } catch {
-      if (!transaction.description.toLowerCase().includes(rule.description_pattern.toLowerCase())) {
+      const needle = rule.description_pattern.toLowerCase()
+      if (
+        !transaction.description.toLowerCase().includes(needle) &&
+        !originalDescription.toLowerCase().includes(needle)
+      ) {
         return false
       }
     }
   }
 
-  // Amount threshold matching
-  const absAmount = Math.abs(transaction.amount)
-  if (rule.amount_min != null && absAmount < rule.amount_min) {
-    return false
-  }
-  if (rule.amount_max != null && absAmount > rule.amount_max) {
-    return false
+  // Amount threshold matching.
+  //
+  // `mapping_rules` has no currency column, so an amount_min/amount_max band
+  // can only mean SEK: the ledger currency. Compare it against the SEK value
+  // of the transaction, never the raw foreign amount (a 3000 EUR row would
+  // otherwise slip through a "max 5000" band that was written to mean kronor).
+  // When a non-SEK row carries neither amount_sek nor an exchange_rate the
+  // band is not evaluable, so the rule does not apply: skipping is the honest
+  // outcome, matching on an unconverted number is not.
+  if (rule.amount_min != null || rule.amount_max != null) {
+    const sekAmount = resolveSekAmountOrNull(transaction)
+    if (sekAmount === null) {
+      log.warn('mapping rule with a SEK amount band skipped: transaction has no SEK value', {
+        transactionId: transaction.id,
+        currency: transaction.currency,
+        ruleId: rule.id,
+        ruleName: rule.rule_name,
+        amountMin: rule.amount_min,
+        amountMax: rule.amount_max,
+      })
+      return false
+    }
+
+    const absAmount = Math.abs(sekAmount)
+    if (rule.amount_min != null && absAmount < rule.amount_min) {
+      return false
+    }
+    if (rule.amount_max != null && absAmount > rule.amount_max) {
+      return false
+    }
   }
 
   return true
@@ -198,31 +315,77 @@ function matchesRule(rule: MappingRule, transaction: Transaction): boolean {
 /**
  * Build a MappingResult from a matched rule
  */
-function buildResult(rule: MappingRule, transaction: Transaction, entityType?: EntityType): MappingResult {
-  const absAmount = Math.abs(transaction.amount)
+function buildResult(
+  rule: MappingRule,
+  transaction: Transaction,
+  entityType: EntityType,
+  vatRegistered?: VatRegistration
+): MappingResult {
+  // VAT figures land on journal entry lines, which are always SEK, so they
+  // are derived from the SEK value of the transaction. The LENIENT resolver
+  // is deliberate: buildTransactionEntryLines resolves the gross with the
+  // same ladder, so the VAT lines and the bank leg can never disagree (a
+  // rateless legacy row degrades to today's behavior on both sides instead
+  // of unbalancing the net line). Mirrors buildMappingResultFromCategory.
+  const absSekAmount = Math.abs(resolveSekAmountLenient(
+    transaction.amount, transaction.amount_sek, transaction.currency, transaction.exchange_rate
+  ))
   const isExpense = transaction.amount < 0
 
   let debitAccount = rule.debit_account || (isExpense ? '6991' : '1930')
   const creditAccount = rule.credit_account || (isExpense ? '1930' : '3900')
 
-  // Check capitalization threshold for equipment
-  const year = new Date(transaction.date).getFullYear()
-  const threshold = rule.capitalization_threshold ?? getCapitalizationThreshold(year)
-  if (absAmount > threshold && rule.capitalized_debit_account) {
-    debitAccount = rule.capitalized_debit_account
+  // Capitalization threshold for equipment (IL 18 kap 4 §, "inventarier av
+  // mindre värde"): below half prisbasbelopp it may be expensed straight to a
+  // 54xx förbrukningsinventarie account, above it must be capitalised to 12xx
+  // and depreciated.
+  //
+  // The threshold is a SEK figure, so the amount compared against it has to be
+  // SEK as well. Comparing a raw 3000 EUR laptop (about 34 500 kr) against the
+  // 29 600 kr limit for 2026 reads as "under the limit" and expenses a
+  // capital asset to 5410: no avskrivning, wrong balansräkning, and a
+  // skattemässig error. Only rules that can actually capitalise are affected.
+  let capitalizationUndecided = false
+  if (rule.capitalized_debit_account) {
+    const year = new Date(transaction.date).getFullYear()
+    const threshold = rule.capitalization_threshold ?? getCapitalizationThreshold(year)
+    const sekAmount = resolveSekAmountOrNull(transaction)
+
+    if (sekAmount === null) {
+      // Non-SEK row with neither amount_sek nor an exchange_rate. Both
+      // branches are a guess and a wrong guess is a depreciation and tax
+      // error, so decline to auto-classify and hand it to the user instead
+      // of faking a conversion.
+      capitalizationUndecided = true
+      log.warn('capitalization threshold undecidable: transaction has no SEK value', {
+        transactionId: transaction.id,
+        currency: transaction.currency,
+        ruleId: rule.id,
+        ruleName: rule.rule_name,
+      })
+    } else if (Math.abs(sekAmount) > threshold) {
+      debitAccount = rule.capitalized_debit_account
+    }
   }
 
   // If default_private, use entity-specific private account
   if (rule.default_private && isExpense) {
-    debitAccount = entityType === 'aktiebolag' ? '2893' : '2013'
+    debitAccount = ownerSettlementAccount(entityType, 'withdrawal')
   }
 
-  // Generate VAT lines if applicable
+  // Generate VAT lines if applicable. The rule's treatment is resolved for
+  // the company's VAT registration first (lib/bookkeeping/vat-registration.ts).
+  const vatTreatment = vatTreatmentForRegistration(rule.vat_treatment, vatRegistered)
   const vatLines: VatJournalLine[] = []
-  if (isExpense && !rule.default_private && rule.vat_treatment) {
-    if (rule.vat_treatment === 'reverse_charge') {
-      // EU reverse charge: fiktiv moms (offsetting entries)
-      const rcLines = generateReverseChargeLines(absAmount)
+  if (isExpense && !rule.default_private && vatTreatment) {
+    if (vatTreatment === 'reverse_charge') {
+      // Reverse charge: emit BOTH the fiktiv-moms pair (2645/2614) AND the
+      // basbelopp pair (44xx|45xx / 4598). The basbelopp pair populates
+      // momsdeklaration rutor 20-24; without it Skatteverket rejects with
+      // FK004. Mapping rules don't carry supplier-country today, so we
+      // default to EU services: the most common reverse-charge scenario.
+      const rcRate = 0.25
+      const rcLines = generateReverseChargeLines(absSekAmount, rcRate, false)
       for (const rcl of rcLines) {
         vatLines.push({
           account_number: rcl.account_number,
@@ -231,12 +394,25 @@ function buildResult(rule: MappingRule, transaction: Transaction, entityType?: E
           description: rcl.line_description || '',
         })
       }
-    } else if (rule.vat_treatment === 'standard_25' || rule.vat_treatment === 'reduced_12' || rule.vat_treatment === 'reduced_6') {
+
+      // Skip basbelopp emission if the rule already books to a basis account.
+      if (!/^4[45]\d{2}$/.test(debitAccount)) {
+        const basisLines = generateReverseChargeBasisLines(absSekAmount, rcRate, 'eu_business')
+        for (const bl of basisLines) {
+          vatLines.push({
+            account_number: bl.account_number,
+            debit_amount: bl.debit_amount,
+            credit_amount: bl.credit_amount,
+            description: bl.line_description || '',
+          })
+        }
+      }
+    } else if (vatTreatment === 'standard_25' || vatTreatment === 'reduced_12' || vatTreatment === 'reduced_6') {
       const vatRate =
-        rule.vat_treatment === 'standard_25' ? 0.25
-        : rule.vat_treatment === 'reduced_12' ? 0.12
+        vatTreatment === 'standard_25' ? 0.25
+        : vatTreatment === 'reduced_12' ? 0.12
         : 0.06
-      const vatLine = generateInputVatLine(absAmount, vatRate)
+      const vatLine = generateInputVatLine(absSekAmount, vatRate)
       if (vatLine) {
         vatLines.push({
           account_number: vatLine.account_number,
@@ -248,16 +424,24 @@ function buildResult(rule: MappingRule, transaction: Transaction, entityType?: E
     }
   }
 
+  // An undecidable capitalization check must not auto-post: drop the
+  // confidence under the auto-book bar (0.8 in lib/transactions/ingest.ts),
+  // force review, and say why in the suggestion label so the user sees the
+  // missing rate rather than a silently expensed asset.
   return {
     rule,
     debit_account: debitAccount,
     credit_account: creditAccount,
     risk_level: rule.risk_level,
-    confidence: rule.confidence_score,
-    requires_review: rule.requires_review,
+    confidence: capitalizationUndecided
+      ? Math.min(rule.confidence_score, 0.3)
+      : rule.confidence_score,
+    requires_review: capitalizationUndecided ? true : rule.requires_review,
     default_private: rule.default_private,
     vat_lines: vatLines,
-    description: rule.rule_name,
+    description: capitalizationUndecided
+      ? `${rule.rule_name} (granska: växelkurs saknas, går inte att avgöra om beloppet överstiger halva prisbasbeloppet)`
+      : rule.rule_name,
   }
 }
 
@@ -281,11 +465,53 @@ function getDefaultResult(transaction: Transaction, bankAccount = '1930'): Mappi
 }
 
 /**
+ * Build a MappingResult for a detected own-account transfer.
+ *
+ * For an outflow (negative amount): debit the counter account, credit this
+ * side's settlement account. The counter side will book the mirror entry when
+ * its row is ingested.
+ *
+ * For an inflow (positive amount): debit this side's settlement account,
+ * credit the counter account.
+ *
+ * Confidence is high (0.95) because IBAN match against the company's own
+ * cash_accounts is an exact identity check, not a heuristic.
+ *
+ * `isFx` flips `requires_review` to true when the two legs sit on different
+ * currencies (e.g. SEK 1930 → EUR 1932). A cross-currency leg generally
+ * realises a kursvinst/kursförlust on 3960/7960 (ÅRL 4 kap 10 §) that the
+ * two-line transfer entry doesn't capture: a human must confirm the FX gain
+ * or loss line rather than auto-booking a potentially incomplete entry.
+ * Same-currency transfers stay auto-bookable.
+ */
+function buildOwnAccountTransferResult(
+  transaction: Transaction,
+  bankAccount: string,
+  counterAccount: string,
+  isFx: boolean = false,
+): MappingResult {
+  const isOutflow = transaction.amount < 0
+  return {
+    rule: null,
+    debit_account: isOutflow ? counterAccount : bankAccount,
+    credit_account: isOutflow ? bankAccount : counterAccount,
+    risk_level: isFx ? 'MEDIUM' : 'LOW',
+    confidence: isFx ? 0.7 : 0.95,
+    requires_review: isFx,
+    default_private: false,
+    vat_lines: [],
+    description: isFx
+      ? 'Överföring mellan egna konton (FX: granska kursvinst/förlust)'
+      : 'Överföring mellan egna konton',
+  }
+}
+
+/**
  * Replace any default 1930 references in a mapping result with the actual settlement account.
  * This allows mapping rules and templates that don't explicitly set a bank account
  * to work correctly with secondary bank accounts (e.g. 1931).
  */
-function applySettlementAccount(result: MappingResult, bankAccount: string): MappingResult {
+export function applySettlementAccount(result: MappingResult, bankAccount: string): MappingResult {
   if (bankAccount === '1930') return result
   return {
     ...result,
@@ -346,7 +572,7 @@ export async function saveUserMappingRule(
     })
 
     if (error) {
-      // Silently fail — saving learned rules is non-critical
+      // Silently fail: saving learned rules is non-critical
     }
   } else {
     const { error } = await supabase.from('mapping_rules').insert({
@@ -365,7 +591,7 @@ export async function saveUserMappingRule(
     })
 
     if (error) {
-      // Silently fail — saving learned rules is non-critical
+      // Silently fail: saving learned rules is non-critical
     }
   }
 }

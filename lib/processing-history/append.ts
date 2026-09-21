@@ -1,8 +1,8 @@
 /**
- * Processing history (behandlingshistorik) — append helper.
+ * Processing history (behandlingshistorik): append helper.
  *
  * Uses a service-role client internally (no INSERT RLS policy on
- * processing_history — matching the event_log pattern). Company scoping
+ * processing_history: matching the event_log pattern). Company scoping
  * is enforced by companyId in the event payload, not by RLS.
  * Throws on failure.
  *
@@ -18,8 +18,58 @@ import type {
   ProcessingHistoryAggregateType,
   ProcessingHistoryActor,
 } from '@/types'
+import type { SupabaseClient } from '@supabase/supabase-js'
 import { createServiceClient } from '@/lib/supabase/server'
 import { z } from 'zod'
+
+/**
+ * Any service-role client with the query surface the append needs. Structural
+ * so both the Next-bound createServiceClient() and a script's own
+ * createClient(url, serviceRoleKey) satisfy it.
+ */
+type SupabaseClientLike = Pick<SupabaseClient, 'from'>
+
+// ── Event type catalog ──────────────────────────────────────────
+// Every event type the code emits, and the contract with the
+// processing_event_types reference table: processing_history.event_type has an
+// FK to it, and every append call site is best-effort try/catch, so a type
+// that is missing from the table fails the insert silently and the act leaves
+// no durable record at all. Ten types drifted out of the table exactly that
+// way before this list existed.
+//
+// Adding an entry here therefore REQUIRES a migration registering the same
+// string in public.processing_event_types, in the same change. The union
+// makes an unregistered literal a compile error;
+// tests/pg/processing-event-types.pg.test.ts makes an unregistered string a
+// test failure. Keep it sorted.
+
+export const PROCESSING_EVENT_TYPES = [
+  'AttachmentsTruncated',
+  'BankTransactionDuplicateDismissed',
+  'BankTransactionStrandedRepaired',
+  'CashAccountTwinsMerged',
+  'ChannelQuestionAnswered',
+  'ChannelQuestionAsked',
+  'ChannelQuestionExpired',
+  'DocumentDuplicateSkipped',
+  'DocumentExtractionAttempted',
+  'DocumentExtractionOverridden',
+  'DocumentExtractionRetried',
+  'DocumentIngested',
+  'InboundMailReceived',
+  'InboxUnderlagReconciled',
+  'InvoiceDuplicatePaymentDismissed',
+  'InvoiceJournalEntrySkipped',
+  'InvoicePaymentRowBackfilled',
+  'InvoiceRowsCompleted',
+  'OAuthClientRevoked',
+  'PendingOperationApproved',
+  'PendingOperationRejected',
+  'RateLimitedDropped',
+  'TransactionDocumentReplaced',
+] as const
+
+export type ProcessingHistoryEventType = (typeof PROCESSING_EVENT_TYPES)[number]
 
 // ── PII validator ───────────────────────────────────────────────
 // Rejects payloads containing Swedish personal identity numbers.
@@ -35,7 +85,7 @@ const PII_PATTERNS = [
 ]
 
 // UUIDs (RFC 4122, 8-4-4-4-12 hex layout) frequently contain all-digit segments
-// that incorrectly match the 8+4 personnummer pattern — e.g. `57484518-3409-...`.
+// that incorrectly match the 8+4 personnummer pattern: e.g. `57484518-3409-...`.
 // Strip UUID-shaped substrings before PII matching so legitimate identifiers
 // aren't rejected. Personnummer always sit outside the UUID shape, so this keeps
 // the original safety intent intact.
@@ -80,12 +130,12 @@ export interface AppendEventInput {
   causationId?: string
   aggregateType: ProcessingHistoryAggregateType
   aggregateId: string
-  eventType: string
+  eventType: ProcessingHistoryEventType
   payload: Record<string, unknown>
   payloadSchemaVersion?: number
   actor: ProcessingHistoryActor
   rubricVersion?: string
-  occurredAt: Date  // mandatory — no default. Caller must set explicitly.
+  occurredAt: Date  // mandatory: no default. Caller must set explicitly.
 }
 
 // ── Append functions ────────────────────────────────────────────
@@ -94,7 +144,7 @@ export interface AppendEventInput {
  * Append a single event to processing_history.
  *
  * Uses a service-role client internally (bypasses RLS) since processing_history
- * has no INSERT policy — matching the event_log pattern. Company scoping is
+ * has no INSERT policy: matching the event_log pattern. Company scoping is
  * enforced by the companyId in the event payload, not by RLS.
  *
  * Returns the generated event_id (pre-generated client-side for causation chaining).
@@ -102,12 +152,26 @@ export interface AppendEventInput {
 export async function appendProcessingHistory(
   input: AppendEventInput
 ): Promise<string> {
+  return appendProcessingHistoryWithClient(createServiceClient(), input)
+}
+
+/**
+ * Same append, on a caller-supplied service-role client. For standalone
+ * scripts (e.g. scripts/backfill-inbox-booked-underlag.ts) that cannot build
+ * the Next-bound service client but must still write behandlingshistorik
+ * through the one shared row shape and PII validation (BFNAR 2013:2 p. 9.16:
+ * the change log has to reconcile across writers, so scripts never hand-roll
+ * the insert).
+ */
+export async function appendProcessingHistoryWithClient(
+  supabase: SupabaseClientLike,
+  input: AppendEventInput
+): Promise<string> {
   // Validate payload + actor.label contain no PII
   piiSafePayload.parse(input.payload)
   assertActorPiiSafe(input.actor)
 
   const eventId = crypto.randomUUID()
-  const supabase = createServiceClient()
 
   const { error } = await supabase
     .from('processing_history')

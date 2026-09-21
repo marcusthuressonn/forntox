@@ -1,11 +1,13 @@
 'use client'
 
+import { useState } from 'react'
+import { useTranslations } from 'next-intl'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { formatCurrency } from '@/lib/utils'
 import {
-  Building2,
   Calendar,
   FileText,
   CheckCircle,
@@ -14,6 +16,7 @@ import {
   ArrowRight,
   BarChart3,
   Info,
+  Briefcase,
 } from 'lucide-react'
 import type { ImportPreview, ParseIssue } from '@/lib/import/types'
 
@@ -25,6 +28,12 @@ interface SIEPreviewStepProps {
   isCreatingAccounts: boolean
   onContinue: () => void
   onBack: () => void
+  /**
+   * Opens the manual "Ingående balanser" wizard (issue #2082). Offered next to
+   * the IB-imbalance acknowledgement so a user who rightly hesitates to book an
+   * unexplained amount to 2099 has somewhere to go other than support.
+   */
+  onOpenManualOpeningBalances?: () => void
 }
 
 export default function SIEPreviewStep({
@@ -35,13 +44,35 @@ export default function SIEPreviewStep({
   isCreatingAccounts,
   onContinue,
   onBack,
+  onOpenManualOpeningBalances,
 }: SIEPreviewStepProps) {
+  const t = useTranslations('import')
   const errors = issues.filter((i) => i.severity === 'error')
   const warnings = issues.filter((i) => i.severity === 'warning')
 
+  // Both blocks are optional: a preview built by an older parse response
+  // lacks them, and the card then falls back to the BAS-reference counts.
+  const chart = preview.chart
+  const fiscalYear = preview.fiscalYear
+  // Both refusals carry the import's own text: an overlap with a period that
+  // has content, or #RAR dates that break a BFL 3 kap. shape rule.
+  const fiscalYearRefused =
+    fiscalYear?.verdict === 'conflict' || fiscalYear?.verdict === 'invalid'
+
+  // Opening-balance imbalance. The importer plugs any diff > 0.01 to 2099, but a
+  // diff under ~1 SEK is genuine öresavrundning. Anything larger is a real
+  // imbalance (incomplete export: missing liabilities / unappropriated prior-year
+  // result) that would silently book a bogus amount to 2099. Mirrors the importer's
+  // own `fileImbalance > 1.00` "serious" threshold (lib/import/sie-import.ts).
+  const ibDiff = Math.round((preview.trialBalance.totalDebit - preview.trialBalance.totalCredit) * 100) / 100
+  const significantImbalance = !preview.trialBalance.isBalanced && Math.abs(ibDiff) > 1
+  const [ackImbalance, setAckImbalance] = useState(false)
+
   // Only block on actual parsing errors, not unmapped accounts
-  // (users need to proceed to mapping step to fix unmapped accounts)
+  // (users need to proceed to mapping step to fix unmapped accounts).
+  // A significant IB imbalance is a soft block: the user must acknowledge it.
   const hasBlockingErrors = errors.length > 0
+  const blockContinue = hasBlockingErrors || (significantImbalance && !ackImbalance)
 
   return (
     <div className="space-y-6">
@@ -49,7 +80,7 @@ export default function SIEPreviewStep({
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Building2 className="h-5 w-5" />
+            <Briefcase className="h-5 w-5" />
             Företagsinformation
           </CardTitle>
           <CardDescription>Information från SIE-filen</CardDescription>
@@ -69,7 +100,7 @@ export default function SIEPreviewStep({
       </Card>
 
       {/* Fiscal year */}
-      <Card>
+      <Card className={fiscalYearRefused ? 'border-destructive/50' : undefined}>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Calendar className="h-5 w-5" />
@@ -91,7 +122,22 @@ export default function SIEPreviewStep({
                 {preview.fiscalYearEnd ?? 'Okänt'}
               </p>
             </div>
+            {fiscalYear && (fiscalYear.verdict === 'match' || fiscalYear.verdict === 'create') && (
+              <span className="ml-auto text-sm text-muted-foreground">
+                {fiscalYear.verdict === 'match'
+                  ? t('fiscal_year_match')
+                  : fiscalYear.replacesEmptyPeriodId
+                    ? t('fiscal_year_create_replaces')
+                    : t('fiscal_year_create')}
+              </span>
+            )}
           </div>
+          {fiscalYear && (fiscalYear.verdict === 'conflict' || fiscalYear.verdict === 'invalid') && (
+            <div className="mt-4 flex items-start gap-2 text-sm text-destructive">
+              <XCircle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+              <span>{fiscalYear.message}</span>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -103,7 +149,7 @@ export default function SIEPreviewStep({
               <FileText className="h-4 w-4" />
               <span className="text-sm">Konton</span>
             </div>
-            <p className="text-2xl font-display font-medium tabular-nums">{preview.accountCount}</p>
+            <p className="text-2xl font-display tabular-nums">{preview.accountCount}</p>
           </CardContent>
         </Card>
 
@@ -113,7 +159,7 @@ export default function SIEPreviewStep({
               <BarChart3 className="h-4 w-4" />
               <span className="text-sm">Verifikationer</span>
             </div>
-            <p className="text-2xl font-display font-medium tabular-nums">{preview.voucherCount}</p>
+            <p className="text-2xl font-display tabular-nums">{preview.voucherCount}</p>
           </CardContent>
         </Card>
 
@@ -122,22 +168,25 @@ export default function SIEPreviewStep({
             <div className="flex items-center gap-2 text-muted-foreground mb-1">
               <span className="text-sm">Transaktionsrader</span>
             </div>
-            <p className="text-2xl font-display font-medium tabular-nums">{preview.transactionLineCount}</p>
+            <p className="text-2xl font-display tabular-nums">{preview.transactionLineCount}</p>
           </CardContent>
         </Card>
 
         <Card>
           <CardContent className="pt-6">
             <div className="flex items-center gap-2 text-muted-foreground mb-1">
-              <span className="text-sm">IB Summa</span>
+              <span className="text-sm">IB, summa debet</span>
             </div>
-            <p className="text-2xl font-display font-medium tabular-nums">{formatCurrency(preview.openingBalanceTotal)}</p>
+            <p className="text-2xl font-display tabular-nums">{formatCurrency(preview.openingBalanceTotal)}</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Summan av alla debetsaldon i ingående balans, inte ett enskilt kontosaldo.
+            </p>
           </CardContent>
         </Card>
       </div>
 
       {/* Trial balance check */}
-      <Card className={preview.trialBalance.isBalanced ? 'border-success/50' : 'border-warning/50'}>
+      <Card className={preview.trialBalance.isBalanced ? 'border-success/50' : 'border-border'}>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             {preview.trialBalance.isBalanced ? (
@@ -161,14 +210,64 @@ export default function SIEPreviewStep({
             <div>
               <p className="text-sm text-muted-foreground">Status</p>
               {preview.trialBalance.isBalanced ? (
-                <Badge variant="default" className="bg-success">Balanserar</Badge>
+                <Badge variant="success">Balanserar</Badge>
               ) : (
                 <Badge variant="secondary">
-                  Diff: {formatCurrency(preview.trialBalance.totalDebit - preview.trialBalance.totalCredit)}
+                  Diff: {formatCurrency(ibDiff)}
                 </Badge>
               )}
             </div>
           </div>
+
+          {/* Significant imbalance: explain + require acknowledgement before continuing */}
+          {significantImbalance && (
+            <div className="mt-4 space-y-3 rounded-lg border border-border bg-muted/30 px-4 py-3">
+              <div className="flex items-start gap-2 text-sm">
+                <AlertCircle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
+                <div className="space-y-1">
+                  <p className="font-medium text-warning">
+                    Ingående balanser balanserar inte ({formatCurrency(Math.abs(ibDiff))})
+                  </p>
+                  <p className="text-muted-foreground">
+                    Vanligaste orsaken är att föregående års resultat aldrig fördes över till
+                    eget kapital i det gamla programmet. SpeedLedger parkerar det till exempel på
+                    egna 9xxx-konton (9030/9031 Obokat resultat), och då summerar inte filens
+                    ingående balanser till noll: differensen är det oförda resultatet. En annan
+                    orsak är en ofullständig export, till exempel att skulder saknas.
+                  </p>
+                  <p className="text-muted-foreground">
+                    Rätta i källsystemet och ladda upp filen på nytt, eller lägg in de ingående
+                    balanserna för hand i guiden Ingående balanser, där du kan rätta raderna
+                    själv innan de bokförs (den här filen importeras då inte). Fortsätter du ändå
+                    bokförs differensen på konto 2099 (Årets resultat), vilket nästan alltid blir
+                    fel.
+                  </p>
+                  {onOpenManualOpeningBalances && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="mt-1"
+                      onClick={onOpenManualOpeningBalances}
+                    >
+                      Lägg in ingående balanser för hand
+                      <ArrowRight className="ml-2 h-4 w-4" />
+                    </Button>
+                  )}
+                </div>
+              </div>
+              <label className="flex items-start gap-2 text-sm cursor-pointer">
+                <Checkbox
+                  checked={ackImbalance}
+                  onCheckedChange={(v) => setAckImbalance(v === true)}
+                  className="mt-0.5"
+                />
+                <span className="text-muted-foreground">
+                  Jag förstår att differensen bokförs på 2099 och vill fortsätta ändå.
+                </span>
+              </label>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -178,7 +277,7 @@ export default function SIEPreviewStep({
           preview.mappingStatus.unmapped > 0
             ? 'border-destructive/50'
             : preview.mappingStatus.lowConfidence > 0
-            ? 'border-warning/50'
+            ? 'border-border'
             : 'border-success/50'
         }
       >
@@ -191,35 +290,67 @@ export default function SIEPreviewStep({
             ) : (
               <CheckCircle className="h-5 w-5 text-success" />
             )}
-            Kontomappning
+            {t('chart_card_title')}
           </CardTitle>
           <CardDescription>
-            Hur väl kunde kontona i filen matchas mot din kontoplan
+            {chart
+              ? t('chart_summary', { toCreate: chart.toCreate, existing: chart.existing })
+              : 'Hur väl kunde kontona i filen matchas mot din kontoplan'}
           </CardDescription>
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-            <div>
-              <p className="text-sm text-muted-foreground">Totalt</p>
-              <p className="font-medium">{preview.mappingStatus.total}</p>
-            </div>
-            <div>
-              <p className="text-sm text-muted-foreground">Mappade</p>
-              <p className="font-medium text-success">{preview.mappingStatus.mapped}</p>
-            </div>
+            {chart ? (
+              <>
+                <div>
+                  <p className="text-sm text-muted-foreground">{t('chart_to_create')}</p>
+                  <p className="font-medium tabular-nums">{chart.toCreate}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">{t('chart_existing')}</p>
+                  <p className="font-medium tabular-nums">{chart.existing}</p>
+                </div>
+              </>
+            ) : (
+              <>
+                <div>
+                  <p className="text-sm text-muted-foreground">Totalt</p>
+                  <p className="font-medium">{preview.mappingStatus.total}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Mappade</p>
+                  <p className="font-medium text-success">{preview.mappingStatus.mapped}</p>
+                </div>
+              </>
+            )}
             <div>
               <p className="text-sm text-muted-foreground">Ej mappade</p>
-              <p className={`font-medium ${preview.mappingStatus.unmapped > 0 ? 'text-destructive' : ''}`}>
+              <p className={`font-medium tabular-nums ${preview.mappingStatus.unmapped > 0 ? 'text-destructive' : ''}`}>
                 {preview.mappingStatus.unmapped}
               </p>
             </div>
             <div>
               <p className="text-sm text-muted-foreground">Osäkra</p>
-              <p className={`font-medium ${preview.mappingStatus.lowConfidence > 0 ? 'text-warning' : ''}`}>
+              <p className={`font-medium tabular-nums ${preview.mappingStatus.lowConfidence > 0 ? 'text-warning' : ''}`}>
                 {preview.mappingStatus.lowConfidence}
               </p>
             </div>
           </div>
+          {chart && chart.sample.length > 0 && (
+            <div className="mt-4 space-y-1 text-sm">
+              {chart.sample.map((acc) => (
+                <div key={acc.number} className="flex gap-2 text-muted-foreground">
+                  <span className="font-mono">{acc.number}</span>
+                  <span>{acc.name}</span>
+                </div>
+              ))}
+              {chart.toCreate > chart.sample.length && (
+                <div className="text-muted-foreground">
+                  {t('chart_sample_more', { count: chart.toCreate - chart.sample.length })}
+                </div>
+              )}
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -228,9 +359,15 @@ export default function SIEPreviewStep({
         <div className="flex items-start gap-2 rounded-lg border bg-muted/50 px-4 py-3 text-sm text-muted-foreground">
           <Info className="h-4 w-4 mt-0.5 flex-shrink-0" />
           <span>
-            {preview.excludedSystemAccounts.length} internt systemkonto från källsystemet exkluderades ({preview.excludedSystemAccounts.map((a) => a.number).join(', ')}) — inte bokföringskonton
+            {preview.excludedSystemAccounts.length} internt systemkonto från källsystemet exkluderades ({preview.excludedSystemAccounts.map((a) => a.number).join(', ')}), inte bokföringskonton
           </span>
         </div>
+      )}
+
+      {Boolean(preview.archivedOnlyAccounts?.length) && (
+        <p className="text-sm text-muted-foreground" data-ph-mask>
+          {t('archived_only_accounts', { accounts: preview.archivedOnlyAccounts!.map(account => account.number).join(', ') })}
+        </p>
       )}
 
       {/* Create missing accounts */}
@@ -243,7 +380,7 @@ export default function SIEPreviewStep({
             </CardTitle>
             <CardDescription>
               {missingAccounts.length} konton från SIE-filen finns inte i din kontoplan ännu.
-              Klicka nedan för att skapa dem — de kopplas sedan automatiskt i nästa steg.
+              Klicka nedan för att skapa dem: de kopplas sedan automatiskt i nästa steg.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -278,7 +415,7 @@ export default function SIEPreviewStep({
       ) : preview.mappingStatus.mapped === preview.mappingStatus.total && preview.mappingStatus.total > 0 && (
         <div className="flex items-center gap-2 rounded-lg border border-success/50 bg-success/5 px-4 py-3 text-sm">
           <CheckCircle className="h-4 w-4 text-success flex-shrink-0" />
-          <span>Alla konton skapade och automatiskt kopplade</span>
+          <span>{t('accounts_mapped_ready')}</span>
         </div>
       )}
 
@@ -312,7 +449,7 @@ export default function SIEPreviewStep({
 
       {/* Warnings */}
       {warnings.length > 0 && (
-        <Card className="border-warning/50">
+        <Card className="border-border">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <AlertCircle className="h-5 w-5 text-warning" />
@@ -343,7 +480,7 @@ export default function SIEPreviewStep({
         <Button variant="outline" className="min-h-11" onClick={onBack}>
           Tillbaka
         </Button>
-        <Button className="min-h-11" onClick={onContinue} disabled={hasBlockingErrors}>
+        <Button className="min-h-11" onClick={onContinue} disabled={blockContinue}>
           {preview.mappingStatus.lowConfidence > 0 || preview.mappingStatus.unmapped > 0
             ? 'Granska mappningar'
             : 'Fortsätt'}

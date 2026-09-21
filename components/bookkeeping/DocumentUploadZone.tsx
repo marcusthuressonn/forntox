@@ -1,6 +1,8 @@
 'use client'
 
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
+import { createPortal } from 'react-dom'
+import { useLocale, useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Upload, FileText, ImageIcon, X, Loader2 } from 'lucide-react'
@@ -23,12 +25,55 @@ interface DocumentUploadZoneProps {
   maxFiles?: number
   disabled?: boolean
   compact?: boolean
+  /**
+   * An ancestor (typically the dialog content) that takes a dropped file as
+   * if it landed in the dashed box. While a file is dragged over it, the
+   * whole surface is outlined and a drop anywhere on it uploads, so nobody
+   * has to hit the small box (or, missing it, have the browser open the
+   * file in the tab).
+   */
+  dropSurfaceRef?: React.RefObject<HTMLElement | null>
 }
 
 let uploadCounter = 0
 const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10 MB
 const ACCEPTED_TYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp']
 const ACCEPTED_EXTENSIONS = '.pdf,.jpg,.jpeg,.png,.webp'
+const FILE_NAME_TAIL_LENGTH = 16
+
+function TruncatedFileName({ fileName }: { fileName: string }) {
+  const characters = Array.from(fileName)
+
+  if (characters.length <= FILE_NAME_TAIL_LENGTH * 2) {
+    return (
+      <span className="min-w-0 flex-1 truncate" title={fileName}>
+        {fileName}
+      </span>
+    )
+  }
+
+  const splitAt = characters.length - FILE_NAME_TAIL_LENGTH
+  const start = characters.slice(0, splitAt).join('')
+  const end = characters.slice(splitAt).join('')
+
+  return (
+    <span
+      className="flex min-w-0 flex-1"
+      title={fileName}
+    >
+      <span className="sr-only">{fileName}</span>
+      <span aria-hidden="true" className="min-w-0 flex-1 truncate">
+        {start}
+      </span>
+      <span
+        aria-hidden="true"
+        className="max-w-1/2 shrink overflow-hidden whitespace-nowrap text-right"
+      >
+        {end}
+      </span>
+    </span>
+  )
+}
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -40,6 +85,29 @@ function isImageType(type: string): boolean {
   return type.startsWith('image/')
 }
 
+/**
+ * Extract a Swedish error message from the structured error envelope
+ * returned by /api/documents. Falls back to message_en or null if the
+ * shape is unexpected.
+ */
+function extractErrorMessage(err: unknown, locale: string): string | null {
+  if (typeof err === 'string') return err
+  if (err && typeof err === 'object') {
+    const e = err as { message?: unknown; message_en?: unknown; code?: unknown }
+    if (locale === 'en' && typeof e.message_en === 'string' && e.message_en.length > 0) {
+      return e.message_en
+    }
+    if (typeof e.message === 'string' && e.message.length > 0) return e.message
+    if (typeof e.message_en === 'string' && e.message_en.length > 0) return e.message_en
+    if (typeof e.code === 'string') return e.code
+  }
+  return null
+}
+
+function hasFiles(e: DragEvent): boolean {
+  return Array.from(e.dataTransfer?.types ?? []).includes('Files')
+}
+
 export default function DocumentUploadZone({
   files,
   onFilesChange,
@@ -47,9 +115,17 @@ export default function DocumentUploadZone({
   maxFiles = 5,
   disabled = false,
   compact = false,
+  dropSurfaceRef,
 }: DocumentUploadZoneProps) {
+  const t = useTranslations('document_upload')
+  const locale = useLocale()
   const [isDragging, setIsDragging] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const zoneRef = useRef<HTMLDivElement>(null)
+  // The surface's outline is a fixed overlay over the surface's box (the
+  // surface scrolls, an absolute child would scroll with it). Null while no
+  // file is over the surface.
+  const [surfaceRect, setSurfaceRect] = useState<DOMRect | null>(null)
 
   const uploadFile = useCallback(async (file: UploadedFile): Promise<UploadedFile> => {
     const formData = new FormData()
@@ -64,17 +140,41 @@ export default function DocumentUploadZone({
         method: 'POST',
         body: formData,
       })
-      const result = await res.json()
 
-      if (result.error) {
-        return { ...file, status: 'error', error: result.error }
+      // Try to parse JSON, but tolerate non-JSON responses (auth redirect HTML, 502 etc.)
+      let result: { data?: { id?: string }; error?: unknown } = {}
+      try {
+        result = await res.json()
+      } catch {
+        console.warn('[DocumentUploadZone] Non-JSON response', {
+          status: res.status,
+          fileName: file.fileName,
+        })
+        const reason = res.status === 401 || res.status === 403
+          ? t('session_expired')
+          : t('server_status', { status: res.status })
+        return { ...file, status: 'error', error: reason }
+      }
+
+      if (!res.ok || result.error) {
+        const errMessage = extractErrorMessage(result.error, locale) || t('failed_status', { status: res.status })
+        console.warn('[DocumentUploadZone] Upload error', {
+          status: res.status,
+          error: result.error,
+          fileName: file.fileName,
+        })
+        return { ...file, status: 'error', error: errMessage }
       }
 
       return { ...file, status: 'uploaded', id: result.data?.id }
-    } catch {
-      return { ...file, status: 'error', error: 'Uppladdning misslyckades' }
+    } catch (err) {
+      console.error('[DocumentUploadZone] Upload threw', {
+        error: err,
+        fileName: file.fileName,
+      })
+      return { ...file, status: 'error', error: t('network_error') }
     }
-  }, [journalEntryId])
+  }, [journalEntryId, locale, t])
 
   const handleFiles = useCallback(async (newFiles: File[]) => {
     const remaining = maxFiles - files.length
@@ -87,7 +187,7 @@ export default function DocumentUploadZone({
         validFiles.push({
           file,
           status: 'error',
-          error: 'Filtypen stöds inte',
+          error: t('unsupported_type'),
           fileName: file.name,
           fileSize: file.size,
           uploadKey: `upload-${++uploadCounter}`,
@@ -98,7 +198,7 @@ export default function DocumentUploadZone({
         validFiles.push({
           file,
           status: 'error',
-          error: 'Filen är för stor (max 10 MB)',
+          error: t('too_large'),
           fileName: file.name,
           fileSize: file.size,
           uploadKey: `upload-${++uploadCounter}`,
@@ -125,7 +225,7 @@ export default function DocumentUploadZone({
       )
       onFilesChange([...currentFiles])
     }
-  }, [files, maxFiles, onFilesChange, uploadFile])
+  }, [files, maxFiles, onFilesChange, t, uploadFile])
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -159,15 +259,95 @@ export default function DocumentUploadZone({
     onFilesChange(files.filter((_, i) => i !== index))
   }, [files, onFilesChange])
 
+  // Whole-surface drop. Native listeners on the surface element: a
+  // dragenter/dragleave pair fires for every child crossed, so a depth
+  // counter tells "left the surface" from "moved between its children". A
+  // drop inside the dashed box is the box's own (React) handler's: skipped
+  // here so one drop never uploads twice.
+  useEffect(() => {
+    const surface = dropSurfaceRef?.current
+    if (!surface || disabled) return
+    let depth = 0
+    const reset = () => {
+      depth = 0
+      setSurfaceRect(null)
+    }
+    const onDragEnter = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      depth += 1
+      if (depth === 1) setSurfaceRect(surface.getBoundingClientRect())
+    }
+    const onDragOver = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      // Without this the browser refuses the drop (and would open the file).
+      e.preventDefault()
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+      // The drag may already be over the surface when these listeners
+      // attach (a dialog that mounts this zone on its first dragenter):
+      // then the enter was never seen, and the first over stands in for it.
+      if (depth === 0) {
+        depth = 1
+        setSurfaceRect(surface.getBoundingClientRect())
+      }
+    }
+    const onDragLeave = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      depth = Math.max(0, depth - 1)
+      if (depth === 0) setSurfaceRect(null)
+    }
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      reset()
+      if (zoneRef.current && e.target instanceof Node && zoneRef.current.contains(e.target)) return
+      handleFiles(Array.from(e.dataTransfer?.files ?? []))
+    }
+    surface.addEventListener('dragenter', onDragEnter)
+    surface.addEventListener('dragover', onDragOver)
+    surface.addEventListener('dragleave', onDragLeave)
+    surface.addEventListener('drop', onDrop)
+    // A drag that ends anywhere else (dropped on the desktop, escaped) never
+    // sends the surface a dragleave: clear the outline on the global end.
+    window.addEventListener('dragend', reset)
+    window.addEventListener('drop', reset)
+    return () => {
+      surface.removeEventListener('dragenter', onDragEnter)
+      surface.removeEventListener('dragover', onDragOver)
+      surface.removeEventListener('dragleave', onDragLeave)
+      surface.removeEventListener('drop', onDrop)
+      window.removeEventListener('dragend', reset)
+      window.removeEventListener('drop', reset)
+    }
+  }, [dropSurfaceRef, disabled, handleFiles])
+
   const isUploading = files.some((f) => f.status === 'uploading')
 
   return (
-    <div className="space-y-2">
+    <div className="min-w-0 space-y-2">
+      {/* Surface outline: sits above the dialog (z-50) and a docked agent
+          sheet (z-60), lets every event through to the surface beneath. */}
+      {surfaceRect &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            aria-hidden="true"
+            className="pointer-events-none fixed z-[70] flex items-center justify-center rounded-xl border-2 border-dashed border-primary bg-background/85"
+            style={{ top: surfaceRect.top, left: surfaceRect.left, width: surfaceRect.width, height: surfaceRect.height }}
+          >
+            <div className="flex flex-col items-center gap-2 text-center">
+              <Upload className="h-8 w-8 text-primary" />
+              <p className="text-sm font-medium text-foreground">{t('drop_surface_prompt')}</p>
+              <p className="text-xs text-muted-foreground">{t('format_hint')}</p>
+            </div>
+          </div>,
+          document.body,
+        )}
       {/* Drop zone */}
       <div
+        ref={zoneRef}
         className={`
           relative border-2 border-dashed rounded-lg text-center transition-colors
-          ${compact ? 'p-3' : 'p-5'}
+          ${compact ? 'p-3' : 'p-6'}
           ${isDragging ? 'border-primary bg-primary/5' : 'border-muted-foreground/25'}
           ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer hover:border-primary/50'}
         `}
@@ -190,11 +370,11 @@ export default function DocumentUploadZone({
           <Upload className={compact ? 'h-4 w-4 text-muted-foreground' : 'mx-auto h-8 w-8 text-muted-foreground'} />
           <div>
             <p className={compact ? 'text-sm text-muted-foreground' : 'text-sm font-medium'}>
-              {compact ? 'Dra och släpp eller klicka' : 'Dra och släpp filer här'}
+              {compact ? t('compact_prompt') : t('prompt')}
             </p>
             {!compact && (
               <p className="text-xs text-muted-foreground">
-                PDF, bilder (max 10 MB)
+                {t('format_hint')}
               </p>
             )}
           </div>
@@ -207,14 +387,14 @@ export default function DocumentUploadZone({
           {files.map((file, index) => (
             <div
               key={file.uploadKey}
-              className="flex items-center gap-2 text-sm py-1.5 px-2 rounded bg-muted/50"
+              className="flex min-w-0 items-center gap-2 text-sm py-1.5 px-2 rounded-sm bg-muted/50"
             >
               {isImageType(file.file.type) ? (
                 <ImageIcon className="h-4 w-4 text-muted-foreground shrink-0" />
               ) : (
                 <FileText className="h-4 w-4 text-muted-foreground shrink-0" />
               )}
-              <span className="truncate flex-1">{file.fileName}</span>
+              <TruncatedFileName fileName={file.fileName} />
               <span className="text-xs text-muted-foreground shrink-0">
                 {formatFileSize(file.fileSize)}
               </span>
@@ -224,13 +404,13 @@ export default function DocumentUploadZone({
               )}
               {file.status === 'uploaded' && (
                 <Badge variant="success" className="text-xs px-1.5 py-0">
-                  Uppladdad
+                  {t('uploaded')}
                 </Badge>
               )}
               {file.status === 'error' && (
                 <>
                   <Badge variant="destructive" className="text-xs px-1.5 py-0">
-                    Fel
+                    {t('error')}
                   </Badge>
                   {file.error && (
                     <span className="text-xs text-destructive">{file.error}</span>
@@ -241,6 +421,7 @@ export default function DocumentUploadZone({
               <Button
                 variant="ghost"
                 size="sm"
+                aria-label={t('remove_file')}
                 className="h-6 w-6 p-0 shrink-0"
                 onClick={(e) => {
                   e.stopPropagation()
@@ -256,7 +437,7 @@ export default function DocumentUploadZone({
       )}
 
       {isUploading && (
-        <p className="text-xs text-muted-foreground">Laddar upp...</p>
+        <p className="text-xs text-muted-foreground">{t('uploading')}</p>
       )}
     </div>
   )

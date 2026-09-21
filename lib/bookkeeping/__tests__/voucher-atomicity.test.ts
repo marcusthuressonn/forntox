@@ -6,7 +6,18 @@ vi.mock('@/lib/events', () => ({
   eventBus: { emit: vi.fn().mockResolvedValue([]) },
 }))
 
+vi.mock('@/lib/logger', () => ({
+  createLogger: () => ({
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    child: vi.fn().mockReturnThis(),
+  }),
+}))
+
 import { commitEntry, getNextVoucherNumber, createJournalEntry } from '../engine'
+import { runWithActor } from '../actor-context-node'
+import { BookkeepingDatabaseError } from '../errors'
 
 describe('voucher number atomicity', () => {
   beforeEach(() => {
@@ -39,14 +50,14 @@ describe('voucher number atomicity', () => {
 
     await expect(
       getNextVoucherNumber(supabase as never, 'co-1', 'fp-1', 'A')
-    ).rejects.toThrow('Failed to get next voucher number: connection lost')
+    ).rejects.toThrow(BookkeepingDatabaseError)
   })
 
   /**
    * commitEntry uses the atomic commit_journal_entry RPC which increments the
    * voucher sequence and updates the entry status in one transaction.
    * If the RPC fails (e.g., balance trigger rejection), the sequence increment
-   * rolls back — no burned number, no gap.
+   * rolls back: no burned number, no gap.
    */
   it('commitEntry RPC failure does not burn a sequence number', async () => {
     const supabase = {
@@ -59,19 +70,24 @@ describe('voucher number atomicity', () => {
 
     await expect(
       commitEntry(supabase as never, 'co-1', 'user-1', 'entry-1')
-    ).rejects.toThrow('Failed to commit journal entry: Journal entry is not balanced')
+    ).rejects.toThrow(BookkeepingDatabaseError)
 
-    // The atomic RPC was called — it failed, rolling back both the
+    // The atomic RPC was called: it failed, rolling back both the
     // sequence increment and the status update. No burned number.
     expect(supabase.rpc).toHaveBeenCalledWith('commit_journal_entry', {
       p_company_id: 'co-1',
       p_entry_id: 'entry-1',
       p_commit_method: null,
       p_rubric_version: null,
+      p_actor_type: null,
+      p_actor_label: null,
     })
 
-    // from() was never called — the RPC handles everything atomically
-    expect(supabase.from).not.toHaveBeenCalled()
+    // No line/entry fetch happened: the RPC handles everything atomically.
+    // (PR10: commitEntry now also probes account_dimension_rules first; the
+    // bare mock makes that probe fail open, which is exactly the posture.)
+    expect(supabase.from).not.toHaveBeenCalledWith('journal_entries')
+    expect(supabase.from).not.toHaveBeenCalledWith('journal_entry_lines')
   })
 
   it('commitEntry succeeds via atomic RPC and returns posted entry', async () => {
@@ -106,9 +122,50 @@ describe('voucher number atomicity', () => {
       p_entry_id: 'entry-1',
       p_commit_method: null,
       p_rubric_version: null,
+      p_actor_type: null,
+      p_actor_label: null,
     })
     // from() called once to fetch the complete entry with lines
     expect(supabase.from).toHaveBeenCalledWith('journal_entries')
+  })
+
+  /**
+   * Actor attribution (migration 20260619120000): commitEntry forwards the
+   * surrounding runWithActor() scope to the RPC so the immutable layer can
+   * record WHO relayed the commit. Outside a scope the params stay null
+   * (asserted by the two tests above).
+   */
+  it('commitEntry forwards the runWithActor scope to the RPC', async () => {
+    const postedEntry = {
+      id: 'entry-1',
+      company_id: 'co-1',
+      voucher_number: 1,
+      status: 'posted' as JournalEntryStatus,
+      lines: [],
+    }
+    const supabase = {
+      from: vi.fn().mockImplementation(() => ({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            single: vi.fn().mockResolvedValue({ data: postedEntry, error: null }),
+          }),
+        }),
+      })),
+      rpc: vi.fn().mockResolvedValue({ data: [{ voucher_number: 1 }], error: null }),
+    }
+
+    await runWithActor({ type: 'api_key', label: 'Claude Desktop' }, () =>
+      commitEntry(supabase as never, 'co-1', 'user-1', 'entry-1', 'api_key')
+    )
+
+    expect(supabase.rpc).toHaveBeenCalledWith('commit_journal_entry', {
+      p_company_id: 'co-1',
+      p_entry_id: 'entry-1',
+      p_commit_method: 'api_key',
+      p_rubric_version: null,
+      p_actor_type: 'api_key',
+      p_actor_label: 'Claude Desktop',
+    })
   })
 
   /**
@@ -213,7 +270,7 @@ describe('createJournalEntry orphan draft cleanup', () => {
         }
         return {}
       }),
-      // commit_journal_entry RPC fails — simulates overload ambiguity or balance error
+      // commit_journal_entry RPC fails: simulates overload ambiguity or balance error
       rpc: vi.fn().mockResolvedValue({
         data: null,
         error: { message: 'Could not choose the best candidate function' },
@@ -231,7 +288,7 @@ describe('createJournalEntry orphan draft cleanup', () => {
           { account_number: '1510', debit_amount: 0, credit_amount: 1000 },
         ],
       })
-    ).rejects.toThrow('Failed to commit journal entry')
+    ).rejects.toThrow(BookkeepingDatabaseError)
 
     // The orphan draft must have been cancelled with CAS guard (status='draft')
     expect(cancelUpdate).toHaveBeenCalledWith({ status: 'cancelled' })
@@ -295,7 +352,7 @@ describe('createJournalEntry orphan draft cleanup', () => {
                 }),
               }),
             }),
-            // Cleanup throws — original error should still propagate
+            // Cleanup throws: original error should still propagate
             update: vi.fn().mockImplementation(() => {
               throw new Error('Network error during rollback')
             }),

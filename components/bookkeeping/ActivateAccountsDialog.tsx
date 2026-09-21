@@ -17,12 +17,23 @@ export interface ActivateAccountsDialogProps {
   accountNumbers: string[]
   onConfirm: () => Promise<void> | void
   onCancel: () => void
+  // Optional: invoked when the user wants to create a custom (non-BAS) account
+  // for a number that isn't in the BAS catalogue. The host should close this
+  // dialog and open AddAccountDialog prefilled with the number.
+  onCreateUnknown?: (accountNumber: string) => void
+  // Confirm button label. Defaults to the bookkeeping wording; non-booking
+  // hosts (e.g. the article register) pass their own.
+  confirmLabel?: string
 }
 
 interface BasLookupRow {
   account_number: string
   account_name: string | null
   known: boolean
+  // Present since the lookup learned about the company's own chart: an account
+  // that is in_chart but not is_active is being reactivated, not added.
+  in_chart?: boolean
+  is_active?: boolean
 }
 
 export function ActivateAccountsDialog({
@@ -30,6 +41,8 @@ export function ActivateAccountsDialog({
   accountNumbers,
   onConfirm,
   onCancel,
+  onCreateUnknown,
+  confirmLabel,
 }: ActivateAccountsDialogProps) {
   const [rows, setRows] = useState<BasLookupRow[]>([])
   const [loading, setLoading] = useState(false)
@@ -47,7 +60,15 @@ export function ActivateAccountsDialog({
       })
       .catch(() => {
         if (cancelled) return
-        setRows(accountNumbers.map((n) => ({ account_number: n, account_name: null, known: false })))
+        setRows(
+          accountNumbers.map((n) => ({
+            account_number: n,
+            account_name: null,
+            known: false,
+            in_chart: false,
+            is_active: false,
+          })),
+        )
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -93,23 +114,45 @@ export function ActivateAccountsDialog({
           )}
 
           {!loading && knownRows.length > 0 && (
-            <ul className="divide-y divide-border rounded-md border">
+            <ul className="divide-y divide-border rounded-lg border">
               {knownRows.map((r) => (
                 <li key={r.account_number} className="flex items-baseline gap-3 px-3 py-2">
                   <span className="font-mono text-foreground w-14 shrink-0">{r.account_number}</span>
                   <span className="truncate">{r.account_name}</span>
+                  {r.in_chart && !r.is_active && (
+                    <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                      Aktiveras igen
+                    </span>
+                  )}
                 </li>
               ))}
             </ul>
           )}
 
           {!loading && unknownRows.length > 0 && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-              <p className="font-medium">Okända konton:</p>
+            <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-attn">
+              <p className="font-medium">Finns inte i BAS-katalogen:</p>
               <p className="mt-1 font-mono">{unknownRows.map((r) => r.account_number).join(', ')}</p>
-              <p className="mt-1 text-destructive/80">
-                Dessa nummer finns inte i BAS-katalogen och kan inte aktiveras automatiskt. Kontrollera inmatningen.
+              <p className="mt-1 text-attn/80">
+                Skapa dem som egna konton, eller kontrollera inmatningen.
               </p>
+              {onCreateUnknown && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {unknownRows.map((r) => (
+                    <Button
+                      key={r.account_number}
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8 text-xs"
+                      onClick={() => onCreateUnknown(r.account_number)}
+                    >
+                      <Plus className="mr-1 h-3 w-3" />
+                      Skapa <span data-ph-mask="">{r.account_number}</span>
+                    </Button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -127,7 +170,7 @@ export function ActivateAccountsDialog({
             ) : (
               <>
                 <Plus className="mr-2 h-4 w-4" />
-                Aktivera och bokför
+                {confirmLabel ?? 'Aktivera och bokför'}
               </>
             )}
           </Button>

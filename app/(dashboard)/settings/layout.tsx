@@ -1,19 +1,23 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
-import { SettingsNav } from '@/components/settings/SettingsSidebar'
-import { useCompany } from '@/contexts/CompanyContext'
-import { createClient } from '@/lib/supabase/client'
+import { useTranslations } from 'next-intl'
+import { PageHeader } from '@/components/ui/page-header'
+import { SettingsShell } from '@/components/settings/SettingsShell'
+import { ActiveCompanyBadge } from '@/components/settings/ActiveCompanyBadge'
 
 const TAB_TO_ROUTE: Record<string, string> = {
   company: '/settings/company',
   invoicing: '/settings/invoicing',
+  payments: '/import?mode=stripe',
   bookkeeping: '/settings/bookkeeping',
   tax: '/settings/tax',
   team: '/settings/team',
   banking: '/settings/banking',
   templates: '/settings/templates',
+  'agent-memory': '/settings/assistant',
+  assistant: '/settings/assistant',
   account: '/settings/account',
   api: '/settings/api',
 }
@@ -21,22 +25,7 @@ const TAB_TO_ROUTE: Record<string, string> = {
 export default function SettingsLayout({ children }: { children: React.ReactNode }) {
   const searchParams = useSearchParams()
   const router = useRouter()
-  const { company } = useCompany()
-  const [isSandbox, setIsSandbox] = useState(false)
-
-  // Fetch sandbox status
-  useEffect(() => {
-    if (!company?.id) return
-    const supabase = createClient()
-    supabase
-      .from('company_settings')
-      .select('is_sandbox')
-      .eq('company_id', company.id)
-      .single()
-      .then(({ data }) => {
-        if (data?.is_sandbox) setIsSandbox(true)
-      })
-  }, [company?.id])
+  const t = useTranslations('settings_nav')
 
   // Handle legacy ?tab= URLs
   useEffect(() => {
@@ -47,17 +36,9 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
   }, [searchParams, router])
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">Inställningar</h1>
-        <p className="text-muted-foreground text-sm mt-1">
-          Hantera ditt företag och konto
-        </p>
-      </div>
-
-      <SettingsNav isSandbox={isSandbox} />
-
-      <div>{children}</div>
+    <div className="space-y-8">
+      <PageHeader title={t('aria_label')} action={<ActiveCompanyBadge />} />
+      <SettingsShell variant="page">{children}</SettingsShell>
     </div>
   )
 }

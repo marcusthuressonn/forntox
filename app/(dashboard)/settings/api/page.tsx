@@ -1,7 +1,5 @@
-'use client'
-
-import { ApiKeysPanel } from '@/components/settings/ApiKeysPanel'
+import { ApiSettingsContent } from '@/components/settings/sections/ApiSettingsContent'
 
 export default function ApiSettingsPage() {
-  return <ApiKeysPanel />
+  return <ApiSettingsContent />
 }

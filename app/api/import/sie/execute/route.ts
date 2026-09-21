@@ -1,246 +1,66 @@
-import { createClient } from '@/lib/supabase/server'
-import { fetchAllRows } from '@/lib/supabase/fetch-all'
-import { NextResponse } from 'next/server'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
-import { parseSIEFile, detectEncoding, decodeBuffer } from '@/lib/import/sie-parser'
+import { after, NextResponse } from 'next/server'
+import { detectEncoding, decodeBuffer, parseSIEFile } from '@/lib/import/sie-parser'
 import { suggestMappings } from '@/lib/import/account-mapper'
-import { executeSIEImport, checkDuplicateImport } from '@/lib/import/sie-import'
 import { BAS_REFERENCE } from '@/lib/bookkeeping/bas-data'
-import { getBASReference } from '@/lib/bookkeeping/bas-reference'
-import type { AccountMapping, SIEAccountMappingRecord } from '@/lib/import/types'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { SIEJobMappingsSchema, SIEJobOptionsSchema } from '@/lib/api/schemas'
+import { submitSIEJob, SIEJobValidationError } from '@/lib/import/sie-jobs'
+import { sieJobValidationResponse } from '@/lib/import/sie-job-validation-response'
+import { runSIEWorker } from '@/lib/import/sie-job-worker'
+import { SIE_LIMITS } from '@/lib/import/sie-job-contract'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import type { SIEAccountMappingRecord } from '@/lib/import/types'
+import { readSIERequestFile } from '@/lib/import/sie-intake'
 
-// SIE imports with many vouchers need extended execution time
 export const maxDuration = 300
 
-/**
- * POST /api/import/sie/execute
- * Execute the SIE import
- */
-export async function POST(request: Request) {
-  const supabase = await createClient()
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
+/** Submit an execution; no ledger work runs before the 202 response. */
+export const POST = withRouteContext('sie_import.execute', async (request,ctx) => {
+  const {supabase,companyId,user,log,requestId} = ctx
   try {
-    // Get form data with file and options
-    const formData = await request.formData()
-    const file = formData.get('file') as File | null
-    const mappingsJson = formData.get('mappings') as string | null
-    const optionsJson = formData.get('options') as string | null
-
-    if (!file) {
-      return NextResponse.json({ error: 'Ingen fil bifogad. Gå tillbaka och ladda upp filen igen.' }, { status: 400 })
-    }
-
-    // Parse options. The voucherSeries option is only a fallback for vouchers
-    // that arrive without a series (SIE4I subsystem files); the import engine
-    // preserves each #VER's source series per voucher.
-    const parsedOptions = optionsJson ? JSON.parse(optionsJson) : null
-    const { data: companySettings } = await supabase
-      .from('company_settings')
-      .select('default_voucher_series')
-      .eq('company_id', companyId)
-      .maybeSingle()
-    const companyDefaultSeries = companySettings?.default_voucher_series || 'B'
-
-    const options = parsedOptions ?? {
-      createFiscalPeriod: true,
-      importOpeningBalances: true,
-      importTransactions: true,
-      voucherSeries: companyDefaultSeries,
-    }
-
-    // Read and decode file
-    const arrayBuffer = await file.arrayBuffer()
-    const encoding = detectEncoding(arrayBuffer)
-    const content = decodeBuffer(arrayBuffer, encoding)
-
-    // Parse the SIE file
-    const parsed = parseSIEFile(content)
-
-    // Check for duplicate import before doing any work
-    const duplicate = await checkDuplicateImport(supabase, companyId, content)
-    if (duplicate) {
-      return NextResponse.json({
-        error: 'duplicate',
-        message: `Denna fil har redan importerats ${duplicate.imported_at ? new Date(duplicate.imported_at).toLocaleDateString('sv-SE') : ''}`.trim(),
-      }, { status: 409 })
-    }
-
-    // Get mappings - either from request or generate new ones
-    let mappings: AccountMapping[]
-
-    if (mappingsJson) {
-      mappings = JSON.parse(mappingsJson)
-    } else {
-      // Match against full BAS reference (not just user's active chart)
-      const { data: storedMappings } = await supabase
-        .from('sie_account_mappings')
-        .select('*')
-        .eq('company_id', companyId)
-
-      mappings = suggestMappings(
-        parsed.accounts,
-        BAS_REFERENCE,
-        (storedMappings as SIEAccountMappingRecord[]) || undefined
-      )
-    }
-
-    // Validate all accounts are mapped
-    const unmapped = mappings.filter((m) => !m.targetAccount)
-    if (unmapped.length > 0) {
-      const accountList = unmapped.slice(0, 5).map((m) => `${m.sourceAccount} (${m.sourceName})`).join(', ')
-      const remaining = unmapped.length > 5 ? ` och ${unmapped.length - 5} till` : ''
-      return NextResponse.json({
-        error: 'validation',
-        message: `${unmapped.length} konto(n) saknar mappning: ${accountList}${remaining}. Gå tillbaka till kontomappningssteget och koppla alla konton.`,
-        unmappedAccounts: unmapped.map((m) => ({
-          account: m.sourceAccount,
-          name: m.sourceName,
-        })),
-      }, { status: 400 })
-    }
-
-    // Auto-activate any mapped BAS accounts not yet in the user's chart
-    const mappedAccountNumbers = [
-      ...new Set(mappings.filter((m) => m.targetAccount).map((m) => m.targetAccount)),
-    ]
-
-    const allCompanyAccounts = await fetchAllRows(({ from, to }) =>
-      supabase
-        .from('chart_of_accounts')
-        .select('account_number')
-        .eq('company_id', companyId)
-        .range(from, to)
-    )
-    const mappedSet = new Set(mappedAccountNumbers)
-    const existingAccounts = allCompanyAccounts.filter((a) => mappedSet.has(a.account_number))
-
-    // Build a lookup from SIE mappings for account names (used for bas_range accounts)
-    const mappingNameLookup = new Map<string, string>()
-    for (const m of mappings) {
-      if (m.targetAccount) {
-        mappingNameLookup.set(m.targetAccount, m.targetName || m.sourceName)
+    const form = await request.formData()
+    const file = await readSIERequestFile(form,supabase,companyId)
+    if (!(file instanceof File)) return errorResponseFromCode('SIE_PARSE_NO_FILE',log,{requestId})
+    if (!/\.(sie|se|si)$/i.test(file.name)) return errorResponseFromCode('SIE_PARSE_INVALID_TYPE',log,{requestId})
+    if (file.size > SIE_LIMITS.fileBytes) return errorResponseFromCode('SIE_PARSE_FILE_TOO_LARGE',log,{requestId})
+    if (!file.size) return errorResponseFromCode('SIE_PARSE_EMPTY',log,{requestId})
+    const options = SIEJobOptionsSchema.parse(JSON.parse(String(form.get('options') ?? '{}')))
+    const buffer = await file.arrayBuffer()
+    const content = decodeBuffer(buffer,detectEncoding(buffer))
+    let mappings
+    if (form.get('mappings')) {
+      const supplied: unknown = JSON.parse(String(form.get('mappings')))
+      const checked = SIEJobMappingsSchema.safeParse(supplied)
+      if (!checked.success) {
+        return errorResponse(checked.error, log, { requestId, details: {
+          issues: checked.error.issues.map(issue => ({
+            field: issue.path.join('.'), message: issue.message, code: issue.code,
+            ...(Array.isArray(supplied) && typeof issue.path[0] === 'number' &&
+              typeof supplied[issue.path[0]]?.sourceAccount === 'string' &&
+              /^\d{1,40}$/.test(supplied[issue.path[0]].sourceAccount)
+              ? { sourceAccount: supplied[issue.path[0]].sourceAccount } : {}),
+          })),
+        } })
       }
+      mappings = checked.data
     }
-
-    const existingNumbers = new Set(existingAccounts.map((a) => a.account_number))
-    const accountsToActivate = mappedAccountNumbers
-      .filter((num) => !existingNumbers.has(num))
-      .map((num) => {
-        const ref = getBASReference(num)
-        if (ref) {
-          // Account exists in BAS reference — use full metadata
-          return {
-            user_id: user.id,
-            company_id: companyId,
-            account_number: ref.account_number,
-            account_name: ref.account_name,
-            account_class: ref.account_class,
-            account_group: ref.account_group,
-            account_type: ref.account_type,
-            normal_balance: ref.normal_balance,
-            plan_type: 'full_bas' as const,
-            is_active: true,
-            is_system_account: false,
-            description: ref.description,
-            sru_code: ref.sru_code,
-            sort_order: parseInt(ref.account_number),
-          }
-        }
-
-        // Account not in BAS reference (sub-account like 1241 Personbilar).
-        // Derive metadata from the account number.
-        const accountClass = parseInt(num.charAt(0), 10)
-        const accountGroup = num.substring(0, 2)
-        const accountName = mappingNameLookup.get(num) || `Konto ${num}`
-        const accountType =
-          accountClass === 1 ? 'asset'
-            : accountClass === 2 ? 'liability'
-              : accountClass === 3 ? 'revenue'
-                : 'expense'
-        const normalBalance =
-          accountClass <= 1 || accountClass >= 4 ? 'debit' : 'credit'
-
-        return {
-          user_id: user.id,
-          company_id: companyId,
-          account_number: num,
-          account_name: accountName,
-          account_class: accountClass,
-          account_group: accountGroup,
-          account_type: accountType,
-          normal_balance: normalBalance,
-          plan_type: 'full_bas' as const,
-          is_active: true,
-          is_system_account: false,
-          description: accountName,
-          sru_code: null,
-          sort_order: parseInt(num),
-        }
-      })
-
-    if (accountsToActivate.length > 0) {
-      const { error: activateError } = await supabase
-        .from('chart_of_accounts')
-        .insert(accountsToActivate)
-
-      if (activateError) {
-        return NextResponse.json({
-          error: `Kunde inte aktivera konton i kontoplanen: ${activateError.message}. Kontrollera att kontona inte redan finns med andra inställningar.`,
-        }, { status: 500 })
-      }
+    else {
+      const stored = await fetchAllRows<SIEAccountMappingRecord>(({from,to}) => supabase.from('sie_account_mappings')
+        .select('*').eq('company_id',companyId).order('source_account').range(from,to))
+      mappings = SIEJobMappingsSchema.parse(suggestMappings(parseSIEFile(content).accounts,BAS_REFERENCE,stored))
     }
-
-    // Execute the import
-    const result = await executeSIEImport(
-      supabase,
-      companyId,
-      user.id,
-      parsed,
-      mappings,
-      {
-        filename: file.name,
-        fileContent: content,
-        createFiscalPeriod: options.createFiscalPeriod,
-        importOpeningBalances: options.importOpeningBalances,
-        importTransactions: options.importTransactions,
-        voucherSeries: options.voucherSeries || companyDefaultSeries,
-      }
-    )
-
-    if (!result.success) {
-      return NextResponse.json({
-        error: 'import',
-        message: 'Importen slutfördes med fel. Se detaljerna nedan för att förstå vad som gick snett.',
-        result,
-      }, { status: 400 })
-    }
-
-    return NextResponse.json({
-      success: true,
-      result,
-    })
+    const job = await submitSIEJob(supabase,companyId!,user.id,content,mappings,{...options,filename:file.name},file)
+    after(async () => { await runSIEWorker({importId:job.id}) })
+    return NextResponse.json({data:{importId:job.id,state:job.job_state,statusUrl:`/api/import/sie/${job.id}`}},
+      {status:202,headers:{Location:`/api/import/sie/${job.id}`,'Retry-After':'2'}})
   } catch (error) {
-    console.error('SIE import error:', error)
-    const detail = error instanceof Error ? error.message : ''
-    return NextResponse.json(
-      {
-        error: `Importen avbröts oväntat. Ingen data har sparats.${detail ? ` (${detail})` : ''} Försök igen — om felet kvarstår, kontakta support.`,
-      },
-      { status: 500 }
-    )
+    if (error instanceof SyntaxError) return errorResponseFromCode('VALIDATION_ERROR',log,{requestId})
+    // The validator's own sentence and details (the voucher outside the
+    // fiscal year, the accounts behind SIE_IMPORT_UNSUPPORTED_ACCOUNT_CLASS)
+    // travel with the structured code so the client can name them instead of
+    // the registry's generic sentence.
+    if (error instanceof SIEJobValidationError) return sieJobValidationResponse(error,log,requestId)
+    return errorResponse(error,log,{requestId})
   }
-}
+},{requireWrite:true})

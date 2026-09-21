@@ -1,43 +1,26 @@
 'use server'
 
+import { cookies, headers } from 'next/headers'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
-import { setActiveCompany } from '@/lib/company/context'
+import {
+  BOOKS_GATE_COOKIE,
+  BOOKS_GATE_MAX_AGE_SECONDS,
+  booksGateEnabled,
+} from '@/lib/onboarding/books-gate'
+import { setActiveCompany, CompanyContextError } from '@/lib/company/context'
 import { revalidatePath } from 'next/cache'
-import { computeFiscalPeriod } from '@/lib/company/compute-fiscal-period'
-import { mapEntityType } from '@/lib/company-lookup/entity-type-map'
-import { normalizeOrgNumber } from '@/lib/company-lookup/normalize-org-number'
+import { createCompanyCore } from '@/lib/company/create-company'
+import { isEntityType, isEntityTypeCreatable } from '@/lib/company/entity-type'
+import type { SupabaseClient } from '@supabase/supabase-js'
 import type { CompanyLookupResult } from '@/lib/company-lookup/types'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 
 /**
- * Check whether an org number is already registered in any non-archived
- * gnubok company. Uses the service role because RLS hides rows the caller
- * isn't a member of — and "other users' duplicates" is exactly what we
- * need to detect. Returns null when `orgNumber` is empty/malformed. Throws
- * if the underlying query fails — callers must not silently treat that as
- * "no duplicate," or the whole guard gets bypassed on transient DB errors.
+ * Switch the active company. Returns an error *code* (translated by the
+ * caller, same pattern as `org_number_invalid` below): 'not_member' when the
+ * user lacks membership, 'persist_failed' when the user_preferences write
+ * failed or could not be verified (#701).
  */
-async function findExistingCompanyByOrgNumber(
-  orgNumber: string | null | undefined,
-): Promise<{ id: string; name: string } | null> {
-  const cleaned = normalizeOrgNumber(orgNumber)
-  if (!cleaned) return null
-
-  const service = createServiceClient()
-  const { data, error } = await service
-    .from('companies')
-    .select('id, name')
-    .eq('org_number', cleaned)
-    .is('archived_at', null)
-    .limit(1)
-    .maybeSingle()
-
-  if (error) {
-    throw new Error(`Duplicate-org lookup failed: ${error.message}`)
-  }
-
-  return data ?? null
-}
-
 export async function switchCompany(companyId: string): Promise<{ error?: string }> {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
@@ -48,13 +31,24 @@ export async function switchCompany(companyId: string): Promise<{ error?: string
 
   try {
     await setActiveCompany(supabase, user.id, companyId)
-    // No revalidatePath — the client performs a hard navigation
+    // No revalidatePath: the client performs a hard navigation
     // (window.location.assign) after this action returns, which wipes
     // every React/router/fetch cache wholesale. revalidatePath would be a
     // no-op and would just race with the hard reload.
     return {}
-  } catch {
-    return { error: 'Du har inte tillgång till detta företag.' }
+  } catch (err) {
+    console.error('[switchCompany] failed', err)
+    if (err instanceof CompanyContextError && err.code === 'not_member') {
+      return { error: 'not_member' }
+    }
+    if (err instanceof CompanyContextError && err.code === 'company_locked') {
+      // Multi-user seat gate: the company is frozen for this (non-owner)
+      // membership until someone pays. Translated by the caller.
+      return { error: 'company_locked' }
+    }
+    // persist_failed and anything unexpected: a retryable failure, not a
+    // permissions problem: don't tell the user they lack access.
+    return { error: 'persist_failed' }
   }
 }
 
@@ -76,6 +70,34 @@ export async function createCompanyFromOnboarding(params: {
     endDate: string
     name: string
   }
+  // Optional TIC lookup result captured during the onboarding form. When
+  // supplied, persisted to companies.tic_snapshot so downstream features
+  // (specialized accountant agent composer, MCP briefing) can read the same
+  // Bolagsverket-sourced data the form used. Empty for manual entry paths.
+  ticLookup?: CompanyLookupResult | null
+  // First company of a fresh account (journey mode='first'): arm the books
+  // gate so the dashboard stays closed until act two ran or was skipped
+  // (issue #2438). Adding a company from inside the app never arms it.
+  booksGate?: boolean
+}): Promise<{ companyId?: string; error?: string }> {
+  try {
+    return await createCompanyFromOnboardingImpl(params)
+  } catch (err) {
+    // Defensive top-level catch: a thrown error escapes to the client as
+    // an opaque Next.js server-action exception with no message in dev
+    // and a redacted message in prod. Logging the full error here gives
+    // us a server-side trace and returns a localized fallback to the UI.
+    console.error('[createCompanyFromOnboarding] unexpected error', err)
+    return { error: getErrorMessage(err, { context: 'settings' }) }
+  }
+}
+
+async function createCompanyFromOnboardingImpl(params: {
+  teamId: string
+  settings: Record<string, unknown>
+  fiscalPeriod: { startDate: string; endDate: string; name: string }
+  ticLookup?: CompanyLookupResult | null
+  booksGate?: boolean
 }): Promise<{ companyId?: string; error?: string }> {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
@@ -84,136 +106,116 @@ export async function createCompanyFromOnboarding(params: {
     return { error: 'Unauthorized' }
   }
 
-  const entityType = params.settings.entity_type as string | undefined
-  if (entityType !== 'enskild_firma' && entityType !== 'aktiebolag') {
+  const entityType = params.settings.entity_type
+  if (!isEntityType(entityType) || !isEntityTypeCreatable(entityType)) {
     return { error: 'Ogiltig företagsform.' }
   }
 
   const companyName = (params.settings.company_name as string | undefined) || 'Mitt företag'
 
-  // Duplicate-org guard. We don't have a DB unique constraint on
-  // companies.org_number (can't add one safely without cleaning up any
-  // existing duplicates first), so enforce uniqueness at the application
-  // boundary. Must run before the create RPC so we don't leave a ghost
-  // company if the duplicate is detected mid-flow.
-  //
-  // normalizeOrgNumber returns null for malformed input — we refuse rather
-  // than storing a value that would break SIE/SRU exports later.
-  const rawOrgNumber = params.settings.org_number as string | undefined
-  const cleanedOrgNumber = normalizeOrgNumber(rawOrgNumber)
-  if (rawOrgNumber && rawOrgNumber.trim() && !cleanedOrgNumber) {
-    return { error: 'org_number_invalid' }
-  }
-  if (cleanedOrgNumber) {
-    try {
-      const existing = await findExistingCompanyByOrgNumber(cleanedOrgNumber)
-      if (existing) {
-        return { error: 'org_number_exists' }
-      }
-    } catch (err) {
-      // Guard must fail closed: if we can't confirm uniqueness, don't create
-      // a company. A silent pass-through would let transient DB errors
-      // through as duplicates (exactly the bug Greptile flagged).
-      console.error('[createCompanyFromOnboarding] duplicate-org lookup failed', err)
-      return { error: 'Kunde inte verifiera organisationsnummer. Försök igen.' }
+  // Creating a company under a BYRÅ team is admin-gated (WL-15): every
+  // created client company is +1 on the byrå's monthly invoice, so only team
+  // owner/admin may do it. Personal-team creation is untouched. The
+  // create_company_with_owner RPC enforces the same rule in the database
+  // (migration 20260826130400); this check exists to return a readable error
+  // instead of a raw 42501. A team the caller cannot read via RLS resolves
+  // to null kind here and falls through to the RPC's own membership check.
+  const { data: teamRow } = await supabase
+    .from('teams')
+    .select('kind')
+    .eq('id', params.teamId)
+    .maybeSingle()
+  if ((teamRow as { kind?: string } | null)?.kind === 'byra') {
+    const { data: teamMemberRow } = await supabase
+      .from('team_members')
+      .select('role')
+      .eq('team_id', params.teamId)
+      .eq('user_id', user.id)
+      .maybeSingle()
+    const teamRole = (teamMemberRow as { role?: string } | null)?.role
+    if (teamRole !== 'owner' && teamRole !== 'admin') {
+      return { error: 'Endast byråns ägare och administratörer kan skapa klientbolag.' }
     }
   }
 
-  // 1. Create company + owner membership atomically via RPC
-  const { data: newCompanyId, error: companyError } = await supabase.rpc('create_company_with_owner', {
-    p_name: companyName,
-    p_entity_type: entityType,
-    p_team_id: params.teamId,
-  })
+  // Brand-host signup homing (2026-08-27): when this wizard runs on an
+  // invite-only brand host and the creating user is on the brand's signup
+  // allowlist, the company attaches to the brand's byrå team via the
+  // create_company_for_brand_signup RPC (which re-checks the allowlist).
+  // Without this the company would get the personal team and the home-domain
+  // rule (WL-01) would home it on the canonical domain, invisible on the
+  // very brand domain the user signed up on. Only the personal-team path is
+  // rerouted: an explicit byrå-team creation (the cockpit's new-client flow)
+  // already passed the byrå team and stays under the WL-15 admin gate above.
+  let createCompanyRow: () => PromiseLike<{ data: unknown; error: unknown }> =
+    () =>
+      supabase.rpc('create_company_with_owner', {
+        p_name: companyName,
+        p_entity_type: entityType,
+        p_team_id: params.teamId,
+      })
+  // When the row is created under the service role (brand-signup path below),
+  // rollback must also run under the service role: `companies` has RLS and no
+  // FOR DELETE policy, so a cookie-session rollback of a service-created
+  // company deletes nothing and strands a member-less orphan on the brand's
+  // team. Stays null on the normal path, where the session client is correct.
+  // Once the rollback delete lands, user_preferences.active_company_id (which
+  // the RPC set) auto-clears via its ON DELETE SET NULL FK, so no dangling
+  // active company survives.
+  let rollbackClient: SupabaseClient | undefined
 
-  if (companyError || !newCompanyId) {
-    console.error('[createCompanyFromOnboarding] company creation failed', companyError)
-    return { error: 'Kunde inte skapa företag. Försök igen.' }
-  }
-
-  // Helper: roll back the company if a subsequent step fails. Deletes in FK order.
-  const rollback = async (reason: string, err: unknown) => {
-    console.error(`[createCompanyFromOnboarding] rolling back ${newCompanyId}: ${reason}`, err)
-    await supabase.from('company_settings').delete().eq('company_id', newCompanyId)
-    await supabase.from('fiscal_periods').delete().eq('company_id', newCompanyId)
-    await supabase.from('chart_of_accounts').delete().eq('company_id', newCompanyId)
-    await supabase.from('company_members').delete().eq('company_id', newCompanyId)
-    await supabase.from('companies').delete().eq('id', newCompanyId)
-  }
-
-  // Mirror the normalized org_number onto the companies row so future
-  // duplicate checks and cross-references are reliable. MUST be error-checked
-  // and rolled back on failure — otherwise the freshly-created company would
-  // exist without an org_number and the duplicate guard would never match it
-  // for any future user (the very guard this code is enforcing).
-  if (cleanedOrgNumber) {
-    const { error: orgUpdateError } = await supabase
-      .from('companies')
-      .update({ org_number: cleanedOrgNumber })
-      .eq('id', newCompanyId)
-    if (orgUpdateError) {
-      await rollback('org_number update failed', orgUpdateError)
-      return { error: 'Kunde inte spara organisationsnummer. Försök igen.' }
+  if ((teamRow as { kind?: string } | null)?.kind !== 'byra' && user.email) {
+    // Dynamic imports: this file is imported by client components (through
+    // switch-client.ts) for its other actions, and these two modules reach
+    // node:crypto; a static import would drag Node builtins into the client
+    // graph (client-node-builtin guard). Server actions always execute
+    // server-side, so the dynamic import is free here.
+    const [{ resolveBrandByHost }, { isEmailOnBrandAllowlist }] = await Promise.all([
+      import('@/lib/branding/resolve'),
+      import('@/lib/auth/brand-signup-gate'),
+    ])
+    const requestHeaders = await headers()
+    const host =
+      requestHeaders.get('x-forwarded-host') ?? requestHeaders.get('host') ?? ''
+    const hostBrand = host ? await resolveBrandByHost(host) : null
+    if (
+      hostBrand?.signupMode === 'invite_only' &&
+      (await isEmailOnBrandAllowlist(hostBrand.id, user.email))
+    ) {
+      const serviceClient = createServiceClient()
+      rollbackClient = serviceClient
+      createCompanyRow = () =>
+        serviceClient.rpc('create_company_for_brand_signup', {
+          p_user_id: user.id,
+          p_name: companyName,
+          p_entity_type: entityType,
+          p_brand_id: hostBrand.id,
+        })
     }
   }
 
-  // 2. Seed chart of accounts
-  const { error: coaError } = await supabase.rpc('seed_chart_of_accounts', {
-    p_company_id: newCompanyId,
-    p_entity_type: entityType,
-  })
-  if (coaError) {
-    await rollback('COA seeding failed', coaError)
-    return { error: 'Kunde inte skapa kontoplan. Försök igen.' }
-  }
-
-  // 3. Save settings (strip UI-only and managed fields)
-  const {
-    id: _id,
-    user_id: _uid,
-    company_id: _cid,
-    created_at: _ca,
-    updated_at: _ua,
-    is_first_fiscal_year: _ify,
-    first_year_start: _fys,
-    first_year_end: _fye,
-    ...settingsToSave
-  } = params.settings
-
-  const { error: settingsError } = await supabase
-    .from('company_settings')
-    .upsert(
-      {
-        ...settingsToSave,
-        company_id: newCompanyId,
-        onboarding_complete: true,
-        onboarding_step: 4,
-      },
-      { onConflict: 'company_id' },
-    )
-
-  if (settingsError) {
-    await rollback('settings upsert failed', settingsError)
-    return { error: 'Kunde inte spara inställningar. Försök igen.' }
-  }
-
-  // 4. Create fiscal period
-  const { error: periodError } = await supabase.from('fiscal_periods').upsert(
+  // Steps 1-5 (company + owner via RPC, org number, TIC snapshot, chart,
+  // settings, fiscal period, tax deadlines, with rollback) are shared with
+  // the MCP and v1 creation paths: lib/company/create-company.ts.
+  const created = await createCompanyCore(
+    supabase,
     {
-      company_id: newCompanyId,
-      name: params.fiscalPeriod.name,
-      period_start: params.fiscalPeriod.startDate,
-      period_end: params.fiscalPeriod.endDate,
+      entityType,
+      companyName,
+      orgNumber: params.settings.org_number as string | undefined,
+      settings: params.settings,
+      fiscalPeriod: params.fiscalPeriod,
+      ticLookup: params.ticLookup,
     },
-    { onConflict: 'company_id,period_start,period_end' },
+    createCompanyRow,
+    rollbackClient,
   )
-
-  if (periodError) {
-    await rollback('fiscal period upsert failed', periodError)
-    return { error: 'Kunde inte skapa räkenskapsår. Försök igen.' }
+  if (created.error !== undefined) {
+    return { error: created.error }
   }
+  const newCompanyId = created.companyId
 
-  // 5. Set as active company
+  // 6. Set as active company
   try {
     await setActiveCompany(supabase, user.id, newCompanyId)
   } catch (err) {
@@ -221,135 +223,24 @@ export async function createCompanyFromOnboarding(params: {
     console.error('[createCompanyFromOnboarding] setActiveCompany failed', err)
   }
 
+  // 7. Arm the first-session books gate. Non-fatal: without the cookie the
+  // user simply lands on Hem with the checklist, exactly as before.
+  if (params.booksGate && booksGateEnabled()) {
+    try {
+      const cookieStore = await cookies()
+      cookieStore.set(BOOKS_GATE_COOKIE, newCompanyId, {
+        path: '/',
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: BOOKS_GATE_MAX_AGE_SECONDS,
+      })
+    } catch (err) {
+      console.error('[createCompanyFromOnboarding] books gate cookie failed', err)
+    }
+  }
+
   revalidatePath('/')
   return { companyId: newCompanyId }
 }
 
-/**
- * One-click company setup from a TIC/Bolagsverket company role.
- *
- * The picker page at /select-company passes a `CompanyLookupResult` already
- * fetched from `/api/extensions/ext/tic/lookup`, plus the `EnrichmentCompanyRole`
- * minimums (org number, legal name, legal entity type). This action derives
- * sensible defaults (accrual, quarterly moms for VAT-registered, Jan-Dec
- * fiscal year) and delegates to `createCompanyFromOnboarding` so the
- * provisioning path is identical to the manual wizard. On success it clears
- * the enrichment row consumed by this path — the manual wizard leaves it
- * intact so a returning BankID user can still reach `/select-company` and
- * pick another directorship.
- *
- * Requires `lookup` to be non-null: if TIC `/lookup` is unreachable, the client
- * must route to the manual wizard instead. Silently defaulting `vat_registered`
- * to false for a momsregistrerat bolag would violate ML 17 kap (invoices
- * without moms), so we refuse to guess.
- */
-export async function createCompanyFromTicRole(params: {
-  teamId: string
-  orgNumber: string
-  legalName: string
-  legalEntityType: string
-  lookup: CompanyLookupResult | null
-}): Promise<{ companyId?: string; error?: string }> {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return { error: 'Unauthorized' }
-  }
-
-  const entityType = mapEntityType(params.legalEntityType)
-  if (!entityType) {
-    return { error: 'Den här företagsformen måste sättas upp manuellt.' }
-  }
-
-  // If the TIC lookup failed we don't know the company's VAT/F-skatt status.
-  // Refuse to silently guess — the caller routes to the manual wizard so the
-  // user can confirm these fields themselves.
-  if (!params.lookup) {
-    return { error: 'lookup_missing' }
-  }
-
-  // Ceased/struck-off companies must not be provisioned. Under BFL 2 kap,
-  // bokföringsskyldighet ends when a company is avregistrerad; creating a
-  // new gnubok accounting entity for a non-existent legal entity would let
-  // users file momsdeklarationer or årsredovisning for it.
-  if (params.lookup.isCeased) {
-    return { error: 'company_ceased' }
-  }
-
-  // Look up the enrichment row so we can delete it after successful
-  // provisioning (one-time use). We only need `id` here; the picker has
-  // already used the `companyRoles` field server-side to render the cards.
-  const { data: enrichmentRow } = await supabase
-    .from('extension_data')
-    .select('id')
-    .eq('user_id', user.id)
-    .eq('extension_id', 'tic')
-    .eq('key', 'bankid_enrichment')
-    .maybeSingle()
-
-  const addressStreet = params.lookup.address?.street ?? null
-  const addressPostal = params.lookup.address?.postalCode ?? null
-  const addressCity = params.lookup.address?.city ?? null
-
-  const fTax = params.lookup.registration.fTax
-  const vatRegistered = params.lookup.registration.vat
-
-  // moms_period: Skatteverket assigns the actual reporting period from
-  // annual beskattningsunderlag (≤1 MSEK → yearly, ≤40 MSEK → quarterly,
-  // >40 MSEK → monthly). TIC /lookup doesn't expose turnover, so we pick the
-  // middle-tier default. The user must verify it matches their Skatteverket
-  // assignment in /settings/tax — a mismatch causes late-filing penalties
-  // under SFL.
-  const momsPeriod = vatRegistered ? 'quarterly' : null
-
-  // EF ≤3 MSEK may use kontantmetoden under K1/BFNAR 2013:2; above that
-  // threshold, BFNAR 2017:3 requires bokföringsmässiga grunder. We default
-  // to cash because the vast majority of EF users are small; users above
-  // the threshold can switch in /settings/bookkeeping. Aktiebolag must use
-  // accrual under K2/K3.
-  const accountingMethod = entityType === 'enskild_firma' ? 'cash' : 'accrual'
-
-  const settings: Record<string, unknown> = {
-    entity_type: entityType,
-    company_name: params.legalName,
-    org_number: params.orgNumber.replace(/[\s-]/g, ''),
-    f_skatt: fTax,
-    vat_registered: vatRegistered,
-    moms_period: momsPeriod,
-    accounting_method: accountingMethod,
-    fiscal_year_start_month: 1,
-    address_line1: addressStreet,
-    postal_code: addressPostal,
-    city: addressCity,
-  }
-
-  const periodResult = computeFiscalPeriod(settings)
-  if (periodResult.error) {
-    return { error: 'Kunde inte beräkna räkenskapsår.' }
-  }
-
-  const result = await createCompanyFromOnboarding({
-    teamId: params.teamId,
-    settings,
-    fiscalPeriod: {
-      startDate: periodResult.startStr,
-      endDate: periodResult.endStr,
-      name: periodResult.periodName,
-    },
-  })
-
-  if (result.error || !result.companyId) {
-    return { error: result.error ?? 'Kunde inte skapa företag. Försök igen.' }
-  }
-
-  // One-time use: drop the enrichment row now that the user has committed to
-  // a TIC-suggested company. The manual wizard intentionally does NOT do this
-  // so a user with multiple directorships can still reach /select-company
-  // afterwards and provision another one.
-  if (enrichmentRow?.id) {
-    await supabase.from('extension_data').delete().eq('id', enrichmentRow.id)
-  }
-
-  return { companyId: result.companyId }
-}

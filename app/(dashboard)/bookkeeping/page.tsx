@@ -1,56 +1,113 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import Link from 'next/link'
-import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
-import { Button } from '@/components/ui/button'
+import { UUID_RE } from '@/lib/invariants/uuid'
+import { useState, useEffect, useMemo } from 'react'
+import dynamic from 'next/dynamic'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { useTranslations } from 'next-intl'
+import { cn } from '@/lib/utils'
+import { useAssistantAvailable } from '@/contexts/CompanyContext'
 import JournalEntryList from '@/components/bookkeeping/JournalEntryList'
-import JournalEntryForm, { type FormLine } from '@/components/bookkeeping/JournalEntryForm'
-import ChartOfAccountsManager from '@/components/bookkeeping/ChartOfAccountsManager'
-import { FiscalYearSelector } from '@/components/common/FiscalYearSelector'
+import { StartCard } from '@/components/dashboard/StartCard'
+import { type FormLine } from '@/components/bookkeeping/JournalEntryForm'
+import type { CopyPrefill, SkvLinkPrefill } from '@/components/bookkeeping/NewJournalEntryDialog'
+import {
+  buildSkvPrefillLines,
+  takeSkvManualPrefill,
+  type SkvManualPrefill,
+} from '@/lib/skatteverket/manual-verifikat-prefill'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
+import { formatCurrency, formatDate } from '@/lib/utils'
+import { DialogLoadingSkeleton } from '@/components/ui/dialog-loading-skeleton'
+import { SplitButton } from '@/components/ui/split-button'
+import { useAgentSheet } from '@/components/agent/AgentSheetProvider'
+import { useUiState } from '@/lib/hooks/use-ui-state'
+import { resolveInitialMode } from '@/lib/ui-state/client'
 import { useToast } from '@/components/ui/use-toast'
-import { Lock, Loader2, Copy } from 'lucide-react'
+import { Plus, LayoutTemplate, Sparkles } from 'lucide-react'
+import { PageHeader } from '@/components/ui/page-header'
+import { formatVoucher } from '@/lib/bookkeeping/voucher-series-resolver'
 import type { JournalEntry, JournalEntryLine } from '@/types'
 
-interface CopyPrefill {
-  sourceId: string
-  sourceVoucherLabel: string
-  lines: FormLine[]
-  description: string
-  notes: string
+const NewJournalEntryDialog = dynamic(
+  () => import('@/components/bookkeeping/NewJournalEntryDialog'),
+  { loading: DialogLoadingSkeleton },
+)
+const TemplateBookDialog = dynamic(
+  () => import('@/components/bookkeeping/TemplateBookDialog'),
+  { loading: DialogLoadingSkeleton },
+)
+
+// SplitButton modes for "Nytt verifikat" (concept scene 9). The last-used
+// mode persists per user in ui_state.create_mode.bookkeeping.
+const CREATE_MODES = ['tomt', 'mall', 'assistent'] as const
+type CreateMode = (typeof CREATE_MODES)[number]
+
+interface NextVoucher {
+  next: number
+  series: string
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-
-function readCopyFromParam(): string | null {
-  if (typeof window === 'undefined') return null
-  const raw = new URLSearchParams(window.location.search).get('copy_from')
-  if (!raw) return null
-  // Guard against path-traversal or other malformed input in the fetch URL.
-  return UUID_RE.test(raw) ? raw : null
-}
 
 export default function BookkeepingPage() {
   const { toast } = useToast()
-  const [refreshKey, setRefreshKey] = useState(0)
-  const [copyFromId] = useState<string | null>(readCopyFromParam)
-  const [activeTab, setActiveTab] = useState(() =>
-    copyFromId ? 'new-entry' : 'journal',
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const copyFromId = useMemo<string | null>(() => {
+    const raw = searchParams.get('copy_from')
+    return raw && UUID_RE.test(raw) ? raw : null
+  }, [searchParams])
+  // Deep link from the dashboard "Verifikat utan underlag" card (and the
+  // push-notification link): open the list with the saknade-underlag filter
+  // already on. Read once on mount: the param stays in the URL (shareable),
+  // and later in-page filter changes must not be fought by the URL.
+  const [initialShowMissingOnly] = useState(
+    () => searchParams.get('missingUnderlag') === 'true',
   )
-  const [periodId, setPeriodId] = useState<string | null>(null)
-  const [copyPrefill, setCopyPrefill] = useState<CopyPrefill | null>(null)
-  const [isLoadingCopy, setIsLoadingCopy] = useState<boolean>(() => copyFromId !== null)
 
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [showNewEntry, setShowNewEntry] = useState(false)
+  const [showTemplateDialog, setShowTemplateDialog] = useState(false)
+  const [copyPrefill, setCopyPrefill] = useState<CopyPrefill | null>(null)
+  const [isLoadingCopy, setIsLoadingCopy] = useState(false)
+  // Set from the skattekonto deep link (skv_tx & co): prefills the Nytt
+  // verifikat dialog and makes the created entry auto-link back to the row.
+  const [skvLink, setSkvLink] = useState<SkvManualPrefill | null>(null)
+  const [nextVoucher, setNextVoucher] = useState<NextVoucher | null>(null)
+  const t = useTranslations('bookkeeping')
+  const tStart = useTranslations('start_cards')
+  const { openAgentSheet } = useAgentSheet()
+  const { uiState, loaded: uiStateLoaded } = useUiState()
+  // The 'assistent' mode opens the tool-loop runtime (verifikation.draft via
+  // /api/agent/invoke), which an OpenAI-compatible or unconfigured deployment
+  // cannot run (#2204): drop it from the split button and the pristine cards
+  // rather than offer a door into a 503. One list feeds both surfaces, and a
+  // persisted last-used 'assistent' falls back to 'tomt' through
+  // resolveInitialMode's validity check.
+  const assistantAvailable = useAssistantAvailable()
+  const createModes: readonly CreateMode[] = assistantAvailable
+    ? CREATE_MODES
+    : CREATE_MODES.filter((mode) => mode !== 'assistent')
+
+  // React to copy_from in URL: switch tab, fetch source entry, then clean URL.
+  // useSearchParams keeps this reactive even when navigation happens within the
+  // same route (e.g. clicking the Kopiera button in the expanded list row),
+  // which a one-shot useState initializer wouldn't notice.
+  /* eslint-disable react-hooks/set-state-in-effect -- URL→state sync requires sync setState */
   useEffect(() => {
     if (!copyFromId) return
+
+    setShowNewEntry(true)
+    setCopyPrefill(null)
+    setIsLoadingCopy(true)
 
     fetch(`/api/bookkeeping/journal-entries/${copyFromId}`)
       .then((res) => res.json())
       .then(({ data, error }: { data?: JournalEntry; error?: string }) => {
         if (error || !data) {
           toast({
-            title: 'Kunde inte kopiera verifikat',
-            description: error || 'Källverifikatet hittades inte.',
+            title: t('copy_failed_title'),
+            description: error || t('copy_source_missing'),
             variant: 'destructive',
           })
           return
@@ -70,7 +127,7 @@ export default function BookkeepingPage() {
         })
         setCopyPrefill({
           sourceId: copyFromId,
-          sourceVoucherLabel: `${data.voucher_series ?? ''}${data.voucher_number ?? ''}`,
+          sourceVoucherLabel: formatVoucher(data),
           lines,
           description: data.description || '',
           notes: data.notes || '',
@@ -78,91 +135,243 @@ export default function BookkeepingPage() {
       })
       .catch(() => {
         toast({
-          title: 'Kunde inte kopiera verifikat',
-          description: 'Källverifikatet kunde inte hämtas.',
+          title: t('copy_failed_title'),
+          description: t('copy_fetch_failed'),
           variant: 'destructive',
         })
       })
       .finally(() => {
         setIsLoadingCopy(false)
-        // Clean the URL so a page refresh doesn't re-trigger the copy prefill.
-        window.history.replaceState({}, '', '/bookkeeping')
+        // Clear copy_from so a refresh doesn't re-trigger and so clicking the
+        // same entry's Kopiera button again re-fires this effect.
+        router.replace('/bookkeeping')
       })
-  }, [copyFromId, toast])
+  }, [copyFromId, toast, router])
+
+  // React to the skattekonto deep link the same way: consume the staged
+  // payload (single-use, sessionStorage; the URL carries only the opaque id),
+  // open the dialog prefilled, and clean the URL so a refresh doesn't
+  // re-trigger. copy_from wins if both are somehow present. A missing or
+  // invalid payload (shared/stale link) degrades to the plain list.
+  useEffect(() => {
+    if (copyFromId) return
+    const rawId = searchParams.get('skv_tx')
+    if (!rawId) return
+    const prefill = takeSkvManualPrefill(rawId)
+    router.replace('/bookkeeping')
+    if (!prefill) return
+    setSkvLink(prefill)
+    setCopyPrefill(null)
+    setShowNewEntry(true)
+  }, [searchParams, copyFromId, router])
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  const skvPrefill = useMemo<SkvLinkPrefill | null>(() => {
+    if (!skvLink) return null
+    return {
+      transactionId: skvLink.transactionId,
+      bannerLabel: [formatDate(skvLink.date), skvLink.text, formatCurrency(skvLink.amount)]
+        .filter(Boolean)
+        .join(' • '),
+      lines: buildSkvPrefillLines(skvLink) as FormLine[],
+      description: skvLink.text,
+      date: skvLink.date,
+    }
+  }, [skvLink])
+
+  // Link the created verifikat back to the skattekonto row. The entry exists
+  // either way, so a failed link degrades to a loud toast pointing at the
+  // manual "Matcha mot verifikat" path instead of silently orphaning the row.
+  async function handleSkvEntryCreated(entryId: string) {
+    if (!skvLink) return
+    const target = skvLink
+    setSkvLink(null)
+    let reason = ''
+    try {
+      const res = await fetch(
+        `/api/extensions/ext/skatteverket/skattekonto/transaktioner/${target.transactionId}/match`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ journal_entry_id: entryId }),
+        },
+      )
+      if (res.ok) {
+        toast({
+          title: t('skv_link_success_title'),
+          description: t('skv_link_success_description', { text: target.text }),
+        })
+        return
+      }
+      const json: unknown = await res.json().catch(() => null)
+      reason = getErrorMessage(json ?? {}, { statusCode: res.status })
+    } catch (err) {
+      reason = err instanceof Error ? getErrorMessage(err) : ''
+    }
+    toast({
+      title: t('skv_link_failed_title'),
+      description: [reason, t('skv_link_failed_hint')].filter(Boolean).join(' '),
+      variant: 'destructive',
+    })
+  }
+
+  // Fetch the next voucher number for today's fiscal period + default series.
+  // Re-runs after each commit (refreshKey++) so the tab label stays current.
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/bookkeeping/voucher-sequences/next')
+      .then((r) => r.json())
+      .then(({ data }) => {
+        if (cancelled) return
+        if (data?.next != null) {
+          setNextVoucher({ next: data.next, series: data.series })
+        } else {
+          setNextVoucher(null)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setNextVoucher(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [refreshKey])
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">Bokföring</h1>
-          <p className="text-muted-foreground">
-            Skapa verifikationer, hantera kontoplanen och bifoga underlag
-          </p>
-        </div>
-        <Button variant="outline" asChild className="w-full sm:w-auto">
-          <Link href="/bookkeeping/year-end">
-            <Lock className="mr-2 h-4 w-4" />
-            Årsbokslut
-          </Link>
-        </Button>
-      </div>
+    <div className="space-y-8">
+      <PageHeader
+        title={t('title')}
+        action={
+          <SplitButton
+            // Remount once ui_state loads so the primary face re-resolves
+            // to the persisted last-used mode.
+            key={uiStateLoaded ? 'loaded' : 'initial'}
+            persistKey="bookkeeping"
+            initialModeKey={resolveInitialMode(uiState, 'bookkeeping', createModes, 'tomt')}
+            options={[
+              {
+                key: 'tomt',
+                label: nextVoucher
+                  ? `${t('create_tomt')} (${nextVoucher.series}${nextVoucher.next})`
+                  : t('create_tomt'),
+                icon: Plus,
+                description: t('create_tomt_desc'),
+                onSelect: () => {
+                  setCopyPrefill(null)
+                  setSkvLink(null)
+                  setShowNewEntry(true)
+                },
+              },
+              {
+                key: 'mall',
+                label: t('create_mall'),
+                icon: LayoutTemplate,
+                description: t('create_mall_desc'),
+                onSelect: () => setShowTemplateDialog(true),
+              },
+              {
+                key: 'assistent',
+                label: t('create_with_assistant'),
+                icon: Sparkles,
+                description: t('create_assistent_desc'),
+                onSelect: () =>
+                  openAgentSheet({
+                    intentId: 'verifikation.draft',
+                    contextRef: 'verifikation:new',
+                  }),
+              },
+            ].filter((option) => (createModes as readonly string[]).includes(option.key))}
+          />
+        }
+      />
 
-      {activeTab === 'journal' && (
-        <FiscalYearSelector value={periodId} onChange={setPeriodId} />
+      {/* refreshToken, NOT key: a created verifikat refreshes the list in
+          place (dim + refetch) instead of remounting it into a spinner and
+          losing expansion/selection/scroll. */}
+      <JournalEntryList
+        refreshToken={refreshKey}
+        initialShowMissingOnly={initialShowMissingOnly}
+        pristineSlot={
+          <div className="animate-fade-in space-y-4">
+            <StartCard
+              card="ledger"
+              layout="bleed-left"
+              title={tStart('bookkeeping_title')}
+              body={tStart('bookkeeping_body')}
+              primary={{ label: tStart('bookkeeping_primary'), href: '/import?mode=migration' }}
+              secondary={{ label: tStart('bookkeeping_secondary'), href: '/import?mode=sie' }}
+            />
+            {/* The split button's create modes, laid out as cards so the pristine
+                page shows what the ledger can do instead of a bare table. */}
+            <div className={cn('grid gap-4', createModes.length === 3 ? 'sm:grid-cols-3' : 'sm:grid-cols-2')}>
+              {(
+                [
+                  ['mall', () => setShowTemplateDialog(true)],
+                  [
+                    'assistent',
+                    () => openAgentSheet({ intentId: 'verifikation.draft', contextRef: 'verifikation:new' }),
+                  ],
+                  [
+                    'tomt',
+                    () => {
+                      setCopyPrefill(null)
+                      setSkvLink(null)
+                      setShowNewEntry(true)
+                    },
+                  ],
+                ] as const
+              )
+                .filter(([mode]) => createModes.includes(mode))
+                .map(([mode, onClick]) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={onClick}
+                  className="rounded-lg border border-border bg-background p-4 text-left transition-colors duration-150 hover:bg-secondary/35 active:bg-secondary/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <div className="text-[13px] font-medium">{tStart(`bookkeeping_mini_${mode}_title`)}</div>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    {tStart(`bookkeeping_mini_${mode}_body`)}
+                  </p>
+                </button>
+              ))}
+            </div>
+          </div>
+        }
+      />
+
+      {showTemplateDialog && (
+        <TemplateBookDialog
+          open
+          onOpenChange={setShowTemplateDialog}
+          onCreated={() => setRefreshKey((k) => k + 1)}
+        />
       )}
 
-      <Tabs value={activeTab} onValueChange={setActiveTab}>
-        <TabsList>
-          <TabsTrigger value="journal">Verifikationer</TabsTrigger>
-          <TabsTrigger value="new-entry">Ny verifikation</TabsTrigger>
-          <TabsTrigger value="accounts">Kontoplan</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="journal">
-          <JournalEntryList key={`${refreshKey}-${periodId ?? 'all'}`} periodId={periodId ?? undefined} />
-        </TabsContent>
-
-        <TabsContent value="new-entry">
-          {isLoadingCopy ? (
-            <div className="flex items-center gap-2 py-12 justify-center text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              <span className="text-sm">Laddar källverifikat...</span>
-            </div>
-          ) : (
-            <>
-              {copyPrefill && (
-                <div className="mb-4 flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3 text-sm">
-                  <Copy className="h-4 w-4 mt-0.5 shrink-0 text-muted-foreground" />
-                  <div className="flex-1">
-                    <p className="font-medium">
-                      Kopia av verifikat {copyPrefill.sourceVoucherLabel || '(okänt nummer)'}
-                    </p>
-                    <p className="text-muted-foreground mt-0.5">
-                      Ett nytt, fristående verifikat skapas med egen verifikationsserie och nummer.
-                      Detta är <strong>inte</strong> en rättelse eller storno av originalet — använd
-                      &quot;Skapa ändringsverifikation&quot; om du vill korrigera källverifikatet.
-                    </p>
-                  </div>
-                </div>
-              )}
-              <JournalEntryForm
-                key={copyPrefill?.sourceId ?? 'fresh'}
-                onCreated={() => {
-                  setRefreshKey((k) => k + 1)
-                  setCopyPrefill(null)
-                }}
-                initialLines={copyPrefill?.lines}
-                initialDescription={copyPrefill?.description}
-                initialNotes={copyPrefill?.notes}
-              />
-            </>
-          )}
-        </TabsContent>
-
-        <TabsContent value="accounts">
-          <ChartOfAccountsManager />
-        </TabsContent>
-      </Tabs>
+      {showNewEntry && (
+        <NewJournalEntryDialog
+          open
+          onOpenChange={(o) => {
+            setShowNewEntry(o)
+            if (!o) {
+              setCopyPrefill(null)
+              setSkvLink(null)
+            }
+          }}
+          onCreated={() => {
+            setRefreshKey((k) => k + 1)
+            setShowNewEntry(false)
+            setCopyPrefill(null)
+            // handleSkvEntryCreated runs from the same render's closure, so
+            // clearing here doesn't rob it of the link target.
+            setSkvLink(null)
+          }}
+          onEntryCreated={skvLink ? handleSkvEntryCreated : undefined}
+          copyPrefill={copyPrefill}
+          skvPrefill={skvPrefill}
+          isLoading={isLoadingCopy}
+        />
+      )}
     </div>
   )
 }

@@ -1,15 +1,25 @@
+import { getBranding } from '@/lib/branding/service'
+
 export interface InviteEmailData {
   companyName: string
   inviterEmail: string
   inviteUrl: string
+  /**
+   * Brand override (WL-13): the app name of the brand of the company the
+   * invite concerns. Absent = platform default from getBranding(), which
+   * keeps unbranded companies byte-identical to before.
+   */
+  appName?: string
 }
 
 export function generateInviteEmailSubject(data: InviteEmailData): string {
-  return `Du har bjudits in till ${data.companyName} på gnubok`
+  const appName = data.appName ?? getBranding().appName
+  return `Du har bjudits in till ${data.companyName} på ${appName.toLowerCase()}`
 }
 
 export function generateInviteEmailHtml(data: InviteEmailData): string {
   const { companyName, inviterEmail, inviteUrl } = data
+  const appName = data.appName ?? getBranding().appName
 
   return `
 <!DOCTYPE html>
@@ -24,12 +34,12 @@ export function generateInviteEmailHtml(data: InviteEmailData): string {
     <div style="background: #ffffff; border-radius: 12px; padding: 40px 32px; border: 1px solid #e5e5e5;">
       <!-- Header -->
       <div style="margin-bottom: 28px;">
-        <p style="margin: 0 0 4px 0; font-size: 13px; color: #888; letter-spacing: 0.05em;">GNUBOK</p>
+        <p style="margin: 0 0 4px 0; font-size: 13px; color: #888; letter-spacing: 0.05em;">${appName.toUpperCase()}</p>
         <h1 style="margin: 0 0 8px 0; font-size: 22px; font-weight: 600; color: #111;">
           Du har blivit inbjuden
         </h1>
         <p style="margin: 0; color: #666; font-size: 15px;">
-          <strong>${inviterEmail}</strong> har bjudit in dig till <strong>${companyName}</strong> på gnubok.
+          <strong>${inviterEmail}</strong> har bjudit in dig till <strong>${companyName}</strong> på ${appName.toLowerCase()}.
         </p>
       </div>
 
@@ -51,7 +61,8 @@ export function generateInviteEmailHtml(data: InviteEmailData): string {
 }
 
 export function generateInviteEmailText(data: InviteEmailData): string {
-  return `Du har bjudits in till ${data.companyName} på gnubok av ${data.inviterEmail}.
+  const appName = data.appName ?? getBranding().appName
+  return `Du har bjudits in till ${data.companyName} på ${appName.toLowerCase()} av ${data.inviterEmail}.
 
 Acceptera inbjudan: ${data.inviteUrl}
 
@@ -65,14 +76,35 @@ Länken är giltig i 7 dagar.`
 export interface TeamInviteEmailData {
   inviterEmail: string
   inviteUrl: string
+  /**
+   * Brand override (WL-13): the app name of the byrå team's brand. Absent =
+   * platform default from getBranding(), which keeps brandless teams
+   * byte-identical to before.
+   */
+  appName?: string
 }
 
-export function generateTeamInviteEmailSubject(): string {
-  return 'Du har bjudits in till ett team på gnubok'
+export function generateTeamInviteEmailSubject(data?: Pick<TeamInviteEmailData, 'appName'>): string {
+  // Branded byrå: the invite is to THE BYRÅ, by name and in its own casing
+  // ("Du har blivit inbjuden till Byrånamn"), no platform wording. Brandless
+  // teams keep the platform phrasing byte-identical.
+  if (data?.appName) {
+    return `Du har blivit inbjuden till ${data.appName}`
+  }
+  return `Du har bjudits in till ett team på ${getBranding().appName.toLowerCase()}`
 }
 
 export function generateTeamInviteEmailHtml(data: TeamInviteEmailData): string {
   const { inviterEmail, inviteUrl } = data
+  const appName = data.appName ?? getBranding().appName
+  // Branded byrå: headline and body name the byrå itself; brandless teams
+  // keep the generic team wording.
+  const headline = data.appName
+    ? `Du har blivit inbjuden till ${data.appName}`
+    : 'Du har blivit inbjuden till ett team'
+  const bodyLine = data.appName
+    ? `<strong>${inviterEmail}</strong> har bjudit in dig till <strong>${data.appName}</strong>. Du får tillgång till alla företag i teamet.`
+    : `<strong>${inviterEmail}</strong> har bjudit in dig som konsult. Du får tillgång till alla företag i teamet.`
 
   return `
 <!DOCTYPE html>
@@ -87,12 +119,12 @@ export function generateTeamInviteEmailHtml(data: TeamInviteEmailData): string {
     <div style="background: #ffffff; border-radius: 12px; padding: 40px 32px; border: 1px solid #e5e5e5;">
       <!-- Header -->
       <div style="margin-bottom: 28px;">
-        <p style="margin: 0 0 4px 0; font-size: 13px; color: #888; letter-spacing: 0.05em;">GNUBOK</p>
+        <p style="margin: 0 0 4px 0; font-size: 13px; color: #888; letter-spacing: 0.05em;">${appName.toUpperCase()}</p>
         <h1 style="margin: 0 0 8px 0; font-size: 22px; font-weight: 600; color: #111;">
-          Du har blivit inbjuden till ett team
+          ${headline}
         </h1>
         <p style="margin: 0; color: #666; font-size: 15px;">
-          <strong>${inviterEmail}</strong> har bjudit in dig som konsult. Du får tillgång till alla företag i teamet.
+          ${bodyLine}
         </p>
       </div>
 
@@ -114,7 +146,14 @@ export function generateTeamInviteEmailHtml(data: TeamInviteEmailData): string {
 }
 
 export function generateTeamInviteEmailText(data: TeamInviteEmailData): string {
-  return `Du har bjudits in som konsult till ett team på gnubok av ${data.inviterEmail}. Du får tillgång till alla företag i teamet.
+  if (data.appName) {
+    return `Du har blivit inbjuden till ${data.appName} av ${data.inviterEmail}. Du får tillgång till alla företag i teamet.
+
+Acceptera inbjudan: ${data.inviteUrl}
+
+Länken är giltig i 7 dagar.`
+  }
+  return `Du har bjudits in som konsult till ett team på ${getBranding().appName.toLowerCase()} av ${data.inviterEmail}. Du får tillgång till alla företag i teamet.
 
 Acceptera inbjudan: ${data.inviteUrl}
 

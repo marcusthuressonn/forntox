@@ -1,72 +1,142 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import Link from 'next/link'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { useRouter } from 'next/navigation'
+import { useTranslations } from 'next-intl'
+import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Button } from '@/components/ui/button'
-import { Plus, Users, HandCoins, CalendarDays, ArrowRight } from 'lucide-react'
+import { EmptyState } from '@/components/ui/empty-state'
+import { StartCard } from '@/components/dashboard/StartCard'
+import { TH_CLASS, TD_CLASS, QUIET_LINK_CLASS } from '@/components/ui/dry-table'
+import { HandCoins, Loader2, Plus, Users } from 'lucide-react'
+import { useToast } from '@/components/ui/use-toast'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
-import { formatCurrency } from '@/lib/utils'
-import type { SalaryRun } from '@/types'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
+import { cn, formatCurrency, formatDate } from '@/lib/utils'
+import type { EmployeeMasked, SalaryRun } from '@/types'
 
-const STATUS_LABELS: Record<string, string> = {
-  draft: 'Utkast',
-  review: 'Granskning',
-  approved: 'Godkänd',
-  paid: 'Betald',
-  booked: 'Bokförd',
+const STATUS_LABEL_KEYS: Record<string, string> = {
+  draft: 'status_draft',
+  review: 'status_review',
+  approved: 'status_approved',
+  paid: 'status_paid',
+  booked: 'status_booked',
+  corrected: 'status_corrected',
 }
 
-const STATUS_COLORS: Record<string, string> = {
-  draft: 'bg-muted text-muted-foreground',
-  review: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400',
-  approved: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
-  paid: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-400',
-  booked: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
+// In-flight states all wear the quiet beige chip (concept scene 22's Utkast
+// look): the payout-date note beside the chip carries the urgency, not an
+// ochre border. Booked renders as muted text, corrected as the outline
+// exception.
+const STATUS_VARIANTS: Record<string, 'default' | 'secondary' | 'success' | 'warning' | 'destructive' | 'outline'> = {
+  draft: 'secondary',
+  review: 'secondary',
+  approved: 'secondary',
+  paid: 'success',
+  booked: 'success',
+  corrected: 'outline',
 }
 
+/**
+ * Löner landing (concept scene 22): header + the lönekörningar dry-table,
+ * nothing else. The open run's row is the way into the flow (chip + payout
+ * date); AGI, skatt, blockers and semester live on the run detail and the
+ * employee register.
+ */
 export default function SalaryPage() {
   const [runs, setRuns] = useState<SalaryRun[]>([])
-  const [employeeCount, setEmployeeCount] = useState(0)
+  const [employees, setEmployees] = useState<EmployeeMasked[]>([])
   const [loading, setLoading] = useState(true)
-  const canWrite = useCanWrite()
+  const [starting, setStarting] = useState(false)
+  const { canWrite } = useCanWrite()
+  const { toast } = useToast()
+  const router = useRouter()
+  const t = useTranslations('salary')
+  const tStart = useTranslations('start_cards')
 
-  useEffect(() => {
-    async function load() {
-      const [runsRes, empRes] = await Promise.all([
-        fetch('/api/salary/runs'),
-        fetch('/api/salary/employees'),
-      ])
-
-      if (runsRes.ok) {
-        const { data } = await runsRes.json()
-        setRuns(data || [])
-      }
-      if (empRes.ok) {
-        const { data } = await empRes.json()
-        setEmployeeCount((data || []).length)
-      }
-      setLoading(false)
+  const load = useCallback(async () => {
+    const [runsRes, empRes] = await Promise.all([
+      fetch('/api/salary/runs').catch(() => null),
+      fetch('/api/salary/employees').catch(() => null),
+    ])
+    if (runsRes?.ok) {
+      const { data } = await runsRes.json()
+      setRuns(data || [])
     }
-    load()
+    if (empRes?.ok) {
+      const { data } = await empRes.json()
+      setEmployees(data || [])
+    }
+    setLoading(false)
   }, [])
 
-  const currentYear = new Date().getFullYear()
-  const yearRuns = runs.filter(r => r.period_year === currentYear)
-  const totalGrossYTD = yearRuns.filter(r => r.status === 'booked').reduce((sum, r) => sum + r.total_gross, 0)
-  const totalAvgifterYTD = yearRuns.filter(r => r.status === 'booked').reduce((sum, r) => sum + r.total_avgifter, 0)
-  const latestRun = runs[0]
+  useEffect(() => {
+    load()
+  }, [load])
+
+  // One-click run creation: the API seeds all active employees, calculates,
+  // and resolves period/pay-date/series defaults from settings.
+  async function startRun() {
+    setStarting(true)
+    try {
+      const res = await fetch('/api/salary/runs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      const json = await res.json().catch(() => null)
+      if (res.status === 201 && json?.data?.id) {
+        router.push(`/salary/runs/${json.data.id}`)
+        return
+      }
+      const existingId = json?.error?.details?.existingId
+      if (res.status === 409 && existingId) {
+        toast({ title: t('run_exists_opening') })
+        router.push(`/salary/runs/${existingId}`)
+        return
+      }
+      toast({
+        title: t('start_run_failed'),
+        description: getErrorMessage(json, { context: 'salary', statusCode: res.status }),
+        variant: 'destructive',
+      })
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  const periodOf = (r: SalaryRun) => `${r.period_year}-${String(r.period_month).padStart(2, '0')}`
+
+  const header = (
+    <div className="page-header flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <h1 className="page-header-title font-display text-2xl leading-8 tracking-tight">{t('title')}</h1>
+      <div className="flex items-center gap-4">
+        <Link href="/salary/employees" className={QUIET_LINK_CLASS}>
+          {t('employees')}
+        </Link>
+        {canWrite && (
+          <Button onClick={startRun} disabled={starting || loading}>
+            {starting ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Plus className="mr-2 h-4 w-4" />
+            )}
+            {t('start_run')}
+          </Button>
+        )}
+      </div>
+    </div>
+  )
 
   if (loading) {
     return (
-      <div className="space-y-6">
-        <div className="flex items-center justify-between">
-          <div className="h-9 w-40 bg-muted rounded animate-pulse" />
-          <div className="h-9 w-32 bg-muted rounded animate-pulse" />
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="space-y-8">
+        {header}
+        <div className="space-y-3">
           {[1, 2, 3].map(i => (
-            <div key={i} className="h-24 bg-muted rounded-lg animate-pulse" />
+            <Skeleton key={i} className="h-10 rounded-lg" />
           ))}
         </div>
       </div>
@@ -74,135 +144,111 @@ export default function SalaryPage() {
   }
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+    <div className="space-y-8">
+      {header}
+
+      {runs.length === 0 && employees.length === 0 ? (
+        canWrite ? (
+          <div className="animate-fade-in">
+            <StartCard
+              card="stopwatch"
+              layout="side-right"
+              eyebrow={tStart('salary_eyebrow_start')}
+              title={tStart('salary_title')}
+              body={tStart('salary_body_no_employees')}
+              primary={{ label: tStart('salary_primary_add'), href: '/salary/employees?new=1' }}
+            />
+          </div>
+        ) : (
+          <EmptyState icon={Users} title={t('onboarding_title')} description={t('onboarding_description')} />
+        )
+      ) : (
         <div>
-          <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">Löner</h1>
-          <p className="text-sm text-muted-foreground mt-1">Hantera anställda och lönekörningar</p>
-        </div>
-        <div className="flex gap-2">
-          <Button variant="outline" asChild>
-            <Link href="/salary/employees">
-              <Users className="mr-2 h-4 w-4" />
-              Anställda
-            </Link>
-          </Button>
-          {canWrite && (
-            <Button asChild>
-              <Link href="/salary/runs/new">
-                <Plus className="mr-2 h-4 w-4" />
-                Ny lönekörning
-              </Link>
-            </Button>
-          )}
-        </div>
-      </div>
-
-      {/* Summary cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center gap-3">
-              <Users className="h-5 w-5 text-muted-foreground" />
-              <div>
-                <p className="text-sm text-muted-foreground">Anställda</p>
-                <p className="text-2xl font-semibold tabular-nums">{employeeCount}</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center gap-3">
-              <HandCoins className="h-5 w-5 text-muted-foreground" />
-              <div>
-                <p className="text-sm text-muted-foreground">Bruttolöner {currentYear}</p>
-                <p className="text-2xl font-semibold tabular-nums">{formatCurrency(totalGrossYTD)}</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center gap-3">
-              <CalendarDays className="h-5 w-5 text-muted-foreground" />
-              <div>
-                <p className="text-sm text-muted-foreground">Avgifter {currentYear}</p>
-                <p className="text-2xl font-semibold tabular-nums">{formatCurrency(totalAvgifterYTD)}</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Recent runs */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Lönekörningar</CardTitle>
-        </CardHeader>
-        <CardContent className="p-0">
           {runs.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-center">
-              <HandCoins className="h-10 w-10 text-muted-foreground/50 mb-3" />
-              <p className="text-sm text-muted-foreground mb-4">Inga lönekörningar ännu</p>
-              {canWrite && (
-                <Button asChild size="sm">
-                  <Link href="/salary/runs/new">
-                    <Plus className="mr-2 h-4 w-4" />
-                    Skapa första lönekörningen
-                  </Link>
-                </Button>
-              )}
-            </div>
+            canWrite ? (
+              <div className="animate-fade-in">
+                <StartCard
+                  card="stopwatch"
+                  layout="side-right"
+                  eyebrow={tStart('salary_eyebrow_next')}
+                  title={tStart('salary_title')}
+                  body={tStart('salary_body_ready', { count: employees.length })}
+                  primary={{ label: tStart('salary_primary_run'), onClick: startRun }}
+                />
+              </div>
+            ) : (
+              <EmptyState icon={HandCoins} title={t('empty_runs_title')} description={t('empty_runs_description')} />
+            )
           ) : (
-            <table className="w-full">
-              <thead>
-                <tr className="border-b text-left text-xs text-muted-foreground">
-                  <th className="px-4 py-2 font-medium">Period</th>
-                  <th className="px-4 py-2 font-medium">Utbetalningsdag</th>
-                  <th className="px-4 py-2 font-medium text-right">Brutto</th>
-                  <th className="px-4 py-2 font-medium text-right">Netto</th>
-                  <th className="px-4 py-2 font-medium text-right">Avgifter</th>
-                  <th className="px-4 py-2 font-medium">Status</th>
-                  <th className="px-4 py-2"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {runs.slice(0, 12).map(run => (
-                  <tr key={run.id} className="border-b last:border-0 hover:bg-muted/50 transition-colors">
-                    <td className="px-4 py-3 text-sm font-medium tabular-nums">
-                      {run.period_year}-{String(run.period_month).padStart(2, '0')}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-muted-foreground tabular-nums">
-                      {run.payment_date}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-right tabular-nums">
-                      {formatCurrency(run.total_gross)}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-right tabular-nums">
-                      {formatCurrency(run.total_net)}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-right tabular-nums">
-                      {formatCurrency(run.total_avgifter)}
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${STATUS_COLORS[run.status]}`}>
-                        {STATUS_LABELS[run.status]}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <Link href={`/salary/runs/${run.id}`} className="text-muted-foreground hover:text-foreground">
-                        <ArrowRight className="h-4 w-4" />
-                      </Link>
-                    </td>
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-[13px]">
+                <thead>
+                  <tr>
+                    <th className={TH_CLASS}>{t('th_period')}</th>
+                    <th className={cn(TH_CLASS, 'w-full')}>{t('th_status')}</th>
+                    <th className={cn(TH_CLASS, 'hidden text-right sm:table-cell')}>{t('th_employees')}</th>
+                    <th className={cn(TH_CLASS, 'text-right')}>{t('th_gross')}</th>
+                    <th className={cn(TH_CLASS, 'text-right')}>{t('th_net')}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="stagger-enter">
+                  {runs.slice(0, 12).map(run => {
+                    // PostgREST count embed: employee_count is [{ count: n }].
+                    const employeeCount = (
+                      run as SalaryRun & { employee_count?: { count: number }[] }
+                    ).employee_count?.[0]?.count
+                    const inFlight = run.status !== 'booked' && run.status !== 'corrected'
+                    return (
+                      <tr
+                        key={run.id}
+                        className="group cursor-pointer transition-colors duration-150 hover:bg-secondary/35"
+                        onClick={() => router.push(`/salary/runs/${run.id}`)}
+                      >
+                        <td className={cn(TD_CLASS, 'whitespace-nowrap tabular-nums')}>
+                          <Link
+                            href={`/salary/runs/${run.id}`}
+                            className="hover:underline"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {periodOf(run)}
+                          </Link>
+                        </td>
+                        {/* overflow-hidden: see #2003, nothing in this cell
+                            truncates so it must clip. */}
+                        <td className={cn(TD_CLASS, 'max-w-0 w-full overflow-hidden whitespace-nowrap')}>
+                          <span className="inline-flex items-center gap-2">
+                            {run.status === 'booked' ? (
+                              <span className="text-muted-foreground">{t('status_booked')}</span>
+                            ) : (
+                              <Badge variant={STATUS_VARIANTS[run.status] || 'secondary'} className="font-normal">
+                                {STATUS_LABEL_KEYS[run.status] ? t(STATUS_LABEL_KEYS[run.status]) : run.status}
+                              </Badge>
+                            )}
+                            {inFlight && (
+                              <span className="text-[11.5px] text-muted-foreground tabular-nums">
+                                {t('run_payout_note', { date: formatDate(run.payment_date) })}
+                              </span>
+                            )}
+                          </span>
+                        </td>
+                        <td className={cn(TD_CLASS, 'hidden whitespace-nowrap text-right tabular-nums sm:table-cell')}>
+                          {employeeCount ?? ''}
+                        </td>
+                        <td className={cn(TD_CLASS, 'whitespace-nowrap text-right tabular-nums rr-mask')}>
+                          {formatCurrency(run.total_gross)}
+                        </td>
+                        <td className={cn(TD_CLASS, 'whitespace-nowrap text-right tabular-nums rr-mask')}>
+                          {formatCurrency(run.total_net)}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      )}
     </div>
   )
 }

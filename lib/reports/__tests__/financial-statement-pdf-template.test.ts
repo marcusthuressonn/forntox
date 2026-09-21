@@ -2,11 +2,11 @@ import { describe, it, expect } from 'vitest'
 import { renderToBuffer } from '@react-pdf/renderer'
 import { FinancialStatementPDF } from '../financial-statement-pdf-template'
 import type { CompanySettings } from '@/types'
+import { pdfTextStrings } from '@/tests/pdf-text'
 
 function fakeCompany(): CompanySettings {
   return {
-    company_name: 'Gnubok AB',
-    trade_name: 'Gnubok',
+    company_name: 'Gnubok',
     org_number: '5566778899',
     vat_number: 'SE556677889901',
     address_line1: 'Kungsgatan 1',
@@ -16,6 +16,10 @@ function fakeCompany(): CompanySettings {
     entity_type: 'aktiebolag',
   } as unknown as CompanySettings
 }
+
+// Real @react-pdf/renderer layout is CPU-heavy; under a fully parallel
+// test run these can exceed the 5s default on a saturated machine.
+const RENDER_TIMEOUT = 30_000
 
 describe('FinancialStatementPDF', () => {
   it('renders a balance-sheet-shaped document to a PDF buffer', async () => {
@@ -62,7 +66,7 @@ describe('FinancialStatementPDF', () => {
     expect(buffer.length).toBeGreaterThan(1000)
     // PDF files always start with "%PDF-"
     expect(buffer.slice(0, 5).toString()).toBe('%PDF-')
-  })
+  }, RENDER_TIMEOUT)
 
   it('renders an income-statement-shaped document with a summary block', async () => {
     const doc = FinancialStatementPDF({
@@ -110,7 +114,7 @@ describe('FinancialStatementPDF', () => {
     const buffer = await renderToBuffer(doc)
     expect(buffer).toBeInstanceOf(Buffer)
     expect(buffer.slice(0, 5).toString()).toBe('%PDF-')
-  })
+  }, RENDER_TIMEOUT)
 
   it('handles empty section groups gracefully', async () => {
     const doc = FinancialStatementPDF({
@@ -136,5 +140,41 @@ describe('FinancialStatementPDF', () => {
 
     const buffer = await renderToBuffer(doc)
     expect(buffer.slice(0, 5).toString()).toBe('%PDF-')
-  })
+  }, RENDER_TIMEOUT)
+
+  it('prints a loss with its sign in the rendered bytes (issue #1982)', async () => {
+    // sv-SE formats negatives with U+2212, which the bundled Helvetica cannot
+    // draw: Årets resultat -4 684,24 used to print as 4 684,24 in both the
+    // resultaträkning summary and the balansräkning 2099 row.
+    const doc = FinancialStatementPDF({
+      title: 'Balansräkning',
+      groups: [
+        {
+          heading: 'Eget kapital och skulder',
+          sections: [
+            {
+              title: 'Eget kapital',
+              rows: [
+                { account_number: '2081', account_name: 'Aktiekapital', amount: 25_000 },
+                { account_number: '2099', account_name: 'Årets resultat', amount: -4684.24 },
+              ],
+              subtotal: 20_315.76,
+            },
+          ],
+          totalLabel: 'Summa eget kapital och skulder',
+          total: 20_315.76,
+        },
+      ],
+      summary: [{ label: 'Årets resultat', amount: -4684.24, emphasis: true }],
+      period: { start: '2025-10-14', end: '2026-01-31' },
+      company: fakeCompany(),
+      generatedAt: '2026-08-27T10:00:00Z',
+    })
+
+    const text = pdfTextStrings(await renderToBuffer(doc)).join('\n')
+    expect(text).toContain('-4 684,24')
+    expect(text).not.toContain(String.fromCharCode(0x12))
+    expect(text).not.toContain('\u2212')
+    expect(text).toContain('20 315,76')
+  }, RENDER_TIMEOUT)
 })

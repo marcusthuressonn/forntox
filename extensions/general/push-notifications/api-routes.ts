@@ -4,7 +4,7 @@ import { getVapidPublicKey } from './notification-sender'
 import { getSettings, saveSettings } from './index'
 
 // ============================================================
-// /subscribe — GET: get VAPID public key for client-side subscription
+// /subscribe: GET: get VAPID public key for client-side subscription
 // ============================================================
 
 async function handleGetSubscribe(
@@ -24,7 +24,7 @@ async function handleGetSubscribe(
 }
 
 // ============================================================
-// /subscribe — POST: save a new push subscription
+// /subscribe: POST: save a new push subscription
 // ============================================================
 
 async function handlePostSubscribe(
@@ -48,7 +48,10 @@ async function handlePostSubscribe(
   // Get user agent for debugging
   const userAgent = request.headers.get('user-agent') || null
 
-  // Upsert subscription (update if endpoint exists)
+  // Upsert subscription. The unique constraint is on `endpoint` alone (a push
+  // endpoint is issued per browser profile and origin, so it is globally
+  // unique), which is the only legal conflict target here: naming
+  // `user_id,endpoint` raised 42P10 on every subscribe call.
   const { data, error } = await supabase
     .from('push_subscriptions')
     .upsert(
@@ -62,7 +65,7 @@ async function handlePostSubscribe(
         last_used_at: new Date().toISOString(),
       },
       {
-        onConflict: 'user_id,endpoint',
+        onConflict: 'endpoint',
       }
     )
     .select()
@@ -99,7 +102,7 @@ async function handlePostSubscribe(
 }
 
 // ============================================================
-// /subscribe — DELETE: remove a push subscription
+// /subscribe: DELETE: remove a push subscription
 // ============================================================
 
 async function handleDeleteSubscribe(
@@ -123,7 +126,7 @@ async function handleDeleteSubscribe(
   const { error } = await supabase
     .from('push_subscriptions')
     .delete()
-    .eq('company_id', userId)
+    .eq('user_id', userId)
     .eq('endpoint', endpoint)
 
   if (error) {
@@ -137,7 +140,7 @@ async function handleDeleteSubscribe(
 }
 
 // ============================================================
-// /settings — GET: get current notification settings
+// /settings: GET: get current notification settings
 // ============================================================
 
 async function handleGetSettings(
@@ -146,11 +149,19 @@ async function handleGetSettings(
 ): Promise<Response> {
   const userId = ctx!.userId
   const settings = await getSettings(userId)
+  // null means the row exists but could not be read: surfacing the defaults
+  // here would show toggles in a state the user may have switched off.
+  if (!settings) {
+    return NextResponse.json(
+      { error: 'Failed to load notification settings' },
+      { status: 500 }
+    )
+  }
   return NextResponse.json({ data: settings })
 }
 
 // ============================================================
-// /settings — PUT: update notification settings
+// /settings: PUT: update notification settings
 // ============================================================
 
 async function handleUpdateSettings(
@@ -166,6 +177,7 @@ async function handleUpdateSettings(
     'invoiceSentEnabled',
     'receiptExtractedEnabled',
     'receiptMatchedEnabled',
+    'missingUnderlagEnabled',
   ]
   const filtered: Record<string, unknown> = {}
   for (const key of allowedKeys) {
@@ -179,6 +191,14 @@ async function handleUpdateSettings(
   }
 
   const settings = await saveSettings(userId, filtered)
+  // null means the current settings could not be read: saving would merge the
+  // partial into defaults and overwrite the user's stored opt-outs.
+  if (!settings) {
+    return NextResponse.json(
+      { error: 'Failed to save notification settings' },
+      { status: 500 }
+    )
+  }
   return NextResponse.json({ data: settings })
 }
 

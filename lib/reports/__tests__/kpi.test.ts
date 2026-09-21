@@ -5,7 +5,11 @@ import {
   calculateRevenueGrowth,
   calculateExpenseRatio,
   calculateAvgPaymentDays,
+  calculateVatLiability,
+  fetchTopSupplierInvoices,
+  type KpiSupplierInvoiceRow,
 } from '../kpi'
+import { VAT_INPUT_ACCOUNTS, VAT_OUTPUT_ACCOUNTS } from '../vat-declaration'
 import type { IncomeStatementReport, TrialBalanceRow } from '@/types'
 
 function makeIncomeStatement(
@@ -105,6 +109,122 @@ describe('calculateCashPosition', () => {
   })
 })
 
+describe('calculateVatLiability', () => {
+  it('returns positive liability for standard output VAT', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2611', closing_credit: 25000 }),
+      makeTrialBalanceRow({ account_number: '2641', closing_debit: 10000 }),
+    ]
+    expect(calculateVatLiability(rows)).toBe(15000)
+  })
+
+  it('includes reduced-rate output VAT (12% and 6%) in the liability', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2611', closing_credit: 25000 }),
+      makeTrialBalanceRow({ account_number: '2621', closing_credit: 1200 }),
+      makeTrialBalanceRow({ account_number: '2631', closing_credit: 600 }),
+      makeTrialBalanceRow({ account_number: '2641', closing_debit: 10000 }),
+    ]
+    expect(calculateVatLiability(rows)).toBe(16800)
+  })
+
+  it('nets EU reverse charge (2614 + 2645) to zero: issue #715', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2614', closing_credit: 2500 }),
+      makeTrialBalanceRow({ account_number: '2645', closing_debit: 2500 }),
+    ]
+    expect(calculateVatLiability(rows)).toBe(0)
+  })
+
+  it('nets domestic reverse charge (2614 + 2647) to zero', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2614', closing_credit: 1200 }),
+      makeTrialBalanceRow({ account_number: '2647', closing_debit: 1200 }),
+    ]
+    expect(calculateVatLiability(rows)).toBe(0)
+  })
+
+  it('nets import VAT (2615 + 2645) to zero', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2615', closing_credit: 800 }),
+      makeTrialBalanceRow({ account_number: '2645', closing_debit: 800 }),
+    ]
+    expect(calculateVatLiability(rows)).toBe(0)
+  })
+
+  it('reverse charge does not distort the net position alongside regular sales', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2611', closing_credit: 5000 }),
+      makeTrialBalanceRow({ account_number: '2641', closing_debit: 2000 }),
+      makeTrialBalanceRow({ account_number: '2614', closing_credit: 1000 }),
+      makeTrialBalanceRow({ account_number: '2645', closing_debit: 1000 }),
+    ]
+    // Old formula gave 5000 − (2000 + 1000) = 2000; correct is 3000
+    expect(calculateVatLiability(rows)).toBe(3000)
+  })
+
+  it('returns negative for net VAT receivable', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2611', closing_credit: 1000 }),
+      makeTrialBalanceRow({ account_number: '2641', closing_debit: 4000 }),
+    ]
+    expect(calculateVatLiability(rows)).toBe(-3000)
+  })
+
+  it('ignores accounts outside the VAT declaration set', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2650', closing_credit: 9000 }), // redovisningskonto för moms
+      makeTrialBalanceRow({ account_number: '1930', closing_debit: 9000 }),
+    ]
+    expect(calculateVatLiability(rows)).toBe(0)
+  })
+
+  it('respects account overrides, splitting input/output on the 264x prefix', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2611', closing_credit: 5000 }),
+      makeTrialBalanceRow({ account_number: '2614', closing_credit: 1000 }),
+      makeTrialBalanceRow({ account_number: '2641', closing_debit: 2000 }),
+    ]
+    // Override excludes 2614
+    expect(calculateVatLiability(rows, ['2611', '2641'])).toBe(3000)
+  })
+
+  it('handles debit balances on output accounts (corrections)', () => {
+    const rows = [
+      makeTrialBalanceRow({ account_number: '2611', closing_credit: 5000, closing_debit: 500 }),
+    ]
+    expect(calculateVatLiability(rows)).toBe(4500)
+  })
+})
+
+describe('VAT widget account lists (derived from ACCOUNT_RUTA)', () => {
+  // Drift guard: an ACCOUNT_RUTA change that alters these lists changes the
+  // dashboard widget's semantics: update this snapshot deliberately.
+  it('output accounts cover rutor 10-12, 30-32 and 60-62', () => {
+    expect([...VAT_OUTPUT_ACCOUNTS].sort()).toEqual([
+      '2610', '2611', '2612', '2613', '2614', '2615', '2616', '2618',
+      '2620', '2621', '2622', '2623', '2624', '2625', '2626', '2628',
+      '2630', '2631', '2632', '2633', '2634', '2635', '2636', '2638',
+    ])
+  })
+
+  it('input accounts cover ruta 48', () => {
+    expect([...VAT_INPUT_ACCOUNTS].sort()).toEqual([
+      '2640', '2641', '2642', '2645', '2646', '2647', '2648', '2649',
+    ])
+  })
+
+  it('the prefix split used by calculateVatLiability is exact for the defaults', () => {
+    for (const account of VAT_OUTPUT_ACCOUNTS) {
+      expect(account.startsWith('26')).toBe(true)
+      expect(account.startsWith('264')).toBe(false)
+    }
+    for (const account of VAT_INPUT_ACCOUNTS) {
+      expect(account.startsWith('264')).toBe(true)
+    }
+  })
+})
+
 describe('calculateRevenueGrowth', () => {
   it('returns positive growth', () => {
     // (120000 - 100000) / 100000 * 100 = 20%
@@ -135,6 +255,95 @@ describe('calculateExpenseRatio', () => {
   it('returns null when total_revenue is 0', () => {
     const stmt = makeIncomeStatement({ total_revenue: 0, total_expenses: 5000 })
     expect(calculateExpenseRatio(stmt)).toBeNull()
+  })
+})
+
+describe('fetchTopSupplierInvoices', () => {
+  const PAGE_SIZE = 1000 // fetchAllRows page size
+
+  function makeRow(): KpiSupplierInvoiceRow {
+    return {
+      supplier_id: 'sup-1',
+      total: 1,
+      total_sek: null,
+      currency: 'SEK',
+      exchange_rate: null,
+      supplier: { id: 'sup-1', name: 'Leverantören AB' },
+    }
+  }
+
+  /**
+   * Query-builder double: every filter method chains; `.range(from, to)`
+   * resolves to the page registered for `from`. Records order/range calls so
+   * the tests can pin the paging contract.
+   */
+  function pagedSupabase(
+    pagesByFrom: Record<number, unknown[] | { error: { message: string } }>,
+  ) {
+    const orderCalls: unknown[][] = []
+    const rangeCalls: Array<[number, number]> = []
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const chain: any = {}
+    for (const m of ['select', 'eq', 'gte', 'lte', 'neq']) chain[m] = () => chain
+    chain.order = (...args: unknown[]) => {
+      orderCalls.push(args)
+      return chain
+    }
+    chain.range = (from: number, to: number) => {
+      rangeCalls.push([from, to])
+      const page = pagesByFrom[from] ?? []
+      if (!Array.isArray(page)) {
+        return Promise.resolve({ data: null, error: page.error })
+      }
+      return Promise.resolve({ data: page, error: null })
+    }
+    return { supabase: { from: () => chain } as never, orderCalls, rangeCalls }
+  }
+
+  it('paginates past the 1000-row PostgREST cap instead of truncating', async () => {
+    // A company with 1003 supplier invoices in the period: awaiting the bare
+    // query returned only the first 1000 and silently understated the totals.
+    const page1 = Array.from({ length: PAGE_SIZE }, () => makeRow())
+    const page2 = Array.from({ length: 3 }, () => makeRow())
+    const { supabase, rangeCalls } = pagedSupabase({ 0: page1, [PAGE_SIZE]: page2 })
+
+    const { data, error } = await fetchTopSupplierInvoices(
+      supabase,
+      'company-1',
+      '2026-01-01',
+      '2026-12-31',
+    )
+
+    expect(error).toBeNull()
+    expect(data).toHaveLength(1003)
+    expect(rangeCalls).toEqual([
+      [0, PAGE_SIZE - 1],
+      [PAGE_SIZE, 2 * PAGE_SIZE - 1],
+    ])
+  })
+
+  it('orders on the id PK for stable paging', async () => {
+    const { supabase, orderCalls } = pagedSupabase({ 0: [makeRow()] })
+
+    await fetchTopSupplierInvoices(supabase, 'company-1', '2026-01-01', '2026-12-31')
+
+    // Without a stable total order, .range() paging can duplicate or skip
+    // rows on page boundaries, which would double or drop supplier spend.
+    expect(orderCalls).toContainEqual(['id', { ascending: true }])
+  })
+
+  it('returns a { data: null, error } value on query failure, never throws', async () => {
+    const { supabase } = pagedSupabase({ 0: { error: { message: 'connection reset' } } })
+
+    const result = await fetchTopSupplierInvoices(
+      supabase,
+      'company-1',
+      '2026-01-01',
+      '2026-12-31',
+    )
+
+    expect(result.data).toBeNull()
+    expect(result.error?.message).toBe('connection reset')
   })
 })
 

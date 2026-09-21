@@ -3,6 +3,7 @@
 import { Badge } from '@/components/ui/badge'
 import { AccountNumber } from '@/components/ui/account-number'
 import { CheckCircle2, Paperclip } from 'lucide-react'
+import { formatAmount, formatDate } from '@/lib/utils'
 
 interface ReviewLine {
   account_number: string
@@ -23,10 +24,6 @@ interface JournalEntryReviewContentProps {
   attachmentCount?: number
   showBalanceBadge?: boolean
   hideDate?: boolean
-}
-
-function formatAmount(amount: number): string {
-  return amount.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
 export function JournalEntryReviewContent({
@@ -58,7 +55,7 @@ export function JournalEntryReviewContent({
           {!hideDate && (
             <div>
               <span className="text-muted-foreground">Datum</span>
-              <p className="font-medium">{entryDate}</p>
+              <p className="font-medium">{formatDate(entryDate)}</p>
             </div>
           )}
           {voucherSeries && (
@@ -84,7 +81,7 @@ export function JournalEntryReviewContent({
       {(showBalanceBadge || (attachmentCount != null && attachmentCount > 0)) && (
         <div className="flex items-center gap-2">
           {showBalanceBadge && (
-            <Badge className="bg-success/10 text-success">
+            <Badge variant="success">
               <CheckCircle2 className="h-3 w-3 mr-1" />
               Debet = Kredit
             </Badge>
@@ -92,17 +89,17 @@ export function JournalEntryReviewContent({
           {attachmentCount != null && attachmentCount > 0 && (
             <Badge variant="outline">
               <Paperclip className="h-3 w-3 mr-1" />
-              {attachmentCount} {attachmentCount === 1 ? 'underlag' : 'underlag'}
+              {attachmentCount} underlag
             </Badge>
           )}
         </div>
       )}
 
-      {/* Debit/Credit — table on desktop, cards on mobile */}
+      {/* Debit/Credit: table on desktop, cards on mobile */}
       <div className="hidden sm:block">
         <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b text-left text-muted-foreground">
+          <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
+            <tr className="border-b text-left">
               <th className="py-2 w-24">Konto</th>
               <th className="py-2">Beskrivning</th>
               <th className="py-2 w-28 text-right">Debet</th>

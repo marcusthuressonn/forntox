@@ -1,23 +1,34 @@
 'use client'
 
+import { useTranslations } from 'next-intl'
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { useToast } from '@/components/ui/use-toast'
-import { Loader2, ShieldCheck, ShieldOff, KeyRound } from 'lucide-react'
+import { Loader2, ShieldCheck, ShieldOff } from 'lucide-react'
 import { isMfaRequired } from '@/lib/auth/mfa'
-import { isBankIdEnabled } from '@/lib/auth/bankid'
+import { isBankIdEnabled } from '@/lib/auth/bankid-flags'
+import { isSelfHosted as readSelfHostedFlag } from '@/lib/env/public-flags'
+import { AutoLogoutToggle } from '@/components/settings/AutoLogoutToggle'
 import { BankIdSettings } from '@/components/settings/BankIdSettings'
+import { userHasPassword } from '@/lib/auth/has-password'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import {
+  SettingsGroup,
+  SettingsInput,
+  SettingsRow,
+  SettingsRowEnd,
+  SettingsRowNote,
+} from '@/components/settings/SettingsRows'
 
-const isSelfHosted = process.env.NEXT_PUBLIC_SELF_HOSTED === 'true'
+const isSelfHosted = readSelfHostedFlag()
 const mfaRequired = isMfaRequired()
 const bankIdEnabled = isBankIdEnabled()
 
 export function SecuritySettings() {
+  const t = useTranslations('settings_security')
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [isChangingPassword, setIsChangingPassword] = useState(false)
@@ -25,19 +36,24 @@ export function SecuritySettings() {
   const [isLoadingMfa, setIsLoadingMfa] = useState(true)
   const [isUnenrolling, setIsUnenrolling] = useState(false)
   const [mfaFactorId, setMfaFactorId] = useState<string | null>(null)
+  const [hasPassword, setHasPassword] = useState<boolean | null>(null)
   const { toast } = useToast()
   const router = useRouter()
   const supabase = createClient()
 
   useEffect(() => {
-    async function loadMfaStatus() {
-      const { data } = await supabase.auth.mfa.listFactors()
-      const verifiedFactor = data?.totp?.find(f => f.status === 'verified')
+    async function loadStatus() {
+      const [{ data: factors }, { data: userData }] = await Promise.all([
+        supabase.auth.mfa.listFactors(),
+        supabase.auth.getUser(),
+      ])
+      const verifiedFactor = factors?.totp?.find(f => f.status === 'verified')
       setHasMfa(!!verifiedFactor)
       setMfaFactorId(verifiedFactor?.id ?? null)
+      setHasPassword(userData?.user ? userHasPassword(userData.user) : null)
       setIsLoadingMfa(false)
     }
-    loadMfaStatus()
+    loadStatus()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -53,8 +69,8 @@ export function SecuritySettings() {
 
     if (!strong) {
       toast({
-        title: 'Lösenordet är för svagt',
-        description: 'Lösenordet måste vara minst 8 tecken och innehålla versaler, gemener, siffror och specialtecken.',
+        title: t('toast_weak_password_title'),
+        description: t('toast_weak_password_description'),
         variant: 'destructive',
       })
       setIsChangingPassword(false)
@@ -63,8 +79,8 @@ export function SecuritySettings() {
 
     if (newPassword !== confirmPassword) {
       toast({
-        title: 'Lösenorden matchar inte',
-        description: 'Kontrollera att du skrev samma lösenord i båda fälten.',
+        title: t('toast_mismatch_title'),
+        description: t('toast_mismatch_description'),
         variant: 'destructive',
       })
       setIsChangingPassword(false)
@@ -72,27 +88,42 @@ export function SecuritySettings() {
     }
 
     try {
-      const { error } = await supabase.auth.updateUser({ password: newPassword })
+      const res = await fetch('/api/account/password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: newPassword }),
+      })
 
-      if (error) {
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string }
+        // Supabase rejects updateUser({password}) with this exact message when
+        // the user has a TOTP factor enrolled but is at AAL1. Send them through
+        // /mfa/verify to step up; on return they land back here and can retry.
+        if (body.error?.includes('AAL2')) {
+          router.push(
+            `/mfa/verify?returnTo=${encodeURIComponent('/settings/account')}`,
+          )
+          return
+        }
         toast({
-          title: 'Kunde inte uppdatera lösenord',
-          description: error.message,
+          title: t('toast_update_failed_title'),
+          description: body.error || t('toast_update_failed_description'),
           variant: 'destructive',
         })
         return
       }
 
       toast({
-        title: 'Lösenord uppdaterat',
-        description: 'Ditt lösenord har ändrats.',
+        title: t('toast_password_updated_title'),
+        description: t('toast_password_updated_description'),
       })
       setNewPassword('')
       setConfirmPassword('')
+      setHasPassword(true)
     } catch {
       toast({
-        title: 'Något gick fel',
-        description: 'Försök igen senare.',
+        title: t('toast_generic_error_title'),
+        description: t('toast_try_again'),
         variant: 'destructive',
       })
     } finally {
@@ -108,24 +139,32 @@ export function SecuritySettings() {
       const { error } = await supabase.auth.mfa.unenroll({ factorId: mfaFactorId })
 
       if (error) {
+        // mfa.unenroll requires AAL2: for BankID-linked users at AAL1 (the
+        // shouldEnforceMfa skip path), this is the only way to step up.
+        if (error.message?.includes('AAL2')) {
+          router.push(
+            `/mfa/verify?returnTo=${encodeURIComponent('/settings/account')}`,
+          )
+          return
+        }
         toast({
-          title: 'Kunde inte inaktivera 2FA',
-          description: error.message,
+          title: t('toast_unenroll_failed_title'),
+          description: getUserErrorMessage(error),
           variant: 'destructive',
         })
         return
       }
 
       toast({
-        title: 'Tvåfaktorsautentisering inaktiverad',
-        description: '2FA har tagits bort från ditt konto.',
+        title: t('toast_mfa_disabled_title'),
+        description: t('toast_mfa_disabled_description'),
       })
       setHasMfa(false)
       setMfaFactorId(null)
     } catch {
       toast({
-        title: 'Något gick fel',
-        description: 'Försök igen senare.',
+        title: t('toast_generic_error_title'),
+        description: t('toast_try_again'),
         variant: 'destructive',
       })
     } finally {
@@ -134,140 +173,165 @@ export function SecuritySettings() {
   }
 
   return (
-    <div className="space-y-6">
+    <SettingsGroup label={t('group_security')}>
       {bankIdEnabled && <BankIdSettings />}
-      {/* Change password */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <KeyRound className="h-5 w-5" />
-            Ändra lösenord
-          </CardTitle>
-          <CardDescription>
-            Uppdatera ditt lösenord. Om du loggar in med e-postlänk kan du sätta ett lösenord här.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={handleChangePassword} className="space-y-4 max-w-md">
-            <div className="space-y-2">
-              <Label htmlFor="new_password">Nytt lösenord</Label>
-              <Input
-                id="new_password"
-                type="password"
-                autoComplete="new-password"
-                placeholder="Minst 8 tecken"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                required
-                minLength={8}
-                disabled={isChangingPassword}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="confirm_new_password">Bekräfta nytt lösenord</Label>
-              <Input
-                id="confirm_new_password"
-                type="password"
-                autoComplete="new-password"
-                placeholder="Upprepa lösenordet"
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                required
-                minLength={8}
-                disabled={isChangingPassword}
-              />
-            </div>
-            <Button type="submit" disabled={isChangingPassword}>
-              {isChangingPassword ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Sparar...
-                </>
-              ) : (
-                'Uppdatera lösenord'
-              )}
-            </Button>
-          </form>
-        </CardContent>
-      </Card>
 
-      {/* MFA — hidden for self-hosted */}
+      {/* BankID-only users with no password: set-password row before the rest */}
+      {hasPassword === false && (
+        <SettingsRow
+          label={t('set_password_title')}
+          help={t('set_password_description')}
+        >
+          <SettingsRowEnd>
+            <Button
+              size="sm"
+              onClick={() =>
+                router.push('/account/set-password?returnTo=/settings/account')
+              }
+            >
+              {t('set_password_button')}
+            </Button>
+          </SettingsRowEnd>
+        </SettingsRow>
+      )}
+
+      {/* Change password: hidden when the user has no password (the row
+          above handles the set-initial-password flow). */}
+      {hasPassword !== false && (
+        <form onSubmit={handleChangePassword}>
+          <SettingsRow
+            label={t('new_password_label')}
+            htmlFor="new_password"
+            help={t('change_password_description')}
+            align="baseline"
+          >
+            <SettingsInput
+              id="new_password"
+              type="password"
+              autoComplete="new-password"
+              placeholder={t('new_password_placeholder')}
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              required
+              minLength={8}
+              disabled={isChangingPassword}
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t('confirm_password_label')}
+            htmlFor="confirm_new_password"
+            align="baseline"
+          >
+            <SettingsInput
+              id="confirm_new_password"
+              type="password"
+              autoComplete="new-password"
+              placeholder={t('confirm_password_placeholder')}
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              required
+              minLength={8}
+              disabled={isChangingPassword}
+            />
+            <SettingsRowEnd>
+              <Button type="submit" size="sm" disabled={isChangingPassword}>
+                {isChangingPassword ? (
+                  <>
+                    <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                    {t('saving')}
+                  </>
+                ) : (
+                  t('update_password_button')
+                )}
+              </Button>
+            </SettingsRowEnd>
+          </SettingsRow>
+        </form>
+      )}
+
+      {/* MFA: hidden for self-hosted */}
       {!isSelfHosted && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <ShieldCheck className="h-5 w-5" />
-              Tvåfaktorsautentisering (2FA)
-            </CardTitle>
-            <CardDescription>
-              Skydda ditt konto med en autentiseringsapp. Vid varje inloggning behöver du ange en kod
-              utöver ditt lösenord.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            {isLoadingMfa ? (
-              <div className="flex items-center gap-2 text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Laddar...
-              </div>
-            ) : hasMfa ? (
-              <div className="space-y-4">
-                <div className="flex items-center gap-3 p-4 rounded-lg border bg-green-50 dark:bg-green-950/20 border-green-200 dark:border-green-900">
-                  <ShieldCheck className="h-5 w-5 text-green-600 dark:text-green-500" />
-                  <div>
-                    <p className="font-medium text-green-900 dark:text-green-100">2FA är aktiverad</p>
-                    <p className="text-sm text-green-700 dark:text-green-400">
-                      Ditt konto skyddas med tvåfaktorsautentisering.
-                    </p>
-                  </div>
-                </div>
-                {!mfaRequired && (
+        <SettingsRow
+          label={t('mfa_title')}
+          help={
+            <>
+              <p>{t('mfa_description')}</p>
+              {!isLoadingMfa && !hasMfa && (
+                <p className="mt-2">{t('mfa_inactive_description')}</p>
+              )}
+            </>
+          }
+        >
+          {isLoadingMfa ? (
+            <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              {t('loading')}
+            </span>
+          ) : hasMfa ? (
+            <>
+              <Badge variant="success">{t('mfa_active_title')}</Badge>
+              <SettingsRowNote>{t('mfa_active_description')}</SettingsRowNote>
+              <SettingsRowEnd>
+                {mfaRequired ? (
+                  // Required by the hosted config: no disable action exists,
+                  // so the reason stays visible as the row's status.
+                  <SettingsRowNote>{t('mfa_required_note')}</SettingsRowNote>
+                ) : (
                   <Button
                     variant="outline"
+                    size="sm"
                     onClick={handleUnenrollMfa}
                     disabled={isUnenrolling}
                   >
                     {isUnenrolling ? (
                       <>
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        Inaktiverar...
+                        <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                        {t('disabling')}
                       </>
                     ) : (
                       <>
-                        <ShieldOff className="mr-2 h-4 w-4" />
-                        Inaktivera 2FA
+                        <ShieldOff className="mr-2 h-3.5 w-3.5" />
+                        {t('disable_mfa')}
                       </>
                     )}
                   </Button>
                 )}
-                {mfaRequired && (
-                  <p className="text-xs text-muted-foreground">
-                    Tvåfaktorsautentisering är obligatorisk och kan inte inaktiveras.
-                  </p>
+              </SettingsRowEnd>
+            </>
+          ) : (
+            <>
+              <SettingsRowNote>{t('mfa_inactive_title')}</SettingsRowNote>
+              <SettingsRowEnd>
+                {hasPassword === false ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      router.push('/account/set-password?returnTo=/mfa/enroll')
+                    }
+                  >
+                    {t('set_password_first')}
+                  </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      router.push(`/mfa/enroll?returnTo=${encodeURIComponent('/settings/account')}`)
+                    }
+                  >
+                    <ShieldCheck className="mr-2 h-3.5 w-3.5" />
+                    {t('enable_mfa')}
+                  </Button>
                 )}
-              </div>
-            ) : (
-              <div className="space-y-4">
-                <div className="flex items-center gap-3 p-4 rounded-lg border">
-                  <ShieldOff className="h-5 w-5 text-muted-foreground" />
-                  <div>
-                    <p className="font-medium">2FA är inte aktiverad</p>
-                    <p className="text-sm text-muted-foreground">
-                      Vi rekommenderar att du aktiverar tvåfaktorsautentisering.
-                    </p>
-                  </div>
-                </div>
-                <Button
-                  onClick={() => router.push(`/mfa/enroll?returnTo=${encodeURIComponent('/settings/account')}`)}
-                >
-                  <ShieldCheck className="mr-2 h-4 w-4" />
-                  Aktivera 2FA
-                </Button>
-              </div>
-            )}
-          </CardContent>
-        </Card>
+              </SettingsRowEnd>
+            </>
+          )}
+        </SettingsRow>
       )}
-    </div>
+
+      {/* Automatic logout: per-user opt-in, renders nothing on self-hosted */}
+      <AutoLogoutToggle />
+    </SettingsGroup>
   )
 }

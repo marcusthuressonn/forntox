@@ -6,26 +6,27 @@ import {
   getDefaultVatTreatmentForCategory,
   buildMappingResultFromCategory,
 } from '../category-mapping'
+import { BAS_REFERENCE } from '../bas-data'
 import { makeTransaction } from '@/tests/helpers'
 import type { TransactionCategory, VatTreatment } from '@/types'
 
 describe('getCategoryAccountMapping', () => {
   describe('income_products uses correct account', () => {
     it('maps income_products to 3001 (25% moms)', () => {
-      const result = getCategoryAccountMapping('income_products', 1000, true)
+      const result = getCategoryAccountMapping('income_products', 1000, true, 'enskild_firma')
       expect(result.creditAccount).toBe('3001')
     })
 
     it('income_products matches income_services account', () => {
-      const products = getCategoryAccountMapping('income_products', 1000, true)
-      const services = getCategoryAccountMapping('income_services', 1000, true)
+      const products = getCategoryAccountMapping('income_products', 1000, true, 'enskild_firma')
+      const services = getCategoryAccountMapping('income_services', 1000, true, 'enskild_firma')
       expect(products.creditAccount).toBe(services.creditAccount)
     })
   })
 
   describe('expense_office maps to 6110 (Kontorsförbrukning)', () => {
     it('maps expense_office to 6110 (not 5010 Lokalhyra)', () => {
-      const result = getCategoryAccountMapping('expense_office', -500, true)
+      const result = getCategoryAccountMapping('expense_office', -500, true, 'enskild_firma')
       expect(result.debitAccount).toBe('6110')
     })
   })
@@ -41,9 +42,16 @@ describe('getCategoryAccountMapping', () => {
       expect(result.debitAccount).toBe('7610')
     })
 
-    it('defaults to 6991 when no entityType provided', () => {
-      const result = getCategoryAccountMapping('expense_education', -500, true)
+    it('uses 6991 for an ideell förening (no personnel cost assumed)', () => {
+      const result = getCategoryAccountMapping('expense_education', -500, true, 'ideell_forening')
       expect(result.debitAccount).toBe('6991')
+    })
+
+    it('settles a private förening transaction on 2890, never an owner account', () => {
+      const out = getCategoryAccountMapping('private', -500, false, 'ideell_forening')
+      expect(out.debitAccount).toBe('2890')
+      const inn = getCategoryAccountMapping('private', 500, false, 'ideell_forening')
+      expect(inn.creditAccount).toBe('2890')
     })
   })
 })
@@ -62,17 +70,21 @@ describe('getExpenseAccountForCategory', () => {
 
 describe('getDefaultAccountForCategory', () => {
   it('returns expense account for expense categories', () => {
-    expect(getDefaultAccountForCategory('expense_equipment')).toBe('5410')
-    expect(getDefaultAccountForCategory('expense_software')).toBe('5420')
-    expect(getDefaultAccountForCategory('expense_travel')).toBe('5800')
-    expect(getDefaultAccountForCategory('expense_office')).toBe('6110')
-    expect(getDefaultAccountForCategory('expense_bank_fees')).toBe('6570')
+    expect(getDefaultAccountForCategory('expense_equipment', 'enskild_firma')).toBe('5410')
+    expect(getDefaultAccountForCategory('expense_software', 'enskild_firma')).toBe('5420')
+    expect(getDefaultAccountForCategory('expense_travel', 'enskild_firma')).toBe('5890')
+    expect(getDefaultAccountForCategory('expense_office', 'enskild_firma')).toBe('6110')
+    expect(getDefaultAccountForCategory('expense_bank_fees', 'enskild_firma')).toBe('6570')
   })
 
   it('returns income account for income categories', () => {
-    expect(getDefaultAccountForCategory('income_services')).toBe('3001')
-    expect(getDefaultAccountForCategory('income_products')).toBe('3001')
-    expect(getDefaultAccountForCategory('income_other')).toBe('3900')
+    expect(getDefaultAccountForCategory('income_services', 'enskild_firma')).toBe('3001')
+    expect(getDefaultAccountForCategory('income_products', 'enskild_firma')).toBe('3001')
+    expect(getDefaultAccountForCategory('income_other', 'enskild_firma')).toBe('3999')
+  })
+
+  it('returns the member settlement account for an ideell förening', () => {
+    expect(getDefaultAccountForCategory('private', 'ideell_forening')).toBe('2890')
   })
 
   it('returns private account for enskild firma', () => {
@@ -89,7 +101,7 @@ describe('getDefaultAccountForCategory', () => {
   })
 
   it('returns fallback for uncategorized', () => {
-    expect(getDefaultAccountForCategory('uncategorized')).toBe('6991')
+    expect(getDefaultAccountForCategory('uncategorized', 'enskild_firma')).toBe('6991')
   })
 })
 
@@ -136,6 +148,186 @@ describe('buildMappingResultFromCategory', () => {
   })
 })
 
+describe('buildMappingResultFromCategory vat_amount override (underlagets faktiska moms)', () => {
+  // Real-world case: restaurant receipt 415.80 kr incl. dricks. The receipt's
+  // actual 12% VAT is 42.43 kr: lower than rate-extraction 44.55 kr, because
+  // dricks carries no moms. The override must win over the computed amount.
+  it('uses the underlag VAT instead of rate-extraction for an expense', () => {
+    const tx = makeTransaction({ amount: -415.8 })
+    const result = buildMappingResultFromCategory(
+      'expense_representation', tx, true, 'enskild_firma', 'reduced_12', 42.43,
+    )
+
+    expect(result.vat_lines).toHaveLength(1)
+    expect(result.vat_lines[0].account_number).toBe('2641')
+    expect(result.vat_lines[0].debit_amount).toBe(42.43)
+    expect(result.vat_lines[0].description).toBe('Ingående moms (enligt underlag)')
+  })
+
+  it('without override the computed amount is unchanged (regression)', () => {
+    const tx = makeTransaction({ amount: -415.8 })
+    const result = buildMappingResultFromCategory(
+      'expense_representation', tx, true, 'enskild_firma', 'reduced_12',
+    )
+
+    expect(result.vat_lines).toHaveLength(1)
+    expect(result.vat_lines[0].debit_amount).toBe(44.55)
+    expect(result.vat_lines[0].description).toBe('Ingående moms 12%')
+  })
+
+  it('null override behaves like no override', () => {
+    const tx = makeTransaction({ amount: -415.8 })
+    const result = buildMappingResultFromCategory(
+      'expense_representation', tx, true, 'enskild_firma', 'reduced_12', null,
+    )
+    expect(result.vat_lines[0].debit_amount).toBe(44.55)
+  })
+
+  it('rejects override 0, pointing to vat_treatment exempt', () => {
+    // A 0-moms document is an exempt supply: booking it as a rate-bearing
+    // treatment minus its VAT line would misclassify it in the momsdeklaration.
+    const tx = makeTransaction({ amount: -500 })
+    expect(() =>
+      buildMappingResultFromCategory('expense_office', tx, true, 'enskild_firma', 'standard_25', 0),
+    ).toThrow(/exempt/)
+  })
+
+  it('overrides output VAT on income', () => {
+    const tx = makeTransaction({ amount: 1000 })
+    const result = buildMappingResultFromCategory(
+      'income_services', tx, true, 'enskild_firma', 'standard_25', 180,
+    )
+
+    expect(result.vat_lines).toHaveLength(1)
+    expect(result.vat_lines[0].account_number).toBe('2611')
+    expect(result.vat_lines[0].credit_amount).toBe(180)
+    expect(result.vat_lines[0].description).toBe('Utgående moms (enligt underlag)')
+  })
+
+  it('rejects an override above the 25% extraction bound', () => {
+    const tx = makeTransaction({ amount: -415.8 })
+    // max possible Swedish VAT on 415.80 gross is 83.16 (25% extraction)
+    expect(() =>
+      buildMappingResultFromCategory('expense_representation', tx, true, 'enskild_firma', 'reduced_12', 100),
+    ).toThrow(/exceeds the maximum possible Swedish VAT/)
+  })
+
+  it('rejects a negative override', () => {
+    const tx = makeTransaction({ amount: -500 })
+    expect(() =>
+      buildMappingResultFromCategory('expense_office', tx, true, 'enskild_firma', 'standard_25', -1),
+    ).toThrow(/positive/)
+  })
+
+  it('rejects an override combined with reverse_charge', () => {
+    const tx = makeTransaction({ amount: -1000 })
+    expect(() =>
+      buildMappingResultFromCategory('expense_software', tx, true, 'enskild_firma', 'reverse_charge', 50),
+    ).toThrow(/cannot be combined/)
+  })
+
+  it('treatment incompatibility wins over the bound check (oversized + reverse_charge)', () => {
+    const tx = makeTransaction({ amount: -1000 })
+    // 500 also exceeds maxVat (200), but the agent's actual mistake is the
+    // treatment: the error must say so, not complain about the amount.
+    expect(() =>
+      buildMappingResultFromCategory('expense_software', tx, true, 'enskild_firma', 'reverse_charge', 500),
+    ).toThrow(/cannot be combined/)
+  })
+
+  it('rejects an override on a VAT-less treatment', () => {
+    const tx = makeTransaction({ amount: -1000 })
+    expect(() =>
+      buildMappingResultFromCategory('expense_software', tx, true, 'enskild_firma', 'exempt', 50),
+    ).toThrow(/cannot be combined/)
+  })
+
+  it('rejects an override on a VAT-exempt default category (bank fees)', () => {
+    const tx = makeTransaction({ amount: -100 })
+    expect(() =>
+      buildMappingResultFromCategory('expense_bank_fees', tx, true, 'enskild_firma', undefined, 10),
+    ).toThrow(/cannot be combined/)
+  })
+
+  it('rejects an override on private transactions', () => {
+    const tx = makeTransaction({ amount: -500 })
+    expect(() =>
+      buildMappingResultFromCategory('private', tx, false, 'enskild_firma', undefined, 50),
+    ).toThrow(/cannot be combined/)
+  })
+})
+
+describe('buildMappingResultFromCategory foreign currency (VAT lines are SEK)', () => {
+  // MCP feedback seq 254607: a 79.34 USD Stripe payment with 15.87 USD moms
+  // validated the override against the USD gross but posted 15.87 kr to 2611.
+  // The entry still balanced (the revenue line absorbed the difference), so
+  // the wrong 26xx figure was undetectable downstream. All journal lines are
+  // SEK: every figure derived from transaction.amount must convert the same
+  // way buildTransactionEntryLines converts the gross.
+  it('converts a vat_amount override on USD income to SEK (Fabian/Stripe case)', () => {
+    const tx = makeTransaction({ amount: 79.34, currency: 'USD', exchange_rate: 9.51 })
+    const result = buildMappingResultFromCategory(
+      'income_services', tx, true, 'enskild_firma', 'standard_25', 15.87,
+    )
+
+    expect(result.vat_lines).toHaveLength(1)
+    expect(result.vat_lines[0].account_number).toBe('2611')
+    // gross SEK = round(79.34 * 9.51) = 754.52; 15.87 * 754.52 / 79.34 = 150.92
+    expect(result.vat_lines[0].credit_amount).toBe(150.92)
+  })
+
+  it('derives auto VAT from the SEK gross, not the foreign amount', () => {
+    const tx = makeTransaction({ amount: 100, currency: 'USD', amount_sek: 1000 })
+    const result = buildMappingResultFromCategory(
+      'income_services', tx, true, 'enskild_firma', 'standard_25',
+    )
+
+    expect(result.vat_lines).toHaveLength(1)
+    expect(result.vat_lines[0].credit_amount).toBe(200) // not 20
+  })
+
+  it('scales the override by amount_sek when present (bank settlement rate wins)', () => {
+    // amount_sek embeds the bank's actual settlement; exchange_rate would give
+    // a different figure. The override must scale by the same value the gross
+    // line resolves to, or the entry lines disagree internally.
+    const tx = makeTransaction({ amount: 100, currency: 'USD', amount_sek: 950, exchange_rate: 10 })
+    const result = buildMappingResultFromCategory(
+      'income_services', tx, true, 'enskild_firma', 'standard_25', 20,
+    )
+
+    expect(result.vat_lines[0].credit_amount).toBe(190)
+  })
+
+  it('books reverse-charge fiktiv moms off the SEK value for an EUR expense', () => {
+    const tx = makeTransaction({ amount: -1000, currency: 'EUR', exchange_rate: 11 })
+    const result = buildMappingResultFromCategory(
+      'expense_software', tx, true, 'enskild_firma', 'reverse_charge',
+    )
+
+    const debitLine = result.vat_lines.find((l) => l.account_number === '2645')
+    const creditLine = result.vat_lines.find((l) => l.account_number === '2614')
+    expect(debitLine!.debit_amount).toBe(2750) // 25% of 11 000 kr, not of 1 000 EUR
+    expect(creditLine!.credit_amount).toBe(2750)
+  })
+
+  it('still bounds the override in the transaction currency and names it', () => {
+    const tx = makeTransaction({ amount: 100, currency: 'USD', amount_sek: 1000 })
+    // max Swedish VAT on 100 USD gross is 20 USD; 25 exceeds it even though
+    // 25 would be far below the SEK bound.
+    expect(() =>
+      buildMappingResultFromCategory('income_services', tx, true, 'enskild_firma', 'standard_25', 25),
+    ).toThrow(/exceeds the maximum possible Swedish VAT on 100 USD/)
+  })
+
+  it('keeps SEK transactions byte-identical (regression)', () => {
+    const tx = makeTransaction({ amount: -415.8 })
+    const result = buildMappingResultFromCategory(
+      'expense_representation', tx, true, 'enskild_firma', 'reduced_12', 42.43,
+    )
+    expect(result.vat_lines[0].debit_amount).toBe(42.43)
+  })
+})
+
 describe('buildMappingResultFromCategory returns non-empty accounts', () => {
   const allCategories: TransactionCategory[] = [
     'income_services',
@@ -159,7 +351,7 @@ describe('buildMappingResultFromCategory returns non-empty accounts', () => {
   it.each(allCategories)('returns non-empty debit_account and credit_account for "%s"', (category) => {
     const tx = makeTransaction({ amount: category.startsWith('income') ? 1000 : -1000 })
     const isBusiness = category !== 'private'
-    const result = buildMappingResultFromCategory(category, tx, isBusiness)
+    const result = buildMappingResultFromCategory(category, tx, isBusiness, 'enskild_firma')
 
     expect(result.debit_account).toBeTruthy()
     expect(result.credit_account).toBeTruthy()
@@ -199,14 +391,14 @@ describe('representation VAT (reduced 12%, ML 13 kap 24-25 §§)', () => {
   })
 
   it('getCategoryAccountMapping has vatTreatment: reduced_12 for representation', () => {
-    const result = getCategoryAccountMapping('expense_representation', -500, true)
+    const result = getCategoryAccountMapping('expense_representation', -500, true, 'enskild_firma')
     expect(result.vatTreatment).toBe('reduced_12')
     expect(result.vatDebitAccount).toBe('2641')
   })
 
   it('buildMappingResultFromCategory generates 12% VAT line for representation', () => {
     const tx = makeTransaction({ amount: -500 })
-    const result = buildMappingResultFromCategory('expense_representation', tx, true)
+    const result = buildMappingResultFromCategory('expense_representation', tx, true, 'enskild_firma')
     expect(result.vat_lines).toHaveLength(1)
     expect(result.vat_lines[0].account_number).toBe('2641')
   })
@@ -232,15 +424,15 @@ describe('income account resolves by VAT treatment', () => {
     expect(result.creditAccount).toBe(expectedAccount)
   })
 
-  it('income_other always returns 3900 regardless of VAT treatment', () => {
+  it('income_other always returns 3999 regardless of VAT treatment', () => {
     for (const vat of ['standard_25', 'reduced_12', 'reduced_6', 'export', 'reverse_charge', 'exempt'] as VatTreatment[]) {
       const result = getCategoryAccountMapping('income_other', 1000, true, 'enskild_firma', vat)
-      expect(result.creditAccount).toBe('3900')
+      expect(result.creditAccount).toBe('3999')
     }
   })
 
   it('defaults to 3001 when no vatTreatment provided', () => {
-    const result = getCategoryAccountMapping('income_services', 1000, true)
+    const result = getCategoryAccountMapping('income_services', 1000, true, 'enskild_firma')
     expect(result.creditAccount).toBe('3001')
   })
 })
@@ -268,5 +460,215 @@ describe('private transaction accounts by entity type and direction', () => {
 
   it('getDefaultAccountForCategory still returns 2013 for EF (default/withdrawal account)', () => {
     expect(getDefaultAccountForCategory('private', 'enskild_firma')).toBe('2013')
+  })
+})
+
+describe('incoming expense refund (positive amount, expense category)', () => {
+  it('getCategoryAccountMapping swaps accounts: bank debited, expense account credited', () => {
+    const result = getCategoryAccountMapping('expense_software', 500, true, 'enskild_firma')
+    expect(result.debitAccount).toBe('1930')
+    expect(result.creditAccount).toBe('5420')
+  })
+
+  it('getCategoryAccountMapping sets vatCreditAccount 2641 and clears vatDebitAccount for refund', () => {
+    const result = getCategoryAccountMapping('expense_software', 500, true, 'enskild_firma')
+    expect(result.vatDebitAccount).toBeNull()
+    expect(result.vatCreditAccount).toBe('2641')
+  })
+
+  it('VAT-exempt expense refund (bank_fees) has no VAT accounts', () => {
+    const result = getCategoryAccountMapping('expense_bank_fees', 100, true, 'enskild_firma')
+    expect(result.debitAccount).toBe('1930')
+    expect(result.creditAccount).toBe('6570')
+    expect(result.vatDebitAccount).toBeNull()
+    expect(result.vatCreditAccount).toBeNull()
+  })
+
+  it('buildMappingResultFromCategory generates credit line on 2641 for expense refund', () => {
+    const tx = makeTransaction({ amount: 1000 })
+    const result = buildMappingResultFromCategory('expense_software', tx, true, 'enskild_firma')
+    expect(result.vat_lines).toHaveLength(1)
+    expect(result.vat_lines[0].account_number).toBe('2641')
+    expect(result.vat_lines[0].credit_amount).toBe(200)
+    expect(result.vat_lines[0].debit_amount).toBe(0)
+  })
+
+  it('buildMappingResultFromCategory uses återföring description for expense refund VAT', () => {
+    const tx = makeTransaction({ amount: 1000 })
+    const result = buildMappingResultFromCategory('expense_software', tx, true, 'enskild_firma')
+    expect(result.vat_lines[0].description).toBe('Återföring ingående moms 25%')
+  })
+
+  it('buildMappingResultFromCategory generates no VAT line for VAT-exempt expense refund', () => {
+    const tx = makeTransaction({ amount: 100 })
+    const result = buildMappingResultFromCategory('expense_bank_fees', tx, true, 'enskild_firma')
+    expect(result.vat_lines).toHaveLength(0)
+  })
+
+  it('buildMappingResultFromCategory maps debit/credit correctly (bank debited, expense credited)', () => {
+    const tx = makeTransaction({ amount: 1250 })
+    const result = buildMappingResultFromCategory('expense_software', tx, true, 'enskild_firma')
+    expect(result.debit_account).toBe('1930')
+    expect(result.credit_account).toBe('5420')
+  })
+
+  it('vat_amount override on expense refund uses återföring description', () => {
+    const tx = makeTransaction({ amount: 1250 })
+    const result = buildMappingResultFromCategory('expense_software', tx, true, 'enskild_firma', 'standard_25', 200)
+    expect(result.vat_lines).toHaveLength(1)
+    expect(result.vat_lines[0].credit_amount).toBe(200)
+    expect(result.vat_lines[0].description).toBe('Återföring ingående moms (enligt underlag)')
+  })
+})
+
+describe('category default → leaf account guarantee', () => {
+  // BAS encodes the parent/leaf distinction in account_name via the
+  // "(gruppkonto)" suffix. Auditors and Skatteverket downstream reporting
+  // expect postings on leaves, not headers: see migration 03d4b740.
+  const groupAccountNumbers = new Set<string>()
+  for (const acct of BAS_REFERENCE) {
+    if (acct.account_name.includes('(gruppkonto)')) {
+      groupAccountNumbers.add(acct.account_number)
+    }
+  }
+
+  const categoriesUnderGuard: TransactionCategory[] = [
+    'income_services',
+    'income_products',
+    'income_other',
+    'expense_equipment',
+    'expense_software',
+    'expense_travel',
+    'expense_office',
+    'expense_marketing',
+    'expense_professional_services',
+    'expense_representation',
+    'expense_consumables',
+    'expense_vehicle',
+    'expense_telecom',
+    'expense_education',
+    'expense_bank_fees',
+    'expense_card_fees',
+    'expense_currency_exchange',
+    'expense_other',
+    'private',
+    'uncategorized',
+  ]
+
+  it.each(categoriesUnderGuard)('%s default does not resolve to a gruppkonto', (category) => {
+    for (const entityType of ['enskild_firma', 'aktiebolag', 'ideell_forening'] as const) {
+      const target = getDefaultAccountForCategory(category, entityType)
+      expect(groupAccountNumbers.has(target)).toBe(false)
+    }
+  })
+
+  it('uncategorized positive amount does not credit a gruppkonto', () => {
+    const result = getCategoryAccountMapping('uncategorized', 1000, true, 'enskild_firma')
+    expect(groupAccountNumbers.has(result.creditAccount)).toBe(false)
+  })
+
+  it('expense_telecom resolves to 6230 (Datakommunikation, leaf)', () => {
+    expect(getDefaultAccountForCategory('expense_telecom', 'enskild_firma')).toBe('6230')
+  })
+
+  it('expense_travel resolves to 5890 (Övriga resekostnader, leaf)', () => {
+    expect(getDefaultAccountForCategory('expense_travel', 'enskild_firma')).toBe('5890')
+  })
+
+  it('income_other resolves to 3999 (Övriga rörelseintäkter, leaf)', () => {
+    expect(getDefaultAccountForCategory('income_other', 'enskild_firma')).toBe('3999')
+  })
+})
+
+// ============================================================
+// VAT registration: a non-registered company books no moms line
+// (lib/bookkeeping/vat-registration.ts, the bank-transaction half of the
+// supplier-invoice guard in app/api/supplier-invoices/route.ts)
+// ============================================================
+
+describe('VAT registration', () => {
+  const expense = makeTransaction({ amount: -1250, description: 'Adobe' })
+  const income = makeTransaction({ amount: 1250, description: 'Faktura 12' })
+
+  it('a registered company (true, null or undefined) books exactly as before', () => {
+    const baseline = buildMappingResultFromCategory('expense_software', expense, true, 'aktiebolag')
+    for (const flag of [true, null, undefined]) {
+      expect(
+        buildMappingResultFromCategory('expense_software', expense, true, 'aktiebolag', undefined, null, flag),
+      ).toEqual(baseline)
+    }
+    expect(baseline.debit_account).toBe('5420')
+    expect(baseline.vat_lines).toEqual([
+      expect.objectContaining({ account_number: '2641', debit_amount: 250 }),
+    ])
+
+    const incomeBaseline = buildMappingResultFromCategory('income_services', income, true, 'aktiebolag')
+    for (const flag of [true, null, undefined]) {
+      expect(
+        buildMappingResultFromCategory('income_services', income, true, 'aktiebolag', undefined, null, flag),
+      ).toEqual(incomeBaseline)
+    }
+    expect(incomeBaseline.credit_account).toBe('3001')
+    expect(incomeBaseline.vat_lines).toEqual([
+      expect.objectContaining({ account_number: '2611', credit_amount: 250 }),
+    ])
+  })
+
+  it('a non-registered company books an expense gross with no ingående moms', () => {
+    const result = buildMappingResultFromCategory(
+      'expense_software', expense, true, 'ideell_forening', undefined, null, false,
+    )
+    expect(result.debit_account).toBe('5420')
+    expect(result.credit_account).toBe('1930')
+    expect(result.vat_lines).toEqual([])
+    const mapping = getCategoryAccountMapping('expense_software', -1250, true, 'ideell_forening', undefined, false)
+    expect(mapping.vatTreatment).toBe('exempt')
+  })
+
+  it('a non-registered company books income as a momsfri supply: 3004 and no utgående moms', () => {
+    const result = buildMappingResultFromCategory(
+      'income_services', income, true, 'ideell_forening', undefined, null, false,
+    )
+    expect(result.credit_account).toBe('3004')
+    expect(result.vat_lines).toEqual([])
+    const mapping = getCategoryAccountMapping('income_services', 1250, true, 'ideell_forening', undefined, false)
+    expect(mapping.vatTreatment).toBe('exempt')
+    expect(mapping.vatCreditAccount).toBeNull()
+  })
+
+  it('applies to every legal form: an enskild firma or aktiebolag that is not registered books the same way', () => {
+    for (const form of ['enskild_firma', 'aktiebolag'] as const) {
+      const result = buildMappingResultFromCategory('expense_office', expense, true, form, undefined, null, false)
+      expect(result.vat_lines).toEqual([])
+      expect(result.debit_account).toBe('6110')
+    }
+  })
+
+  it('keeps reverse charge for a non-registered company: self-assessment is a separate obligation', () => {
+    const registered = buildMappingResultFromCategory(
+      'expense_professional_services', expense, true, 'aktiebolag', 'reverse_charge',
+    )
+    const notRegistered = buildMappingResultFromCategory(
+      'expense_professional_services', expense, true, 'aktiebolag', 'reverse_charge', null, false,
+    )
+    expect(notRegistered.vat_lines).toEqual(registered.vat_lines)
+    expect(notRegistered.vat_lines.some((l) => l.account_number === '2645')).toBe(true)
+    expect(notRegistered.vat_lines.some((l) => l.account_number === '2614')).toBe(true)
+  })
+
+  it('refuses a vat_amount override for a non-registered company instead of booking 2641', () => {
+    expect(() =>
+      buildMappingResultFromCategory('expense_software', expense, true, 'aktiebolag', 'standard_25', 100, false),
+    ).toThrow(/not VAT-registered/)
+  })
+
+  it('the category default resolves to exempt only for an explicit false', () => {
+    expect(getDefaultVatTreatmentForCategory('expense_software', false)).toBe('exempt')
+    expect(getDefaultVatTreatmentForCategory('expense_representation', false)).toBe('exempt')
+    expect(getDefaultVatTreatmentForCategory('expense_software', true)).toBe('standard_25')
+    expect(getDefaultVatTreatmentForCategory('expense_software', null)).toBe('standard_25')
+    expect(getDefaultVatTreatmentForCategory('expense_software')).toBe('standard_25')
+    expect(getDefaultVatTreatmentForCategory('expense_bank_fees', false)).toBeNull()
+    expect(getDefaultVatTreatmentForCategory('private', false)).toBeNull()
   })
 })

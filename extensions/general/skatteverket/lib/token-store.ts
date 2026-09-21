@@ -1,6 +1,11 @@
 import crypto from 'crypto'
-import type { SupabaseClient } from '@supabase/supabase-js'
+import { type SupabaseClient } from '@supabase/supabase-js'
+import { createServiceRoleClient } from '@/lib/supabase/service-client'
+import { createLogger } from '@/lib/logger'
 import type { SkatteverketTokens } from '../types'
+import { SkatteverketAuthError } from './api-client'
+
+const log = createLogger('skatteverket-token-store')
 
 /**
  * Encrypted token storage for Skatteverket OAuth2 tokens.
@@ -9,7 +14,28 @@ import type { SkatteverketTokens } from '../types'
  * role key) to encrypt tokens at rest in the skatteverket_tokens table.
  *
  * Pattern mirrors lib/auth/oauth-codes.ts but adapted for persistent storage.
+ *
+ * All DB operations route through a service-role client. The original RLS
+ * design (auth.uid() = user_id) is correct, but at least one deployed
+ * environment is missing the INSERT/UPDATE/DELETE policies and the
+ * UNIQUE(user_id) constraint, so user-session writes get rejected. The
+ * service-role client bypasses RLS, and the calling handlers (the OAuth
+ * callback in particular) verify the user identity via cookies before
+ * passing user_id here, so the access-control invariant is upheld at the
+ * application layer.
  */
+
+let _serviceClient: SupabaseClient | null = null
+function getServiceClient(): SupabaseClient {
+  if (_serviceClient) return _serviceClient
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+  if (!url || !key) {
+    throw new Error('skatteverket token-store requires NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY')
+  }
+  _serviceClient = createServiceRoleClient(url, key)
+  return _serviceClient
+}
 
 const ALGORITHM = 'aes-256-gcm'
 
@@ -40,32 +66,42 @@ function decrypt(ciphertext: string): string {
 }
 
 /**
- * Store (upsert) Skatteverket tokens for a user.
+ * Store (replace) Skatteverket tokens for a user + company pair.
  * Both access_token and refresh_token are encrypted at rest.
+ *
+ * Connections are per (user_id, company_id): the OAuth token is the person's
+ * BankID session, but which company it is wired to is an explicit product
+ * choice, and a multi-company operator holds one row per company. The
+ * DELETE + INSERT (instead of UPSERT) predates the UNIQUE constraint and is
+ * safe because OAuth callbacks and refreshes for a given pair are coalesced.
  */
 export async function storeTokens(
-  supabase: SupabaseClient,
+  _supabase: SupabaseClient,
   userId: string,
-  tokens: SkatteverketTokens
+  tokens: SkatteverketTokens,
+  companyId: string,
 ): Promise<void> {
   const encryptedAccess = encrypt(tokens.access_token)
   const encryptedRefresh = tokens.refresh_token ? encrypt(tokens.refresh_token) : null
+  const db = getServiceClient()
 
-  const { error } = await supabase
+  const { error: deleteError } = await db
     .from('skatteverket_tokens')
-    .upsert(
-      {
-        user_id: userId,
-        access_token: encryptedAccess,
-        refresh_token: encryptedRefresh,
-        expires_at: new Date(tokens.expires_at).toISOString(),
-        refresh_count: tokens.refresh_count,
-        scope: tokens.scope,
-      },
-      { onConflict: 'user_id' }
-    )
+    .delete()
+    .eq('user_id', userId)
+    .eq('company_id', companyId)
+  if (deleteError) throw new Error(`Failed to clear existing tokens: ${deleteError.message}`)
 
-  if (error) throw new Error(`Failed to store tokens: ${error.message}`)
+  const { error: insertError } = await db.from('skatteverket_tokens').insert({
+    user_id: userId,
+    company_id: companyId,
+    access_token: encryptedAccess,
+    refresh_token: encryptedRefresh,
+    expires_at: new Date(tokens.expires_at).toISOString(),
+    refresh_count: tokens.refresh_count,
+    scope: tokens.scope,
+  })
+  if (insertError) throw new Error(`Failed to store tokens: ${insertError.message}`)
 }
 
 /**
@@ -73,17 +109,26 @@ export async function storeTokens(
  * Returns null if no tokens are stored.
  */
 export async function getTokens(
-  supabase: SupabaseClient,
-  userId: string
+  _supabase: SupabaseClient,
+  userId: string,
+  companyId: string
 ): Promise<SkatteverketTokens | null> {
-  const { data, error } = await supabase
+  const db = getServiceClient()
+  const { data, error } = await db
     .from('skatteverket_tokens')
     .select('access_token, refresh_token, expires_at, refresh_count, scope')
-    .eq('company_id', userId)
-    .single()
+    .eq('user_id', userId)
+    .eq('company_id', companyId)
+    .maybeSingle()
 
   if (error || !data) return null
 
+  // Distinguish three states:
+  //   1. No row → caller treats as NOT_CONNECTED (return null above)
+  //   2. Decryption error → log + throw TOKEN_CORRUPTED so the caller can
+  //      tell the user to reconnect. Previously returned null silently
+  //      which masked the real problem (key rotation, tampering, or a
+  //      schema-level bug) as "not connected".
   try {
     return {
       access_token: decrypt(data.access_token),
@@ -92,9 +137,16 @@ export async function getTokens(
       refresh_count: data.refresh_count ?? 0,
       scope: data.scope,
     }
-  } catch {
-    // Decryption failed — key may have rotated, tokens are invalid
-    return null
+  } catch (err) {
+    log.error('decryption failed for stored tokens', {
+      userId,
+      companyId,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    throw new SkatteverketAuthError(
+      'Tokens kunde inte läsas. Anslut igen med BankID.',
+      'TOKEN_CORRUPTED'
+    )
   }
 }
 
@@ -102,11 +154,82 @@ export async function getTokens(
  * Delete stored tokens (disconnect from Skatteverket).
  */
 export async function deleteTokens(
-  supabase: SupabaseClient,
-  userId: string
+  _supabase: SupabaseClient,
+  userId: string,
+  companyId: string
 ): Promise<void> {
-  await supabase
+  const db = getServiceClient()
+  await db
     .from('skatteverket_tokens')
     .delete()
-    .eq('company_id', userId)
+    .eq('user_id', userId)
+    .eq('company_id', companyId)
+}
+
+/**
+ * Terminal auth-error codes: the stored token can never recover on its own —
+ * only a fresh BankID consent fixes it. SESSION_EXPIRED qualifies because
+ * SKV's `per`-flow refresh tokens live 65 minutes: once expired there is
+ * nothing left to refresh with.
+ */
+export const RECONSENT_ERROR_CODES = [
+  'SESSION_EXPIRED',
+  'REFRESH_EXHAUSTED',
+  'MISSING_SCOPE',
+  'TOKEN_CORRUPTED',
+] as const
+
+/**
+ * Flag a connection as needing re-consent so crons stop retrying it every
+ * night and the UI can prompt proactively. storeTokens() (delete + insert)
+ * resets the row to status 'active' on the next successful consent.
+ * Best-effort: health bookkeeping must never mask the original auth error.
+ */
+export async function markNeedsReconsent(
+  _supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  errorCode: string,
+): Promise<void> {
+  const db = getServiceClient()
+  const { error } = await db
+    .from('skatteverket_tokens')
+    .update({
+      status: 'needs_reconsent',
+      last_error_code: errorCode,
+      last_error_at: new Date().toISOString(),
+    })
+    .eq('user_id', userId)
+    .eq('company_id', companyId)
+  if (error) {
+    log.warn('failed to mark token row needs_reconsent', {
+      userId,
+      errorCode,
+      error: error.message,
+    })
+  }
+}
+
+/**
+ * Read the persisted connection health for a user's token row.
+ * Returns null when no row exists (not connected).
+ */
+export async function getTokenHealth(
+  _supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+): Promise<{ status: string; last_error_code: string | null; last_error_at: string | null } | null> {
+  const db = getServiceClient()
+  const { data, error } = await db
+    .from('skatteverket_tokens')
+    .select('status, last_error_code, last_error_at')
+    .eq('user_id', userId)
+    .eq('company_id', companyId)
+    .maybeSingle()
+  if (error || !data) return null
+  return {
+    status: (data.status as string | null) ?? 'active',
+    last_error_code: (data.last_error_code as string | null) ?? null,
+    last_error_at: (data.last_error_at as string | null) ?? null,
+  }
 }

@@ -1,20 +1,36 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
+import { useTranslations } from 'next-intl'
 import Link from 'next/link'
-import Image from 'next/image'
 import { createClient } from '@/lib/supabase/client'
 import { Button } from '@/components/ui/button'
 import { useToast } from '@/components/ui/use-toast'
-import { Loader2, Receipt, ArrowLeftRight, BookOpen, BarChart3 } from 'lucide-react'
+import {
+  TurnstileChallenge,
+  type TurnstileChallengeHandle,
+} from '@/components/auth/TurnstileChallenge'
+import { Loader2 } from 'lucide-react'
+import { getBranding } from '@/lib/branding/service'
+import { BrandWordmark } from '@/components/branding/BrandWordmark'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import {
+  captchaTokenOptions,
+  isTurnstileSubmissionBlocked,
+} from '@/lib/auth/turnstile'
+
+const branding = getBranding()
 
 export default function SandboxPage() {
   const [isLoading, setIsLoading] = useState(false)
   const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null)
+  const [captchaToken, setCaptchaToken] = useState<string | null>(null)
+  const turnstileRef = useRef<TurnstileChallengeHandle>(null)
   const { toast } = useToast()
   const router = useRouter()
   const supabase = createClient()
+  const tAuth = useTranslations('auth')
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data: { user } }) => {
@@ -23,17 +39,27 @@ export default function SandboxPage() {
   }, [supabase.auth])
 
   const handleStartSandbox = async () => {
+    if (isTurnstileSubmissionBlocked(captchaToken)) {
+      toast({
+        title: 'Kunde inte starta sandlådan',
+        description: tAuth('turnstile_required'),
+        variant: 'destructive',
+      })
+      return
+    }
+
     setIsLoading(true)
 
     try {
-      const { error } = await supabase.auth.signInAnonymously()
+      const { error } = await supabase.auth.signInAnonymously({
+        options: captchaTokenOptions(captchaToken),
+      })
       if (error) {
         toast({
           title: 'Kunde inte starta sandlådan',
-          description: error.message,
+          description: getUserErrorMessage(error),
           variant: 'destructive',
         })
-        setIsLoading(false)
         return
       }
 
@@ -47,7 +73,6 @@ export default function SandboxPage() {
           description: 'Försök igen om en stund.',
           variant: 'destructive',
         })
-        setIsLoading(false)
         return
       }
 
@@ -59,6 +84,8 @@ export default function SandboxPage() {
         description: 'Försök igen om en stund.',
         variant: 'destructive',
       })
+    } finally {
+      turnstileRef.current?.reset()
       setIsLoading(false)
     }
   }
@@ -66,7 +93,7 @@ export default function SandboxPage() {
   // Loading state while checking auth
   if (isLoggedIn === null) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-b from-background to-primary/[0.03]">
+      <div className="min-h-dvh flex items-center justify-center bg-gradient-to-b from-background to-primary/[0.03]">
         <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
       </div>
     )
@@ -75,21 +102,14 @@ export default function SandboxPage() {
   // Already logged in as a real user
   if (isLoggedIn) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-b from-background to-primary/[0.03] p-4">
+      <div className="min-h-dvh flex flex-col items-center justify-center bg-gradient-to-b from-background to-primary/[0.03] p-4">
         <div className="w-full max-w-sm animate-slide-up">
           <div className="text-center mb-10">
-            <Image
-              src="/gnubokiceon-removebg-preview.png"
-              alt="Gnubok"
-              width={240}
-              height={240}
-              className="mx-auto mb-2"
-              priority
-            />
+            <BrandWordmark size="hero" className="mb-2" />
           </div>
 
           <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
-            <h1 className="text-lg font-medium tracking-tight text-center mb-2">
+            <h1 className="text-lg tracking-tight text-center mb-2">
               Du är redan inloggad
             </h1>
             <p className="text-sm text-muted-foreground text-center leading-relaxed">
@@ -110,48 +130,35 @@ export default function SandboxPage() {
 
   // Sandbox landing
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-b from-background to-primary/[0.03] p-4">
+    <div className="min-h-dvh flex flex-col items-center justify-center bg-gradient-to-b from-background to-primary/[0.03] p-4">
       <div className="w-full max-w-sm animate-slide-up">
         <div className="text-center mb-10">
-          <Image
-            src="/gnubokiceon-removebg-preview.png"
-            alt="Gnubok"
-            width={240}
-            height={240}
-            className="mx-auto mb-2"
-            priority
-          />
-          <h1 className="text-xl font-medium tracking-tight mt-3">
-            Testa gnubok utan att registrera dig
+          <BrandWordmark size="hero" className="mb-2" />
+          <h1 className="text-xl tracking-tight mt-3">
+            Testa {branding.appName.toLowerCase()} utan att registrera dig
           </h1>
           <p className="text-muted-foreground text-sm mt-2 leading-relaxed">
-            Utforska ett fullt demoföretag med riktig data — helt gratis.
+            Utforska ett fullt demoföretag med riktig data: helt gratis.
           </p>
         </div>
 
         <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
-          {/* Feature highlights */}
-          <div className="grid grid-cols-2 gap-3 mb-6">
-            {[
-              { icon: Receipt, label: 'Fakturor' },
-              { icon: ArrowLeftRight, label: 'Transaktioner' },
-              { icon: BookOpen, label: 'Bokföring' },
-              { icon: BarChart3, label: 'Rapporter' },
-            ].map(({ icon: Icon, label }) => (
-              <div
-                key={label}
-                className="flex items-center gap-2.5 rounded-lg bg-muted/40 px-3 py-2.5"
-              >
-                <Icon className="h-4 w-4 text-primary/70 flex-shrink-0" />
-                <span className="text-sm text-foreground/80">{label}</span>
-              </div>
-            ))}
-          </div>
+          <p className="mb-6 rounded-lg border border-border bg-secondary/40 px-3 py-2.5 text-xs leading-relaxed text-muted-foreground">
+            AI-assistenten och externa tjänster (e-post, bankuppkoppling,
+            valutakurser, Skatteverket) är avstängda i sandlådan: de
+            kräver ett riktigt konto.
+          </p>
+
+          <TurnstileChallenge
+            ref={turnstileRef}
+            action="accounted_sandbox"
+            onTokenChange={setCaptchaToken}
+          />
 
           <Button
             className="w-full h-11"
             onClick={handleStartSandbox}
-            disabled={isLoading}
+            disabled={isLoading || isTurnstileSubmissionBlocked(captchaToken)}
           >
             {isLoading ? (
               <>

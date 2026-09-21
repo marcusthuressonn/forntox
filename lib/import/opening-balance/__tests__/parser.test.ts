@@ -123,7 +123,7 @@ describe('parseOpeningBalanceFile', () => {
     const data = [
       ['Kontonr', 'Debet', 'Kredit'],
       ['1930', 50000, 0],
-      ['3001', 0, 50000], // Revenue account — should warn
+      ['3001', 0, 50000], // Revenue account: should warn
     ]
     const ws = XLSX.utils.aoa_to_sheet(data)
     XLSX.utils.book_append_sheet(wb, ws, 'Sheet1')
@@ -159,6 +159,64 @@ describe('parseOpeningBalanceFile', () => {
     expect(row1930!.debit_amount).toBe(50000)
     expect(result.rows.length).toBe(2) // 1930 (merged) + 2099
     expect(result.warnings.some((w) => w.includes('1930'))).toBe(true)
+    expect(result.notices).toContainEqual({
+      code: 'ob_duplicate_account',
+      severity: 'notice',
+      params: { account: '1930' },
+    })
+  })
+
+  it('preserves validation_errors from every duplicated row when merging', async () => {
+    const XLSX = await import('xlsx')
+    const { parseOpeningBalanceFile } = await import('../parser')
+
+    const wb = XLSX.utils.book_new()
+    // Two rows for account 3001 (a P&L class warning fires on each) plus a
+    // balance-sheet row to keep totals reachable. Both copies of 3001 should
+    // contribute their warning into the merged row's validation_errors so it
+    // isn't silently lost.
+    const data = [
+      ['Kontonr', 'Debet', 'Kredit'],
+      ['3001', 100, 0],
+      ['3001', 200, 0],
+      ['2099', 0, 300],
+    ]
+    const ws = XLSX.utils.aoa_to_sheet(data)
+    XLSX.utils.book_append_sheet(wb, ws, 'Sheet1')
+
+    const buffer = XLSX.write(wb, { type: 'array', bookType: 'xlsx' })
+    const result = parseOpeningBalanceFile(buffer, 'test.xlsx')
+
+    const merged = result.rows.find((r) => r.account_number === '3001')
+    expect(merged).toBeDefined()
+    expect(merged!.debit_amount).toBe(300)
+    expect(merged!.validation_errors.length).toBeGreaterThan(0)
+    expect(merged!.validation_errors.some((e) => e.includes('resultatkonto'))).toBe(true)
+  })
+
+  it('merges duplicates that differ only in whitespace / formatting', async () => {
+    const XLSX = await import('xlsx')
+    const { parseOpeningBalanceFile } = await import('../parser')
+
+    const wb = XLSX.utils.book_new()
+    // Same account written three ways: plain, padded with NBSP, with a dot
+    const data = [
+      ['Kontonr', 'Debet', 'Kredit'],
+      ['1930', 10000, 0],
+      [' 1930 ', 20000, 0],
+      ['1.930', 30000, 0],
+      ['2099', 0, 60000],
+    ]
+    const ws = XLSX.utils.aoa_to_sheet(data)
+    XLSX.utils.book_append_sheet(wb, ws, 'Sheet1')
+
+    const buffer = XLSX.write(wb, { type: 'array', bookType: 'xlsx' })
+    const result = parseOpeningBalanceFile(buffer, 'test.xlsx')
+
+    const matches = result.rows.filter((r) => r.account_number === '1930')
+    expect(matches.length).toBe(1)
+    expect(matches[0].debit_amount).toBe(60000)
+    expect(result.rows.length).toBe(2)
   })
 
   it('skips zero-amount rows', async () => {
@@ -200,5 +258,70 @@ describe('parseOpeningBalanceFile', () => {
     expect(result.is_balanced).toBe(false)
     expect(result.total_debit).toBe(50000)
     expect(result.total_credit).toBe(40000)
+  })
+})
+
+describe('bank statement detection (issue #918)', () => {
+  const toBuffer = (csv: string): ArrayBuffer =>
+    new TextEncoder().encode(csv).buffer as ArrayBuffer
+
+  it('flags a Swedbank bank statement CSV that yields no account rows', async () => {
+    const { parseOpeningBalanceFile } = await import('../parser')
+
+    const csv = [
+      'Radnr,Clnr,Kontonr,Produkt,Valuta,Bokfdag,Transdag,Valutadag,Referens,Text,Belopp,Saldo',
+      '1,8385-9,9350000000,Företagskonto,SEK,2026-05-02,2026-05-02,2026-05-02,Hyra maj,Bg-bet. via internet,-12000.00,54321.00',
+      '2,8385-9,9350000000,Företagskonto,SEK,2026-05-03,2026-05-03,2026-05-03,Kundbetalning,Insättning,25000.00,79321.00',
+    ].join('\n')
+
+    const result = parseOpeningBalanceFile(toBuffer(csv), 'kontoutdrag.csv')
+
+    expect(result.rows.length).toBe(0)
+    expect(result.detected_bank_format).toBe('Swedbank')
+  })
+
+  it('flags an SEB bank statement CSV that yields no account rows', async () => {
+    const { parseOpeningBalanceFile } = await import('../parser')
+
+    const csv = [
+      'Bokföringsdatum;Valutadatum;Verifikationsnummer;Text;Belopp;Saldo',
+      '2026-05-02;2026-05-02;5501234567;Hyra maj;-12000,00;54321,00',
+      '2026-05-03;2026-05-03;5501234568;Kundbetalning;25000,00;79321,00',
+    ].join('\n')
+
+    const result = parseOpeningBalanceFile(toBuffer(csv), 'export.csv')
+
+    expect(result.rows.length).toBe(0)
+    expect(result.detected_bank_format).toBe('SEB')
+  })
+
+  it('does not flag a CSV that yields no rows but matches no bank format', async () => {
+    const { parseOpeningBalanceFile } = await import('../parser')
+
+    const csv = [
+      'Namn,Stad,Antal',
+      'Alfa,Göteborg,3',
+      'Beta,Malmö,7',
+    ].join('\n')
+
+    const result = parseOpeningBalanceFile(toBuffer(csv), 'annat.csv')
+
+    expect(result.rows.length).toBe(0)
+    expect(result.detected_bank_format).toBeNull()
+  })
+
+  it('does not flag a valid opening balance file', async () => {
+    const { parseOpeningBalanceFile } = await import('../parser')
+
+    const csv = [
+      'Kontonr,Kontonamn,Debet,Kredit',
+      '1930,Företagskonto,50000,0',
+      '2099,Årets resultat,0,50000',
+    ].join('\n')
+
+    const result = parseOpeningBalanceFile(toBuffer(csv), 'ib.csv')
+
+    expect(result.rows.length).toBe(2)
+    expect(result.detected_bank_format).toBeNull()
   })
 })

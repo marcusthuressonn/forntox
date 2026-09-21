@@ -3,17 +3,32 @@
  *
  * Core defines the contract. The email extension registers a real
  * implementation (Resend). Without the extension, a no-op service
- * is used — email-dependent features degrade gracefully.
+ * is used: email-dependent features degrade gracefully.
  */
 
 export interface SendEmailOptions {
   to: string | string[]
   cc?: string | string[]
+  bcc?: string | string[]
   subject: string
   html: string
   text?: string
   replyTo?: string
   fromName?: string
+  /**
+   * Explicit From address. Only ever set by lib/email/brand-sender.ts for
+   * brands whose Resend sender domain is VERIFIED. When absent, the provider
+   * sends from its default address (RESEND_FROM_EMAIL) with fromName as the
+   * display name.
+   */
+  fromAddress?: string
+  /**
+   * Explicit From identity (company's own verified sending domain). When
+   * set, the provider sends as "<name> <address>" instead of the platform
+   * sender; `fromName` is ignored. Callers obtain it from
+   * resolveInvoiceSender(): never build one from raw user input.
+   */
+  from?: { name: string; address: string }
   attachments?: Array<{
     filename: string
     content: Buffer | string
@@ -23,6 +38,7 @@ export interface SendEmailOptions {
 
 export interface SendEmailResult {
   success: boolean
+  provider?: string
   messageId?: string
   error?: string
 }

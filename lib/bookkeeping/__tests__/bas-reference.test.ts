@@ -35,13 +35,21 @@ describe('BAS_REFERENCE data integrity', () => {
   })
 
   it('every account has a non-null sru_code', () => {
-    const withoutSru = BAS_REFERENCE.filter((a) => a.sru_code === null)
+    const withoutSru = BAS_REFERENCE.filter((a) => a.sru_code === null).map((a) => a.account_number)
     expect(withoutSru).toEqual([])
   })
 
   it('every account has a non-empty description', () => {
     const withoutDesc = BAS_REFERENCE.filter((a) => !a.description || a.description.trim() === '')
     expect(withoutDesc).toEqual([])
+  })
+
+  it('no account name or description has a concatenated group header', () => {
+    const headerSuffix = /\s\d{2,}\s+[A-ZÅÄÖ]{2,}/
+    const corrupted = BAS_REFERENCE.filter(
+      (a) => headerSuffix.test(a.account_name) || headerSuffix.test(a.description ?? ''),
+    )
+    expect(corrupted).toEqual([])
   })
 
   it('every account has a valid account_type', () => {
@@ -70,6 +78,38 @@ describe('Non-standard accounts removed', () => {
   for (const num of nonStandard) {
     it(`${num} is not in the catalog`, () => {
       expect(isStandardBASAccount(num)).toBe(false)
+    })
+  }
+})
+
+// BAS 2026 restructured kontogrupp 12: bilar/datorer moved under 1210 (för
+// produktion) and 1220 (ej för produktion), and 1230/1240/1250/1260 became
+// free heads. The pre-2026 sub-accounts under those heads are gone from the
+// official chart (bas.se BAS 2026 v2), so the catalog must not hand them out
+// with their old names next to a head that says "fritt konto" (#2413).
+describe('BAS 2026 kontogrupp 12: free heads and their contra accounts agree', () => {
+  const retired = ['1241', '1242', '1251', '1261']
+  for (const num of retired) {
+    it(`${num} (retired in BAS 2026) is not in the catalog`, () => {
+      expect(isStandardBASAccount(num)).toBe(false)
+    })
+  }
+
+  const pairs: Array<[head: string, contra: string]> = [
+    ['1240', '1249'],
+    ['1250', '1259'],
+    ['1260', '1269'],
+  ]
+  for (const [head, contra] of pairs) {
+    it(`${contra} is named after the free head ${head}, not a retired bilar/datorer account`, () => {
+      const headName = getBASReference(head)?.account_name ?? ''
+      const contraName = getBASReference(contra)?.account_name ?? ''
+      expect(headName.startsWith('(Fritt konto för ')).toBe(true)
+      // "(Fritt konto för X)" on the head; "... (fritt konto för X)" on the contra.
+      const subject = headName.slice('(Fritt konto för '.length, -1)
+      expect(contraName).toContain(`(fritt konto för ${subject})`)
+      expect(contraName).toMatch(/^Ackumulerade avskrivningar/)
+      expect(contraName.toLowerCase()).not.toMatch(/bilar|datorer|inventarier och verktyg$/)
     })
   }
 })
@@ -157,11 +197,13 @@ describe('Contra accounts have opposite normal_balance', () => {
 describe('K2-excluded accounts', () => {
   const k2Excluded = [
     '1010', '1011', '1012', '1018', '1019',
+    '1081',
     '1370', '1518',
-    '2092', '2096', '2240', '2448',
+    '2089', '2092', '2096', '2240', '2448',
     '3940', '7940',
     '8290', '8291', '8295',
     '8320', '8321', '8325',
+    '8417',
     '8450', '8451', '8455',
     '8480', '8940',
   ]
@@ -183,9 +225,9 @@ describe('K2-excluded accounts', () => {
     }
   })
 
-  it('total K2-excluded count matches expected (24)', () => {
+  it('total K2-excluded count matches expected (27)', () => {
     const k2Count = BAS_REFERENCE.filter((a) => a.k2_excluded).length
-    expect(k2Count).toBe(24)
+    expect(k2Count).toBe(27)
   })
 })
 

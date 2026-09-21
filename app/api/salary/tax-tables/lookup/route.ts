@@ -1,12 +1,9 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { lookupTaxFromApi, TaxTableUnavailableError } from '@/lib/salary/tax-tables'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
+export const GET = withRouteContext('salary.tax_tables.lookup', async (request) => {
   const { searchParams } = new URL(request.url)
   const year = parseInt(searchParams.get('year') || new Date().getFullYear().toString())
   const tableNumber = parseInt(searchParams.get('table') || '0')
@@ -31,8 +28,8 @@ export async function GET(request: Request) {
     })
   } catch (err) {
     if (err instanceof TaxTableUnavailableError) {
-      return NextResponse.json({ error: err.message }, { status: 503 })
+      return NextResponse.json({ error: getUserErrorMessage(err) }, { status: 503 })
     }
     throw err
   }
-}
+})

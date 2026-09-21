@@ -1,21 +1,21 @@
 'use client'
 
+import { useTranslations } from 'next-intl'
 import { Badge } from '@/components/ui/badge'
-import { cn } from '@/lib/utils'
 import type { ExtensionCategory } from '@/lib/extensions/types'
 
-const CATEGORY_CONFIG: Record<ExtensionCategory, { label: string; className: string }> = {
-  accounting: { label: 'Bokföring & Skatt', className: 'bg-destructive/10 text-destructive border-destructive/30' },
-  reports: { label: 'Branschrapporter', className: 'bg-primary/10 text-primary border-primary/30' },
-  import: { label: 'Smart Import', className: 'bg-success/10 text-success border-success/30' },
-  operations: { label: 'Verktyg', className: 'bg-muted text-muted-foreground border-border' },
+const CATEGORY_LABEL_KEY: Record<ExtensionCategory, string> = {
+  accounting: 'category_accounting',
+  reports: 'category_reports',
+  import: 'category_import',
+  operations: 'category_operations',
 }
 
 export default function CategoryBadge({ category }: { category: ExtensionCategory }) {
-  const config = CATEGORY_CONFIG[category]
+  const t = useTranslations('extensions')
   return (
-    <Badge variant="outline" className={cn('text-[10px] font-medium', config.className)}>
-      {config.label}
+    <Badge variant="outline" className="text-[10px] font-medium">
+      {t(CATEGORY_LABEL_KEY[category])}
     </Badge>
   )
 }

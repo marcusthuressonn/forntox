@@ -14,7 +14,6 @@
 
 import { SupabaseClient } from '@supabase/supabase-js'
 import { createLogger } from '@/lib/logger'
-import type { DeadlineStatus } from '@/types'
 
 const log = createLogger('deadline-status')
 
@@ -22,28 +21,6 @@ const log = createLogger('deadline-status')
  * Number of days before deadline when status changes to action_needed
  */
 export const ACTION_NEEDED_THRESHOLD_DAYS = 14
-
-/**
- * Valid manual status transitions
- */
-export const MANUAL_TRANSITIONS: Record<DeadlineStatus, DeadlineStatus[]> = {
-  upcoming: ['action_needed', 'in_progress'],
-  action_needed: ['in_progress', 'submitted'],
-  in_progress: ['submitted', 'action_needed'],
-  submitted: ['confirmed', 'in_progress'],
-  confirmed: [], // Terminal state
-  overdue: ['in_progress', 'submitted'], // Can recover from overdue
-}
-
-/**
- * Check if a manual status transition is valid
- */
-export function isValidTransition(
-  currentStatus: DeadlineStatus,
-  newStatus: DeadlineStatus
-): boolean {
-  return MANUAL_TRANSITIONS[currentStatus].includes(newStatus)
-}
 
 /**
  * Calculate days until a deadline
@@ -54,37 +31,6 @@ export function daysUntilDeadline(dueDate: string): number {
   const deadline = new Date(dueDate)
   deadline.setHours(0, 0, 0, 0)
   return Math.ceil((deadline.getTime() - today.getTime()) / (1000 * 60 * 60 * 24))
-}
-
-/**
- * Determine the automatic status based on deadline date
- */
-export function getAutomaticStatus(
-  dueDate: string,
-  currentStatus: DeadlineStatus
-): DeadlineStatus | null {
-  const daysUntil = daysUntilDeadline(dueDate)
-
-  // Already in terminal or user-controlled state
-  if (['submitted', 'confirmed', 'in_progress'].includes(currentStatus)) {
-    // Check for overdue on submitted (shouldn't happen often)
-    if (currentStatus === 'submitted' && daysUntil < 0) {
-      return null // Keep as submitted, don't change to overdue
-    }
-    return null
-  }
-
-  // Past deadline without submission
-  if (daysUntil < 0 && currentStatus !== 'overdue') {
-    return 'overdue'
-  }
-
-  // Within action needed threshold
-  if (daysUntil <= ACTION_NEEDED_THRESHOLD_DAYS && currentStatus === 'upcoming') {
-    return 'action_needed'
-  }
-
-  return null
 }
 
 /**
@@ -115,6 +61,7 @@ export async function updateDeadlineStatuses(
     })
     .lt('due_date', todayStr)
     .eq('is_completed', false)
+    .is('dismissed_at', null)
     .in('status', ['upcoming', 'action_needed'])
     .select('id')
 
@@ -136,6 +83,7 @@ export async function updateDeadlineStatuses(
     .lte('due_date', thresholdStr)
     .eq('status', 'upcoming')
     .eq('is_completed', false)
+    .is('dismissed_at', null)
     .select('id')
 
   if (actionNeededError) {
@@ -146,60 +94,6 @@ export async function updateDeadlineStatuses(
   }
 
   return { updated, newlyOverdue, newlyActionNeeded }
-}
-
-/**
- * Manually update a deadline's status
- */
-export async function updateDeadlineStatus(
-  supabase: SupabaseClient,
-  deadlineId: string,
-  companyId: string,
-  newStatus: DeadlineStatus
-): Promise<{ success: boolean; error?: string }> {
-  // Fetch current deadline
-  const { data: deadline, error: fetchError } = await supabase
-    .from('deadlines')
-    .select('status, is_completed')
-    .eq('id', deadlineId)
-    .eq('company_id', companyId)
-    .single()
-
-  if (fetchError || !deadline) {
-    return { success: false, error: 'Deadline not found' }
-  }
-
-  // Check if transition is valid
-  if (!isValidTransition(deadline.status, newStatus)) {
-    return {
-      success: false,
-      error: `Invalid transition from ${deadline.status} to ${newStatus}`,
-    }
-  }
-
-  // Update the status
-  const updates: Record<string, unknown> = {
-    status: newStatus,
-    status_changed_at: new Date().toISOString(),
-  }
-
-  // If marking as confirmed, also mark as completed
-  if (newStatus === 'confirmed') {
-    updates.is_completed = true
-    updates.completed_at = new Date().toISOString()
-  }
-
-  const { error: updateError } = await supabase
-    .from('deadlines')
-    .update(updates)
-    .eq('id', deadlineId)
-    .eq('company_id', companyId)
-
-  if (updateError) {
-    return { success: false, error: updateError.message }
-  }
-
-  return { success: true }
 }
 
 /**
@@ -217,6 +111,7 @@ export async function getDeadlinesNeedingAttention(
     .select('id, title, due_date, tax_deadline_type, status')
     .eq('company_id', companyId)
     .eq('is_completed', false)
+    .is('dismissed_at', null)
     .in('status', ['action_needed', 'overdue'])
     .order('due_date', { ascending: true })
 

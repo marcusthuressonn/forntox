@@ -16,6 +16,18 @@ const SETTINGS_PANELS: Record<string, ComponentType> = {
   'cloud-backup': dynamic(
     () => import('@/extensions/general/cloud-backup/components/CloudBackupCard')
   ),
+  stripe: dynamic(
+    () => import('@/extensions/general/stripe/components/StripeSettingsPanel')
+  ),
+  woocommerce: dynamic(
+    () => import('@/extensions/general/woocommerce/components/WooCommerceSettingsPanel')
+  ),
+  shopify: dynamic(
+    () => import('@/extensions/general/shopify/components/ShopifySettingsPanel')
+  ),
+  zettle: dynamic(
+    () => import('@/extensions/general/zettle/components/ZettleSettingsPanel')
+  ),
 }
 
 /**

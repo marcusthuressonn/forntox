@@ -1,266 +1,49 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
-import { calculateSalary } from '@/lib/salary/calculation-engine'
-import { loadPayrollConfig, serializePayrollConfig } from '@/lib/salary/payroll-config'
-import { fetchAllTaxTableRatesForRun, TaxTableUnavailableError } from '@/lib/salary/tax-tables'
-import type { SalaryLineItemType } from '@/types'
+import { runSalaryCalculation } from '@/lib/salary/run-calculation'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 
 ensureInitialized()
 
-export async function POST(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id } = await params
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+/**
+ * POST /api/salary/runs/{id}/calculate
+ *
+ * Thin wrapper over `runSalaryCalculation()` from `lib/salary/run-calculation.ts`.
+ * The orchestration was extracted in Phase 5 PR-2 so the v1 public route
+ * (`POST /api/v1/companies/{companyId}/salary-runs/{id}/calculate`) can call
+ * the same code. This route's responsibility is now: auth → invoke helper →
+ * convert the discriminated result into the dashboard's expected envelope
+ * (`{ data, warnings? }` on success; structured-error envelope on failure).
+ *
+ * Status transitions stay where they were: this route does NOT advance
+ * `salary_runs.status`. The dashboard's UX is calculate → review (explicit
+ * `/review` verb) → approve. The v1 collapses calculate+review into a
+ * single verb but applies the status flip at the route layer, not here.
+ */
+export const POST = withRouteContext(
+  'salary_run.calculate',
+  async (_request, ctx, { params }: { params: Promise<{ id: string }> }) => {
+    const { id } = await params
+    const { supabase, companyId, log, requestId } = ctx
 
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  // Verify run is draft
-  const { data: run, error: runError } = await supabase
-    .from('salary_runs')
-    .select('*')
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .single()
-
-  if (runError || !run) {
-    return NextResponse.json({ error: 'Lönekörning hittades inte' }, { status: 404 })
-  }
-  if (run.status !== 'draft') {
-    return NextResponse.json({ error: 'Kan bara beräkna utkast' }, { status: 400 })
-  }
-
-  const paymentYear = parseInt(run.payment_date.split('-')[0])
-
-  // Load config
-  const config = await loadPayrollConfig(supabase, paymentYear)
-
-  // Load all employees in this run
-  const { data: runEmployees, error: empError } = await supabase
-    .from('salary_run_employees')
-    .select('*, employee:employees(*), line_items:salary_line_items(*)')
-    .eq('salary_run_id', id)
-
-  if (empError || !runEmployees || runEmployees.length === 0) {
-    return NextResponse.json({ error: 'Inga anställda i lönekörningen' }, { status: 400 })
-  }
-
-  // Pre-calculation validation — ensure employees have required data
-  const validationErrors: string[] = []
-  for (const sre of runEmployees) {
-    const emp = sre.employee
-    if (!emp) continue
-    const name = `${emp.first_name} ${emp.last_name}`
-
-    if (emp.salary_type === 'monthly' && (!emp.monthly_salary || emp.monthly_salary <= 0)) {
-      validationErrors.push(`${name}: Månadslön saknas eller är 0`)
-    }
-    if (emp.salary_type === 'hourly' && (!emp.hourly_rate || emp.hourly_rate <= 0)) {
-      validationErrors.push(`${name}: Timlön saknas eller är 0`)
-    }
-    if (emp.f_skatt_status === 'a_skatt' && !emp.is_sidoinkomst && !emp.tax_table_number) {
-      validationErrors.push(`${name}: Skattetabell saknas (krävs för A-skatt)`)
-    }
-  }
-  if (validationErrors.length > 0) {
-    return NextResponse.json({
-      error: 'Valideringsfel — korrigera anställda innan beräkning',
-      details: validationErrors,
-    }, { status: 400 })
-  }
-
-  // Fetch tax table rates from Skatteverket API for all needed tables/columns
-  const tableNumbers = [...new Set(runEmployees.filter(e => e.employee?.tax_table_number).map(e => e.employee.tax_table_number as number))]
-  const columns = [...new Set(runEmployees.filter(e => e.employee?.tax_column).map(e => e.employee.tax_column as number))]
-  let taxRates: Awaited<ReturnType<typeof fetchAllTaxTableRatesForRun>>['rates'] = []
-  let taxTableSource: Awaited<ReturnType<typeof fetchAllTaxTableRatesForRun>>['source'] = 'api'
-  if (tableNumbers.length > 0) {
-    try {
-      const result = await fetchAllTaxTableRatesForRun(
-        paymentYear,
-        tableNumbers,
-        columns.length > 0 ? columns : [1]
-      )
-      taxRates = result.rates
-      taxTableSource = result.source
-    } catch (err) {
-      if (err instanceof TaxTableUnavailableError) {
-        return NextResponse.json({ error: err.message }, { status: 503 })
-      }
-      throw err
-    }
-  }
-
-  let totalGross = 0
-  let totalTax = 0
-  let totalNet = 0
-  let totalAvgifter = 0
-  let totalVacationAccrual = 0
-  let totalEmployerCost = 0
-
-  // Load YTD data from prior booked salary runs this year (filters pushed to DB)
-  const { data: priorRuns } = await supabase
-    .from('salary_run_employees')
-    .select('employee_id, gross_salary, tax_withheld, net_salary, salary_run:salary_runs!inner(period_year, period_month, status)')
-    .eq('company_id', companyId)
-    .eq('salary_run.period_year', run.period_year)
-    .eq('salary_run.status', 'booked')
-    .lt('salary_run.period_month', run.period_month)
-
-  const ytdByEmployee = new Map<string, { gross: number; tax: number; net: number }>()
-  for (const prior of (priorRuns || [])) {
-    const current = ytdByEmployee.get(prior.employee_id) || { gross: 0, tax: 0, net: 0 }
-    current.gross += prior.gross_salary
-    current.tax += prior.tax_withheld
-    current.net += prior.net_salary
-    ytdByEmployee.set(prior.employee_id, current)
-  }
-
-  for (const sre of runEmployees) {
-    const emp = sre.employee
-    if (!emp) continue
-
-    const lineItems = (sre.line_items || []).map((li: Record<string, unknown>) => ({
-      itemType: li.item_type as SalaryLineItemType,
-      amount: li.amount as number,
-      isTaxable: li.is_taxable as boolean,
-      isAvgiftBasis: li.is_avgift_basis as boolean,
-      isVacationBasis: li.is_vacation_basis as boolean,
-      isGrossDeduction: li.is_gross_deduction as boolean,
-      isNetDeduction: li.is_net_deduction as boolean,
-    }))
-
-    const result = calculateSalary(
-      {
-        employmentType: emp.employment_type,
-        salaryType: emp.salary_type,
-        monthlySalary: emp.monthly_salary || 0,
-        hourlyRate: emp.hourly_rate || undefined,
-        hoursWorked: sre.hours_worked || undefined,
-        employmentDegree: emp.employment_degree,
-        taxTableNumber: emp.tax_table_number,
-        taxColumn: emp.tax_column || 1,
-        isSidoinkomst: emp.is_sidoinkomst,
-        jamkningPercentage: emp.jamkning_percentage,
-        jamkningValidFrom: emp.jamkning_valid_from,
-        jamkningValidTo: emp.jamkning_valid_to,
-        fSkattStatus: emp.f_skatt_status,
-        personnummer: emp.personnummer,
-        paymentDate: run.payment_date,
-        vacationRule: emp.vacation_rule,
-        vacationDaysPerYear: emp.vacation_days_per_year,
-        semestertillaggRate: emp.semestertillagg_rate,
-        vaxaStodEligible: emp.vaxa_stod_eligible,
-        vaxaStodStart: emp.vaxa_stod_start,
-        vaxaStodEnd: emp.vaxa_stod_end,
-        lineItems,
-      },
-      config,
-      taxRates.map(r => ({
-        tableYear: r.tableYear,
-        tableNumber: r.tableNumber,
-        columnNumber: r.columnNumber,
-        incomeFrom: r.incomeFrom,
-        incomeTo: r.incomeTo,
-        taxAmount: r.taxAmount,
-      }))
-    )
-
-    // Count absence days from line items
-    const rawLines = (sre.line_items || []) as Array<Record<string, unknown>>
-    function sumQuantity(types: string[]): number {
-      return rawLines
-        .filter(li => types.includes(li.item_type as string))
-        .reduce((sum: number, li) => sum + ((li.quantity as number) || 0), 0)
-    }
-    const sickDays = sumQuantity(['sick_karens', 'sick_day2_14'])
-    const vabDays = sumQuantity(['vab'])
-    const parentalDays = sumQuantity(['parental_leave'])
-    const vacationDays = sumQuantity(['vacation'])
-
-    // Update salary_run_employee with calculated results. If any individual
-    // update fails we abort so run totals aren't written from partial data.
-    const { error: empUpdateError } = await supabase
-      .from('salary_run_employees')
-      .update({
-        gross_salary: result.grossSalary,
-        gross_deductions: result.grossDeductions,
-        benefit_values: result.benefitValues,
-        taxable_income: result.taxableIncome,
-        tax_withheld: result.taxWithheld,
-        net_deductions: result.netDeductions,
-        net_salary: result.netSalary,
-        avgifter_rate: result.avgifterRate,
-        avgifter_amount: result.avgifterAmount,
-        avgifter_basis: result.avgifterBasis,
-        avgifter_category: result.avgifterCategory,
-        vacation_accrual: result.vacationAccrual,
-        vacation_accrual_avgifter: result.vacationAccrualAvgifter,
-        tax_table_number: emp.tax_table_number,
-        tax_column: emp.tax_column,
-        tax_table_year: paymentYear,
-        sick_days: sickDays,
-        vab_days: vabDays,
-        parental_days: parentalDays,
-        vacation_days_taken: vacationDays,
-        calculation_breakdown: { steps: result.steps },
-        ytd_gross: Math.round(((ytdByEmployee.get(sre.employee_id)?.gross || 0) + result.grossSalary) * 100) / 100,
-        ytd_tax: Math.round(((ytdByEmployee.get(sre.employee_id)?.tax || 0) + result.taxWithheld) * 100) / 100,
-        ytd_net: Math.round(((ytdByEmployee.get(sre.employee_id)?.net || 0) + result.netSalary) * 100) / 100,
-      })
-      .eq('id', sre.id)
-
-    if (empUpdateError) {
-      return NextResponse.json({ error: empUpdateError.message }, { status: 500 })
-    }
-
-    totalGross += result.grossSalary
-    totalTax += result.taxWithheld
-    totalNet += result.netSalary
-    totalAvgifter += result.avgifterAmount
-    totalVacationAccrual += result.vacationAccrual
-    totalEmployerCost += result.totalEmployerCost
-  }
-
-  // Update run totals
-  const { data: updatedRun, error: updateError } = await supabase
-    .from('salary_runs')
-    .update({
-      total_gross: Math.round(totalGross * 100) / 100,
-      total_tax: Math.round(totalTax * 100) / 100,
-      total_net: Math.round(totalNet * 100) / 100,
-      total_avgifter: Math.round(totalAvgifter * 100) / 100,
-      total_vacation_accrual: Math.round(totalVacationAccrual * 100) / 100,
-      total_employer_cost: Math.round(totalEmployerCost * 100) / 100,
-      calculation_params: serializePayrollConfig(config),
+    const result = await runSalaryCalculation({
+      supabase,
+      companyId: companyId!,
+      salaryRunId: id,
+      log,
+      requestId,
     })
-    .eq('id', id)
-    .select()
-    .single()
 
-  if (updateError) {
-    return NextResponse.json({ error: updateError.message }, { status: 500 })
-  }
+    if (!result.ok) {
+      return errorResponseFromCode(result.code, log, {
+        requestId,
+        details: result.details,
+        status: result.status,
+      })
+    }
 
-  const warnings: string[] = []
-  if (taxTableSource === 'fallback') {
-    warnings.push(
-      `Skatteverkets skattetabell-API är inte nåbart — beräkningen använder lokal reservdata för ${paymentYear}. Kontrollera att Skatteverket inte publicerat ändringar innan lönekörningen bokförs.`
-    )
-  } else if (taxTableSource === 'mixed') {
-    warnings.push(
-      `Skatteverkets skattetabell-API svarade bara delvis — vissa skattetabeller kommer från lokal reservdata för ${paymentYear}. Kontrollera att Skatteverket inte publicerat ändringar innan lönekörningen bokförs.`
-    )
-  }
-
-  return NextResponse.json({ data: updatedRun, warnings })
-}
+    return NextResponse.json({ data: result.run, warnings: result.warnings })
+  },
+  { requireWrite: true },
+)

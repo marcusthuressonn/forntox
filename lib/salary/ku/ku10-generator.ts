@@ -1,7 +1,10 @@
+import { escapeXml } from '@/lib/xml/escape'
 import { decryptPersonnummer } from '../personnummer'
+import { getBranding } from '@/lib/branding/service'
+import { stripOrgNumberFormatting } from '@/lib/invariants/org-number'
 
 /**
- * KU10 (Kontrolluppgift) — Annual employee income statement.
+ * KU10 (Kontrolluppgift): Annual employee income statement.
  *
  * Per Skatteförfarandelagen 15 kap: Every employer must file KU10 for each
  * employee by January 31 of the following year. Reports total income, tax
@@ -15,7 +18,7 @@ import { decryptPersonnummer } from '../personnummer'
  */
 
 export interface KU10EmployeeData {
-  personnummer: string        // Encrypted — will be decrypted
+  personnummer: string        // Encrypted, will be decrypted
   specificationNumber: number // FK570
   totalGross: number          // Ruta 011: Total kontant bruttolön for year
   totalTax: number            // Ruta 001: Total avdragen skatt for year
@@ -38,6 +41,29 @@ export interface KU10CompanyData {
   contactEmail: string
 }
 
+const KU_ORG_NUMBER_PATTERN = /^16\d{2}[2-9]\d{7}$/
+
+/**
+ * Normalize the employer identity to the 12-digit format required by the KU
+ * schema. Skatteverket's KU 12.0 XSD defines OrganisationsnummerTYPE with the
+ * `16` prefix and does not validate the check digit.
+ *
+ * Source: https://www.skatteverket.se/foretag/skatterochavdrag/kontrolluppgifter/testtjanstochtekniskbeskrivning.4.233f91f71260075abe8800073614.html
+ */
+function normalizeKUOrgNumber(raw: string): string {
+  const cleaned = stripOrgNumberFormatting(raw)
+  const normalized = /^\d{10}$/.test(cleaned) ? `16${cleaned}` : cleaned
+
+  if (!KU_ORG_NUMBER_PATTERN.test(normalized)) {
+    throw new Error(
+      'KU10 kan inte genereras: organisationsnumret måste innehålla 10 siffror ' +
+        'eller 12 siffror med prefixet 16.'
+    )
+  }
+
+  return normalized
+}
+
 /**
  * Generate KU10 XML for all employees for a calendar year.
  *
@@ -48,7 +74,7 @@ export function generateKU10Xml(
   employees: KU10EmployeeData[]
 ): string {
   const lines: string[] = []
-  const orgNr = company.orgNumber.replace('-', '')
+  const orgNr = normalizeKUOrgNumber(company.orgNumber)
 
   lines.push('<?xml version="1.0" encoding="UTF-8"?>')
   lines.push('<Skatteverket xmlns="http://xmls.skatteverket.se/se/skatteverket/ai/instans/infoForBeskworksgivku/1.0"')
@@ -56,7 +82,7 @@ export function generateKU10Xml(
 
   // Avsändare
   lines.push('  <Avsandare>')
-  lines.push('    <Programnamn>gnubok</Programnamn>')
+  lines.push(`    <Programnamn>${escapeXml(getBranding().appName.toLowerCase())}</Programnamn>`)
   lines.push(`    <Organisationsnummer>${orgNr}</Organisationsnummer>`)
   lines.push('    <TekniskKontaktperson>')
   lines.push(`      <Namn>${escapeXml(company.contactName)}</Namn>`)
@@ -68,7 +94,7 @@ export function generateKU10Xml(
   // Blankettgemensamt
   lines.push('  <Blankettgemensamt>')
   lines.push(`    <Uppgiftslamnare>`)
-  lines.push(`      <UppgijftslamnareId>${orgNr}</UppgijftslamnareId>`)
+  lines.push(`      <UppgiftslamnarId>${orgNr}</UppgiftslamnarId>`)
   lines.push(`      <NamnUppgiftslamnare>${escapeXml(company.companyName)}</NamnUppgiftslamnare>`)
   lines.push(`    </Uppgiftslamnare>`)
   lines.push('  </Blankettgemensamt>')
@@ -138,11 +164,3 @@ export function generateKU10Xml(
   return lines.join('\n')
 }
 
-function escapeXml(str: string): string {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;')
-}

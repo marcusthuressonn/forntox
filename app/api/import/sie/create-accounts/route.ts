@@ -1,8 +1,8 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
-import type { SIEAccount } from '@/lib/import/types'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { SIECreateAccountsSchema } from '@/lib/api/schemas'
+import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 /**
  * Determine account type based on account class (first digit)
@@ -54,92 +54,92 @@ function getNormalBalance(accountType: string): 'debit' | 'credit' {
  * POST /api/import/sie/create-accounts
  * Create missing accounts from SIE file definitions
  */
-export async function POST(request: Request) {
-  const supabase = await createClient()
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  try {
-    const body = await request.json()
-    const accounts: SIEAccount[] = body.accounts
-
-    if (!accounts || !Array.isArray(accounts) || accounts.length === 0) {
-      return NextResponse.json({ error: 'Inga konton att skapa.' }, { status: 400 })
-    }
-
-    // Prepare accounts for upsert (idempotent — safe to retry)
-    const accountsToUpsert = accounts.map(account => {
-      const accountClass = parseInt(account.number.charAt(0), 10) || 1
-      const accountGroup = account.number.substring(0, 2)
-      const accountType = getAccountType(account.number)
-      const normalBalance = getNormalBalance(accountType)
-
-      return {
-        user_id: user.id,
-        company_id: companyId,
-        account_number: account.number,
-        account_name: account.name,
-        account_class: accountClass,
-        account_group: accountGroup,
-        account_type: accountType,
-        normal_balance: normalBalance,
-        plan_type: 'full_bas',
-        is_active: true,
-        is_system_account: false, // User-created via import
-        sort_order: parseInt(account.number, 10) || 0,
+export const POST = withRouteContext(
+  'sie_import.create_accounts',
+  async (request, { supabase, user, companyId, log, requestId }) => {
+    try {
+      const body = await request.json()
+      const checked = SIECreateAccountsSchema.safeParse(body)
+      if (!checked.success) {
+        return errorResponse(checked.error, log, { requestId, details: {
+          issues: checked.error.issues.map(issue => {
+            const number = issue.path[0] === 'accounts' && typeof issue.path[1] === 'number' &&
+              issue.path[2] === 'number' && Array.isArray(body?.accounts)
+              ? body.accounts[issue.path[1]]?.number : undefined
+            return {
+              field: issue.path.join('.'), message: issue.message, code: issue.code,
+              ...(typeof number === 'string' && /^\d{1,40}$/.test(number) ? { sourceAccount: number } : {}),
+            }
+          }),
+        } })
       }
-    })
+      const { accounts } = checked.data
 
-    // Upsert in batches of 100 to avoid timeout
-    // ignoreDuplicates skips rows that already exist (no update)
-    const batchSize = 100
-    let totalCreated = 0
+      // Prepare accounts for upsert (idempotent, safe to retry)
+      const accountsToUpsert = accounts.map(account => {
+        const accountClass = parseInt(account.number.charAt(0), 10) || 1
+        const accountGroup = account.number.substring(0, 2)
+        const accountType = getAccountType(account.number)
+        const normalBalance = getNormalBalance(accountType)
 
-    for (let i = 0; i < accountsToUpsert.length; i += batchSize) {
-      const batch = accountsToUpsert.slice(i, i + batchSize)
+        return {
+          user_id: user.id,
+          company_id: companyId,
+          account_number: account.number,
+          account_name: account.name,
+          account_class: accountClass,
+          account_group: accountGroup,
+          account_type: accountType,
+          normal_balance: normalBalance,
+          plan_type: 'full_bas',
+          is_active: true,
+          is_system_account: false, // User-created via import
+          sort_order: parseInt(account.number, 10) || 0,
+        }
+      })
 
-      const { data: upserted, error } = await supabase
-        .from('chart_of_accounts')
-        .upsert(batch, {
-          onConflict: 'company_id,account_number',
-          ignoreDuplicates: true,
-          count: 'exact',
-        })
-        .select('account_number')
+      // Upsert in batches of 100 to avoid timeout
+      // ignoreDuplicates skips rows that already exist (no update)
+      const batchSize = 100
+      let totalCreated = 0
 
-      if (error) {
-        console.error('Error upserting accounts batch:', error)
-        return NextResponse.json({
-          error: `Kunde inte skapa konton (batch ${Math.floor(i / batchSize) + 1}): ${error.message}. ${totalCreated} konton skapades innan felet.`,
-          created: totalCreated,
-        }, { status: 500 })
+      for (let i = 0; i < accountsToUpsert.length; i += batchSize) {
+        const batch = accountsToUpsert.slice(i, i + batchSize)
+
+        const { data: upserted, error } = await supabase
+          .from('chart_of_accounts')
+          .upsert(batch, {
+            onConflict: 'company_id,account_number',
+            ignoreDuplicates: true,
+            count: 'exact',
+          })
+          .select('account_number')
+
+        if (error) {
+          console.error('Error upserting accounts batch:', error)
+          return NextResponse.json({
+            error: `Kunde inte skapa konton (batch ${Math.floor(i / batchSize) + 1}): ${getUserErrorMessage(error)}. ${totalCreated} konton skapades innan felet.`,
+            created: totalCreated,
+          }, { status: 500 })
+        }
+
+        totalCreated += upserted?.length ?? batch.length
       }
 
-      totalCreated += upserted?.length ?? batch.length
+      return NextResponse.json({
+        success: true,
+        created: totalCreated,
+        message: `Created ${totalCreated} new accounts`,
+      })
+
+    } catch (error) {
+      if (error instanceof SyntaxError) return errorResponseFromCode('VALIDATION_ERROR', log, { requestId })
+      console.error('Create accounts error:', error)
+      return NextResponse.json(
+        { error: `Kunde inte skapa konton: ${error instanceof Error ? getUserErrorMessage(error) : 'Okänt fel'}. Försök igen.` },
+        { status: 500 }
+      )
     }
-
-    return NextResponse.json({
-      success: true,
-      created: totalCreated,
-      message: `Created ${totalCreated} new accounts`,
-    })
-
-  } catch (error) {
-    console.error('Create accounts error:', error)
-    return NextResponse.json(
-      { error: `Kunde inte skapa konton: ${error instanceof Error ? error.message : 'Okänt fel'}. Försök igen.` },
-      { status: 500 }
-    )
-  }
-}
+  },
+  { requireWrite: true },
+)

@@ -8,6 +8,7 @@ import {
   makeCompanySettings,
 } from '@/tests/helpers'
 import { eventBus } from '@/lib/events/bus'
+import { AccountsNotInChartError } from '@/lib/bookkeeping/errors'
 
 const { supabase: mockSupabase, enqueue, enqueueMany, reset } = createQueuedMockSupabase()
 vi.mock('@/lib/supabase/server', () => ({
@@ -33,6 +34,10 @@ vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
 const mockCreateJournalEntry = vi.fn()
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: (...args: unknown[]) => mockCreateJournalEntry(...args),
+}))
+
+vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
+  detectBookingDuplicate: vi.fn().mockResolvedValue(null),
 }))
 
 // Mock VAT validation
@@ -92,13 +97,16 @@ describe('POST /api/pending-operations/:id/commit', () => {
         preview_data: {},
       },
     })
+    enqueue({ data: null, error: null }) // CAS UPDATE returns 0 rows since status != 'pending'
 
     const request = createMockRequest('/api/pending-operations/op-1/commit', { method: 'POST' })
     const response = await POST(request, routeParams)
     const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
     expect(status).toBe(409)
-    expect(body.error).toContain('already committed')
+    // The executor's English error string maps to the Swedish HTTP-409
+    // fallback: raw English never reaches the toast (issue #337).
+    expect(body.error).toBe('En konflikt uppstod. Ladda om sidan och försök igen.')
   })
 
   describe('categorize_transaction', () => {
@@ -122,10 +130,12 @@ describe('POST /api/pending-operations/:id/commit', () => {
 
       enqueueMany([
         { data: pendingOp },                         // fetch pending op
+        { data: { id: 'op-1' } },                    // CAS claim
         { data: tx },                                 // fetch transaction
         { data: settings },                           // fetch company settings
+        { data: [] },                                 // resolveSettlementAccount: no cash accounts -> 1930
         { data: [{ id: 'fp-1' }] },                  // fiscal period check
-        { data: null, error: null },                  // update transaction
+        { data: [{ id: 'tx-1' }], error: null },      // transaction CAS matched
         { data: null, error: null },                  // upsert counterparty template
         { data: null, error: null },                  // update pending op status
       ])
@@ -139,12 +149,47 @@ describe('POST /api/pending-operations/:id/commit', () => {
       expect(mockCreateJournalEntry).toHaveBeenCalledTimes(1)
     })
 
+    it('returns the structured ACCOUNTS_NOT_IN_CHART envelope when the chart lacks accounts', async () => {
+      // The booking is valid but posts to reverse-charge accounts (2614/2645)
+      // not active in the chart. The engine throws AccountsNotInChartError; the
+      // dispatcher must release the op back to 'pending' (retryable, see the
+      // 6th enqueued response) and the route must return the structured error
+      // with code + account_numbers so the chat can offer activation: NOT a
+      // raw error string.
+      const tx = makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null })
+      const settings = makeCompanySettings()
+      mockCreateJournalEntry.mockRejectedValueOnce(new AccountsNotInChartError(['2645', '2614']))
+
+      enqueueMany([
+        { data: pendingOp },                         // route fetch op
+        { data: { id: 'op-1' } },                    // CAS claim (pending -> committing)
+        { data: tx },                                 // fetch transaction
+        { data: settings },                           // fetch company settings
+        { data: [] },                                 // resolveSettlementAccount: no cash accounts -> 1930
+        { data: [{ id: 'fp-1' }] },                  // fiscal period exists
+        { data: null, error: null },                  // dispatcher releases op back to 'pending'
+      ])
+
+      const request = createMockRequest('/api/pending-operations/op-1/commit', { method: 'POST' })
+      const response = await POST(request, routeParams)
+      const { status, body } = await parseJsonResponse<{
+        error: { code: string; account_numbers: string[] }
+      }>(response)
+
+      expect(status).toBe(400)
+      expect(body.error.code).toBe('ACCOUNTS_NOT_IN_CHART')
+      // Numeric sort puts 2614 before 2645 regardless of input order.
+      expect(body.error.account_numbers).toEqual(['2614', '2645'])
+    })
+
     it('returns 409 when transaction already categorized', async () => {
       const tx = makeTransaction({ id: 'tx-1', journal_entry_id: 'existing-je' })
 
       enqueueMany([
         { data: pendingOp },                         // fetch pending op
+        { data: { id: 'op-1' } },                    // CAS claim
         { data: tx },                                 // fetch transaction (already has JE)
+        { data: { status: 'posted' } },              // hasLiveJournalEntryLink: existing JE is live
         { data: null, error: null },                  // auto-reject update
       ])
 
@@ -153,7 +198,10 @@ describe('POST /api/pending-operations/:id/commit', () => {
       const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
       expect(status).toBe(409)
-      expect(body.error).toContain('already has a journal entry')
+      // Known-pattern translation of the executor's English message (#337).
+      expect(body.error).toBe(
+        'Transaktionen är redan bokförd. Ångra kategoriseringen om du vill ändra den.',
+      )
     })
   })
 
@@ -175,6 +223,8 @@ describe('POST /api/pending-operations/:id/commit', () => {
     it('commits successfully', async () => {
       enqueueMany([
         { data: pendingOp },                         // fetch pending op
+        { data: { id: 'op-1' } },                    // CAS claim
+        { data: null, error: null },                  // company_settings read (payment-terms default)
         { data: { id: 'cust-1', name: 'Acme AB' } }, // insert customer
         { data: null, error: null },                  // update pending op status
       ])
@@ -216,26 +266,29 @@ describe('POST /api/pending-operations/:id/commit', () => {
 
       enqueueMany([
         { data: pendingOp },                          // fetch pending op
+        { data: { id: 'op-1' } },                     // CAS claim
         { data: customer },                           // fetch customer
-        { data: '20260001' },                         // generate invoice number (rpc)
-        { data: { id: 'inv-1' } },                    // insert invoice
+        { data: { vat_registered: true } },           // company_settings VAT registration gate
+        { data: { id: 'inv-1', invoice_number: null } }, // insert invoice (no number: assigned at send)
         { data: null, error: null },                  // insert items
-        { data: { id: 'inv-1', customer: customer, items: [] } }, // fetch complete invoice
+        { data: { id: 'inv-1', invoice_number: null, customer: customer, items: [] } }, // fetch complete invoice
         { data: null, error: null },                  // update pending op status
       ])
 
       const request = createMockRequest('/api/pending-operations/op-1/commit', { method: 'POST' })
       const response = await POST(request, routeParams)
-      const { status, body } = await parseJsonResponse<{ data: { invoice_id: string; invoice_number: string } }>(response)
+      const { status, body } = await parseJsonResponse<{ data: { invoice_id: string; invoice_number: string | null } }>(response)
 
       expect(status).toBe(200)
       expect(body.data.invoice_id).toBe('inv-1')
-      expect(body.data.invoice_number).toBe('20260001')
+      // Drafts no longer reserve a number: assigned at send time instead
+      expect(body.data.invoice_number).toBeNull()
     })
 
     it('returns 404 when customer not found', async () => {
       enqueueMany([
         { data: pendingOp },                          // fetch pending op
+        { data: { id: 'op-1' } },                     // CAS claim
         { data: null, error: { message: 'not found' } }, // customer not found
         { data: null, error: null },                  // auto-reject update
       ])
@@ -245,7 +298,8 @@ describe('POST /api/pending-operations/:id/commit', () => {
       const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
       expect(status).toBe(404)
-      expect(body.error).toContain('Customer not found')
+      // English executor message → Swedish HTTP-404 fallback (issue #337).
+      expect(body.error).toBe('Resursen kunde inte hittas.')
     })
   })
 })

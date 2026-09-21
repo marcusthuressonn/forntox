@@ -1,38 +1,82 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
+import { z } from 'zod'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { validateBody } from '@/lib/api/validate'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 /**
- * DELETE /api/settings/api-keys/[id] — Revoke an API key (soft delete)
+ * Approval authority in SEK: the largest amount this key may commit with no
+ * human in the loop. null clears the ceiling (unlimited, the default).
+ *
+ * Bounded at 1 000 000 000 so a typo cannot store a number the numeric(14,2)
+ * column would reject at insert time with a raw Postgres error. The DB CHECK
+ * (> 0) is the real guarantee; this is the friendly message in front of it.
  */
-export async function DELETE(
-  _request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const supabase = await createClient()
-  const { id } = await params
-  const { data: { user } } = await supabase.auth.getUser()
+const patchSchema = z.object({
+  unattended_commit_limit: z.number().positive().max(1_000_000_000).nullable(),
+})
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+/**
+ * DELETE /api/settings/api-keys/[id]: Revoke an API key (soft delete)
+ */
+export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'api_key.revoke',
+  async (_request, ctx, { params }) => {
+    const { id } = await params
+    const { supabase, companyId } = ctx
 
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
+    const { error } = await supabase
+      .from('api_keys')
+      .update({ revoked_at: new Date().toISOString() })
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .is('revoked_at', null)
 
-  const companyId = await requireCompanyId(supabase, user.id)
+    if (error) {
+      return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
+    }
 
-  const { error } = await supabase
-    .from('api_keys')
-    .update({ revoked_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .is('revoked_at', null)
+    return NextResponse.json({ success: true })
+  },
+  { requireWrite: true },
+)
 
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
-  }
+/**
+ * PATCH /api/settings/api-keys/[id]: set the key's unattended commit limit.
+ *
+ * Deliberately narrow: name and scopes are NOT editable here. Silently
+ * widening a key's scopes after the fact would defeat the point of showing the
+ * scope list at creation, and the separation-of-duties check
+ * (findStageApproveConflict) runs only on POST.
+ */
+export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'api_key.update',
+  async (request, ctx, { params }) => {
+    const { id } = await params
+    const { supabase, companyId } = ctx
 
-  return NextResponse.json({ success: true })
-}
+    const validation = await validateBody(request, patchSchema)
+    if (!validation.success) return validation.response
+
+    // Revoked keys are deliberately excluded: raising a limit on a key that no
+    // longer authenticates reads as re-enabling it, and it does not.
+    const { data, error } = await supabase
+      .from('api_keys')
+      .update({ unattended_commit_limit: validation.data.unattended_commit_limit })
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .is('revoked_at', null)
+      .select('id, unattended_commit_limit')
+      .maybeSingle()
+
+    if (error) {
+      return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
+    }
+    if (!data) {
+      return NextResponse.json({ error: 'API-nyckeln hittades inte.' }, { status: 404 })
+    }
+
+    return NextResponse.json({ data })
+  },
+  { requireWrite: true },
+)

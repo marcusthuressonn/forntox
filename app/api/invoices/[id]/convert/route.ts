@@ -1,145 +1,42 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { eventBus } from '@/lib/events'
 import { ensureInitialized } from '@/lib/init'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
-import type { Invoice } from '@/types'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { convertToInvoice } from '@/lib/invoices/convert-to-invoice'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 ensureInitialized()
 
 /**
  * POST /api/invoices/[id]/convert
  *
- * Converts a proforma invoice to a real invoice.
- * Copies all data, generates a real invoice number, and marks the proforma as cancelled.
+ * Converts a proforma invoice or an accepted quote (offert) to a real
+ * invoice. The shared implementation (lib/invoices/convert-to-invoice.ts)
+ * copies the data, generates an F-series number LAST, marks a proforma
+ * cancelled and a quote accepted; the new invoice links back through
+ * converted_from_id.
  */
-export async function POST(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id } = await params
-  const supabase = await createClient()
+export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'invoice.convert',
+  async (_request, { supabase, user, companyId, log, requestId }, { params }) => {
+    const { id } = await params
 
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  // Fetch proforma with items
-  const { data: proforma, error: proformaError } = await supabase
-    .from('invoices')
-    .select('*, items:invoice_items(*)')
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .single()
-
-  if (proformaError || !proforma) {
-    return NextResponse.json({ error: 'Proformafakturan hittades inte' }, { status: 404 })
-  }
-
-  if (proforma.document_type !== 'proforma') {
-    return NextResponse.json(
-      { error: 'Endast proformafakturor kan konverteras' },
-      { status: 400 }
-    )
-  }
-
-  if (proforma.status === 'cancelled') {
-    return NextResponse.json(
-      { error: 'Denna proformafaktura har redan makuleras' },
-      { status: 400 }
-    )
-  }
-
-  // Generate real invoice number
-  const { data: invoiceNumber } = await supabase.rpc('generate_invoice_number', {
-    p_company_id: companyId,
-  })
-
-  // Create the real invoice
-  const { data: invoice, error: invoiceError } = await supabase
-    .from('invoices')
-    .insert({
-      user_id: user.id,
-      company_id: companyId,
-      customer_id: proforma.customer_id,
-      invoice_number: invoiceNumber,
-      invoice_date: new Date().toISOString().split('T')[0],
-      due_date: proforma.due_date,
-      currency: proforma.currency,
-      exchange_rate: proforma.exchange_rate,
-      exchange_rate_date: proforma.exchange_rate_date,
-      subtotal: proforma.subtotal,
-      subtotal_sek: proforma.subtotal_sek,
-      vat_amount: proforma.vat_amount,
-      vat_amount_sek: proforma.vat_amount_sek,
-      total: proforma.total,
-      total_sek: proforma.total_sek,
-      vat_treatment: proforma.vat_treatment,
-      vat_rate: proforma.vat_rate,
-      moms_ruta: proforma.moms_ruta,
-      reverse_charge_text: proforma.reverse_charge_text,
-      your_reference: proforma.your_reference,
-      our_reference: proforma.our_reference,
-      notes: proforma.notes,
-      document_type: 'invoice',
-      converted_from_id: id,
+    const result = await convertToInvoice({
+      supabase,
+      userId: user.id,
+      companyId,
+      sourceId: id,
     })
-    .select()
-    .single()
 
-  if (invoiceError) {
-    return NextResponse.json({ error: invoiceError.message }, { status: 500 })
-  }
-
-  // Copy invoice items
-  const items = (proforma.items || []).map((item: { sort_order: number; description: string; quantity: number; unit: string; unit_price: number; line_total: number }) => ({
-    invoice_id: invoice.id,
-    sort_order: item.sort_order,
-    description: item.description,
-    quantity: item.quantity,
-    unit: item.unit,
-    unit_price: item.unit_price,
-    line_total: item.line_total,
-  }))
-
-  if (items.length > 0) {
-    const { error: itemsError } = await supabase
-      .from('invoice_items')
-      .insert(items)
-
-    if (itemsError) {
-      await supabase.from('invoices').delete().eq('id', invoice.id)
-      return NextResponse.json({ error: itemsError.message }, { status: 500 })
+    if (!result.ok) {
+      if (result.code === 'INVOICE_CONVERT_FAILED') {
+        log.error('invoice conversion failed', result.cause as Error, { sourceId: id })
+        return NextResponse.json({ error: getUserErrorMessage(result.cause) }, { status: 500 })
+      }
+      return errorResponseFromCode(result.code, log, { requestId })
     }
-  }
 
-  // Mark proforma as cancelled
-  await supabase
-    .from('invoices')
-    .update({ status: 'cancelled' })
-    .eq('id', id)
-
-  // Fetch complete invoice
-  const { data: completeInvoice } = await supabase
-    .from('invoices')
-    .select('*, customer:customers(*), items:invoice_items(*)')
-    .eq('id', invoice.id)
-    .single()
-
-  if (completeInvoice) {
-    await eventBus.emit({
-      type: 'invoice.created',
-      payload: { invoice: completeInvoice as Invoice, companyId, userId: user.id },
-    })
-  }
-
-  return NextResponse.json({ data: completeInvoice })
-}
+    return NextResponse.json({ data: result.invoice })
+  },
+  { requireWrite: true },
+)

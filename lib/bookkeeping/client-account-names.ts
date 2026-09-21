@@ -1,12 +1,12 @@
 /**
  * Client-safe account name map for UI display.
  * Covers the ~30 accounts used in transaction categorization.
- * No server dependencies — safe for 'use client' components.
+ * No server dependencies: safe for 'use client' components.
  */
 
 const ACCOUNT_NAMES: Record<string, string> = {
   // Assets (1xxx)
-  '1250': 'Inventarier',
+  '1220': 'Inventarier',
   '1510': 'Kundfordringar',
   '1630': 'Skattekonto',
   '1680': 'Fordringar hos ägare',
@@ -18,7 +18,7 @@ const ACCOUNT_NAMES: Record<string, string> = {
   '2350': 'Långfristiga skulder',
   '2393': 'Kortfristig skuld närstående',
   '2440': 'Leverantörsskulder',
-  '2510': 'Personalskatt',
+  '2510': 'Skatteskulder',
   '2611': 'Utg. moms 25%',
   '2621': 'Utg. moms 12%',
   '2631': 'Utg. moms 6%',
@@ -83,7 +83,7 @@ const ACCOUNT_NAMES: Record<string, string> = {
   '6991': 'Övriga kostnader',
 
   // Personnel & financial (7xxx / 8xxx)
-  '7210': 'Löner',
+  '7210': 'Löner tjänstemän',
   '7410': 'Pensionsförsäkring',
   '7610': 'Utbildning',
   '7622': 'Intern representation',

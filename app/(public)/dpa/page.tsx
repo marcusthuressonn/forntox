@@ -1,45 +1,69 @@
 import type { Metadata } from 'next'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import Link from 'next/link'
+import { SourceCodeFooter } from '@/components/branding/SourceCodeFooter'
+import { getBranding } from '@/lib/branding/service'
 
-export const metadata: Metadata = {
-  title: 'Personuppgiftsbitradesavtal - Gnubok',
+export function generateMetadata(): Metadata {
+  return {
+    title: `Personuppgiftsbiträdesavtal - ${getBranding().appName}`,
+  }
 }
 
 export default function DPAPage() {
+  const { appName, legalEntity, privacyEmail } = getBranding()
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white py-12 px-4">
-      <div className="max-w-3xl mx-auto space-y-6">
-        <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-gray-900 mb-2">
-            Personuppgiftsbitradesavtal (DPA)
+    <div className="min-h-dvh bg-background py-12 px-4">
+      <div className="max-w-3xl mx-auto space-y-8">
+        <div className="text-center space-y-2">
+          <h1 className="font-display text-3xl md:text-4xl tracking-tight text-foreground">
+            Personuppgiftsbiträdesavtal (DPA)
           </h1>
-          <p className="text-muted-foreground">
-            Enligt GDPR Art. 28 | Senast uppdaterad: 2026-03-05
+          <p className="text-sm text-muted-foreground">
+            Enligt GDPR Art. 28 &middot; Senast uppdaterad: 2026-06-03
           </p>
         </div>
 
         <Card>
           <CardHeader>
-            <CardTitle>1. Roller</CardTitle>
+            <CardTitle className="text-base">1. Roller</CardTitle>
           </CardHeader>
           <CardContent className="prose prose-sm max-w-none">
             <p>
               Detta personuppgiftsbitradesavtal (&quot;DPA&quot;) ingår mellan:
             </p>
             <ul>
-              <li><strong>Personuppgiftsansvarig (&quot;den Ansvarige&quot;):</strong> Du som användare av Gnubok,
+              <li><strong>Personuppgiftsansvarig (&quot;den Ansvarige&quot;):</strong> Du som användare av {appName},
                 i egenskap av ansvarig för de personuppgifter du registrerar i tjänsten
                 (kunder, leverantörer, anställda m.fl.).</li>
-              <li><strong>Personuppgiftsbiträde (&quot;Biträdet&quot;):</strong> Arcim, som tillhandahåller
-                Gnubok-tjänsten och behandlar personuppgifter på dina vägnar.</li>
+              <li><strong>Personuppgiftsbiträde (&quot;Biträdet&quot;):</strong> {legalEntity}, som tillhandahåller
+                {' '}{appName}-tjänsten och behandlar personuppgifter på dina vägnar.</li>
             </ul>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader>
-            <CardTitle>2. Behandlingens syfte och omfattning</CardTitle>
+            <CardTitle className="text-base">2. Behandling enligt instruktioner</CardTitle>
+          </CardHeader>
+          <CardContent className="prose prose-sm max-w-none">
+            <p>
+              Biträdet behandlar personuppgifter endast enligt den Ansvariges dokumenterade
+              instruktioner, inklusive vid överföring av personuppgifter till tredjeland eller en
+              internationell organisation, om inte unionsrätten eller svensk rätt ålägger Biträdet
+              att göra det. I sådant fall informerar Biträdet den Ansvarige om det rättsliga kravet
+              innan behandlingen sker, om inte sådan information är förbjuden enligt lag.
+            </p>
+            <p>
+              Om Biträdet anser att en instruktion strider mot GDPR eller andra
+              dataskyddsbestämmelser ska Biträdet omedelbart informera den Ansvarige.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">3. Behandlingens syfte och omfattning</CardTitle>
           </CardHeader>
           <CardContent className="prose prose-sm max-w-none">
             <p>Biträdet behandlar personuppgifter för följande ändamål:</p>
@@ -61,7 +85,21 @@ export default function DPAPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>3. Tekniska och organisatoriska åtgärder</CardTitle>
+            <CardTitle className="text-base">4. Konfidentialitet</CardTitle>
+          </CardHeader>
+          <CardContent className="prose prose-sm max-w-none">
+            <p>
+              Biträdet säkerställer att de personer som har behörighet att behandla
+              personuppgifterna har åtagit sig att iaktta konfidentialitet eller omfattas av en
+              lämplig lagstadgad tystnadsplikt. Åtkomst till personuppgifter begränsas till personal
+              som behöver uppgifterna för att fullgöra Biträdets åtaganden.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">5. Tekniska och organisatoriska åtgärder</CardTitle>
           </CardHeader>
           <CardContent className="prose prose-sm max-w-none">
             <p>Biträdet vidtar följande åtgärder för att skydda personuppgifterna:</p>
@@ -69,22 +107,27 @@ export default function DPAPage() {
               <li><strong>Kryptering:</strong> All data krypteras i transit (TLS 1.3) och i vila (AES-256)</li>
               <li><strong>Åtkomstkontroll:</strong> Row Level Security (RLS) säkerställer att varje användare
                 enbart kan komma åt sina egna uppgifter</li>
-              <li><strong>Autentisering:</strong> Säkra inloggningsmetoder (magic link, inga lösenord lagrade)</li>
+              <li><strong>Autentisering:</strong> Inloggning med e-post och lösenord (lösenord lagras
+                endast som saltad hash, aldrig i klartext), tvåfaktorsautentisering (2FA via TOTP)
+                samt BankID (på den hostade tjänsten). Tvåfaktorsautentisering kan krävas för
+                åtkomst</li>
               <li><strong>Integritetskontroll:</strong> SHA-256 checksummor för alla dokument, med
                 regelbunden verifiering</li>
-              <li><strong>Revisionslogg:</strong> Alla ändringshandelser loggas automatiskt av databasen
+              <li><strong>Revisionslogg:</strong> Alla ändringshändelser loggas automatiskt av databasen
                 (ej redigerbara)</li>
               <li><strong>Oföränderlig bokföring:</strong> Bokförda verifikationer kan inte ändras eller
                 raderas (databasutlösare)</li>
               <li><strong>Säkerhetskopior:</strong> Kontinuerliga databaskopior med point-in-time-recovery</li>
-              <li><strong>EU-lagring:</strong> All primär datalagring sker i EU (eu-central-1)</li>
+              <li><strong>EU-lagring och EU-inferens:</strong> All primär datalagring sker i EU
+                (Supabase, eu-north-1, Stockholm). AI-inferens sker, när AI-funktioner är aktiverade, inom
+                EU via Amazon Bedrock (eu-north-1, Stockholm): ingen överföring till tredje land</li>
             </ul>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader>
-            <CardTitle>4. Underbiträden</CardTitle>
+            <CardTitle className="text-base">6. Underbiträden</CardTitle>
           </CardHeader>
           <CardContent className="prose prose-sm max-w-none">
             <p>
@@ -99,12 +142,36 @@ export default function DPAPage() {
               Biträdet kommer att informera den Ansvarige minst 30 dagar i förväg innan
               en ny underbiträde anlitas, så att den Ansvarige har möjlighet att invända.
             </p>
+            <p>
+              Biträdet ålägger genom skriftligt avtal varje underbiträde samma
+              dataskyddsskyldigheter som anges i detta avtal. Biträdet förblir fullt ansvarigt
+              gentemot den Ansvarige för att underbiträdet fullgör sina skyldigheter.
+            </p>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader>
-            <CardTitle>5. Dataintrångsnotifiering</CardTitle>
+            <CardTitle className="text-base">7. Bistånd med registrerades rättigheter</CardTitle>
+          </CardHeader>
+          <CardContent className="prose prose-sm max-w-none">
+            <p>
+              Biträdet bistår den Ansvarige, genom lämpliga tekniska och organisatoriska åtgärder
+              och i den mån det är möjligt, med att fullgöra den Ansvariges skyldighet att besvara
+              begäran från registrerade om utövande av sina rättigheter enligt GDPR kapitel III
+              (art. 12-23), däribland rätt till tillgång, rättelse, radering, begränsning,
+              dataportabilitet och invändning.
+            </p>
+            <p>
+              Tjänsten tillhandahåller självbetjäningsfunktioner för export (SIE4, JSON, CSV) och
+              radering som stöd för detta.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">8. Dataintrångsnotifiering och bistånd enligt art. 32-36</CardTitle>
           </CardHeader>
           <CardContent className="prose prose-sm max-w-none">
             <p>
@@ -119,15 +186,19 @@ export default function DPAPage() {
               <li>Åtgärder som vidtagits eller föreslås för att hantera incidenten</li>
             </ul>
             <p>
-              Biträdet ska bistå den Ansvarige med den information som behövs för att den
-              Ansvarige ska kunna uppfylla sin anmälningsplikt till IMY (Integritetsskyddsmyndigheten).
+              Biträdet bistår den Ansvarige med att säkerställa att skyldigheterna enligt
+              art. 32-36 i GDPR fullgörs, med beaktande av behandlingens art och den information
+              som Biträdet har tillgång till. Detta omfattar säkerhet i behandlingen (art. 32),
+              anmälan av personuppgiftsincidenter (art. 33-34), konsekvensbedömningar avseende
+              dataskydd (art. 35, DPIA) samt förhandssamråd med Integritetsskyddsmyndigheten
+              (IMY) (art. 36).
             </p>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader>
-            <CardTitle>6. Revisionsrätt</CardTitle>
+            <CardTitle className="text-base">9. Revisionsrätt</CardTitle>
           </CardHeader>
           <CardContent className="prose prose-sm max-w-none">
             <p>
@@ -146,7 +217,7 @@ export default function DPAPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>7. Radering vid avslut</CardTitle>
+            <CardTitle className="text-base">10. Radering vid avslut</CardTitle>
           </CardHeader>
           <CardContent className="prose prose-sm max-w-none">
             <p>
@@ -173,12 +244,16 @@ export default function DPAPage() {
         <Card>
           <CardContent className="pt-6">
             <p className="text-sm text-muted-foreground text-center">
-              Detta personuppgiftsbitradesavtal träder i kraft när du skapar ett konto på
-              Gnubok och gäller så länge du använder tjänsten. För frågor, kontakta oss
-              på privacy@gnubok.se.
+              Detta personuppgiftsbiträdesavtal träder i kraft när du skapar ett konto på
+              {' '}{appName} och gäller så länge du använder tjänsten. För frågor, kontakta oss
+              på {privacyEmail}.
             </p>
           </CardContent>
         </Card>
+
+        {/* AGPL section 13 source offer (WL-06): renders on both default and
+            branded hosts; never gate this on a brand. */}
+        <SourceCodeFooter className="pt-2" />
       </div>
     </div>
   )

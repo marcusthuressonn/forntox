@@ -4,7 +4,8 @@ import { useState, useCallback, useEffect } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
 import { Button } from '@/components/ui/button'
-import { Upload, FileText, AlertCircle, CheckCircle, Loader2, XCircle, RefreshCw } from 'lucide-react'
+import { Upload, AlertCircle, CheckCircle, Loader2, XCircle, RefreshCw } from 'lucide-react'
+import { hasSIEFileExtension, SIE_FILE_EXTENSIONS_SV } from '@/lib/import/sie-file-extensions'
 
 const LOADING_PHASES = [
   { message: 'Läser fil...', progress: 10 },
@@ -17,7 +18,7 @@ interface SIEUploadStepProps {
   onFileSelect: (file: File) => void
   isLoading: boolean
   error: string | null
-  errorType?: 'duplicate' | 'duplicate_period' | 'validation' | 'parse'
+  errorType?: 'duplicate' | 'duplicate_period' | 'validation' | 'parse' | 'network'
   validationErrors?: string[]
   validationWarnings?: string[]
   duplicateImportId?: string | null
@@ -29,6 +30,7 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
   const [isDragging, setIsDragging] = useState(false)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [loadingPhase, setLoadingPhase] = useState(0)
+  const [fileTypeError, setFileTypeError] = useState<string | null>(null)
 
   // Cycle through loading phases on timers
   useEffect(() => {
@@ -56,27 +58,43 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
     setIsDragging(false)
   }, [])
 
+  // No `accept` attribute on the input and no silent rejection here: Safari
+  // maps accept extensions to system file types, and unregistered extensions
+  // like .sie/.se/.si grey out perfectly valid files in the picker. All
+  // filtering happens after selection, with a visible error instead of a dead
+  // drop.
+  const trySelectFile = useCallback((file: File) => {
+    if (hasSIEFileExtension(file.name)) {
+      setFileTypeError(null)
+      setSelectedFile(file)
+      onFileSelect(file)
+      return
+    }
+    if (file.name.toLowerCase().endsWith('.zip')) {
+      setFileTypeError(`Filen "${file.name}" är en zip-fil. Packa upp den först och välj SIE-filen inuti (slutar på ${SIE_FILE_EXTENSIONS_SV}).`)
+    } else {
+      setFileTypeError(`Filen "${file.name}" stöds inte. Välj en SIE-fil som slutar på ${SIE_FILE_EXTENSIONS_SV}.`)
+    }
+  }, [onFileSelect])
+
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragging(false)
 
     const files = e.dataTransfer.files
     if (files.length > 0) {
-      const file = files[0]
-      if (file.name.toLowerCase().endsWith('.sie') || file.name.toLowerCase().endsWith('.se')) {
-        setSelectedFile(file)
-        onFileSelect(file)
-      }
+      trySelectFile(files[0])
     }
-  }, [onFileSelect])
+  }, [trySelectFile])
 
   const handleFileInput = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
     if (files && files.length > 0) {
-      setSelectedFile(files[0])
-      onFileSelect(files[0])
+      trySelectFile(files[0])
     }
-  }, [onFileSelect])
+    // Allow re-picking the same file after a rejection
+    e.target.value = ''
+  }, [trySelectFile])
 
   const phase = LOADING_PHASES[loadingPhase]
 
@@ -124,7 +142,7 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
             className={`
               relative border-2 border-dashed rounded-lg p-8 text-center transition-colors cursor-pointer hover:border-primary/50
               ${isDragging ? 'border-primary bg-primary/5' : 'border-muted-foreground/25'}
-              ${error ? 'border-destructive bg-destructive/5' : ''}
+              ${error || fileTypeError ? 'border-destructive bg-destructive/5' : ''}
             `}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -134,7 +152,6 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
             <input
               id="file-input"
               type="file"
-              accept=".sie,.se"
               className="hidden"
               onChange={handleFileInput}
               disabled={isLoading}
@@ -157,18 +174,29 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
                   <p className="font-medium hidden sm:block">Dra och släpp SIE-fil här</p>
                   <p className="font-medium sm:hidden">Tryck för att välja SIE-fil</p>
                   <p className="text-sm text-muted-foreground hidden sm:block">eller klicka för att välja fil</p>
-                  <p className="text-sm text-muted-foreground sm:hidden">.sie eller .se-filer</p>
+                  <p className="text-sm text-muted-foreground sm:hidden">{SIE_FILE_EXTENSIONS_SV}-filer</p>
                 </div>
               </div>
             )}
           </div>
+
+          {/* Rejected file type (client-side, before upload) */}
+          {fileTypeError && (
+            <div className="mt-4 p-4 rounded-lg flex gap-3 bg-destructive/10 border border-destructive/20">
+              <AlertCircle className="h-5 w-5 flex-shrink-0 mt-0.5 text-destructive" />
+              <div className="space-y-1.5 min-w-0">
+                <p className="font-medium text-destructive">Filen kan inte användas</p>
+                <p className="text-sm text-muted-foreground">{fileTypeError}</p>
+              </div>
+            </div>
+          )}
 
           {/* Error display */}
           {error && (
             <div className="mt-4 space-y-3">
               <div className={`p-4 rounded-lg flex gap-3 ${
                 errorType === 'duplicate' || errorType === 'duplicate_period'
-                  ? 'bg-warning/10 border border-warning/20'
+                  ? 'bg-muted/30 border border-border'
                   : 'bg-destructive/10 border border-destructive/20'
               }`}>
                 <AlertCircle className={`h-5 w-5 flex-shrink-0 mt-0.5 ${
@@ -186,6 +214,7 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
                     {errorType === 'duplicate_period' && 'Överlappande räkenskapsår'}
                     {errorType === 'validation' && 'Filen innehåller valideringsfel'}
                     {errorType === 'parse' && 'Kunde inte tolka filen'}
+                    {errorType === 'network' && 'Uppladdningen misslyckades'}
                     {!errorType && 'Ett fel uppstod'}
                   </p>
                   <p className="text-sm text-muted-foreground">{error}</p>
@@ -199,7 +228,7 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
                           <Button
                             variant="outline"
                             size="sm"
-                            className="border-warning/50 text-warning hover:bg-warning/10"
+                            className="border-border text-warning hover:bg-muted/30"
                             disabled={isReplacing}
                             onClick={(e) => {
                               e.stopPropagation()
@@ -220,6 +249,9 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
                     )}
                     {errorType === 'parse' && (
                       <p>Kontrollera att filen är en SIE4-fil exporterad från ett bokföringsprogram (Fortnox, Visma, Bokio etc). Filen kan vara skadad om den redigerats manuellt.</p>
+                    )}
+                    {errorType === 'network' && (
+                      <p>Kontrollera din internetanslutning och försök igen. Om problemet kvarstår, prova att ladda upp filen från en dator eller hör av dig till support.</p>
                     )}
                   </div>
                 </div>
@@ -242,7 +274,7 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
 
               {/* Validation warnings list */}
               {validationWarnings && validationWarnings.length > 0 && (
-                <div className="p-4 bg-warning/5 border border-warning/15 rounded-lg space-y-2">
+                <div className="p-4 bg-muted/30 border border-border rounded-lg space-y-2">
                   <p className="text-sm font-medium text-warning">Varningar ({validationWarnings.length})</p>
                   <div className="space-y-1.5 max-h-32 overflow-y-auto">
                     {validationWarnings.map((warn, i) => (
@@ -297,7 +329,7 @@ export default function SIEUploadStep({ onFileSelect, isLoading, error, errorTyp
             <p className="text-muted-foreground">Inställningar → Import/Export → Exportera SIE</p>
           </div>
           <div>
-            <p className="font-medium">Visma eEkonomi</p>
+            <p className="font-medium">Visma</p>
             <p className="text-muted-foreground">Rapporter → Övrigt → Exportera till SIE</p>
           </div>
           <div>

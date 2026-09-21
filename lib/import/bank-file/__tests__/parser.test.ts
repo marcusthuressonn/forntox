@@ -8,11 +8,11 @@
 
 import { detectFileFormat, parseBankFile, generateExternalId, generateFileHash, getFormat, getAllFormats } from '../parser'
 import type { ParsedBankTransaction, BankFileFormatId } from '../types'
-import { parseGenericCSV } from '../formats/generic-csv'
+import { parseGenericCSV, normalizeMinusSign } from '../formats/generic-csv'
 import { parseCSVLine } from '../formats/nordea'
 
 // ---------------------------------------------------------------------------
-// Test data — realistic CSV/XML content for each Swedish bank format
+// Test data: realistic CSV/XML content for each Swedish bank format
 // ---------------------------------------------------------------------------
 
 const NORDEA_CSV = [
@@ -51,6 +51,15 @@ const SEB_PRIVAT_CSV = [
   '2024-10-31;2024-10-31;5841990687;H31520956893;433,16;5147,56',
 ].join('\n')
 
+// SEB "Transaktioner" web export: UTF-8 BOM, CRLF, dot decimals, and the
+// amount split across Insättningar/Uttag (Uttag rows carry their own minus).
+// Header and first data row are verbatim from a user-provided export
+// (2026-08); the deposit row is synthetic.
+const SEB_TRANSAKTIONER_CSV =
+  '\uFEFFBokförd;Valutadatum;Text;Typ;Insättningar;Uttag;Bokfört saldo\r\n' +
+  '2026-07-21;2026-07-21;SAN FRANCISC/26-07-20;Kortköp;;-89.44;433217.91\r\n' +
+  '2026-07-18;2026-07-18;KUNDINBETALNING;Insättning;12500.00;;433307.35\r\n'
+
 const SWEDBANK_CSV = [
   'Kontouppgifter',
   'Clearingnummer,Kontonummer,Datum,Text,Belopp,Saldo',
@@ -77,6 +86,34 @@ const HANDELSBANKEN_CSV_WITH_PREL = [
   '2024-01-15;2024-01-15;SPOTIFY AB;-99,00;12345,67',
   '2024-01-14;2024-01-14;Prel kortköp CLAS OHLSON;-199,00;12444,67',
   '2024-01-13;2024-01-13;LÖNEUTBETALNING;25000,00;12643,67',
+].join('\n')
+
+// Real Handelsbanken web exports can prepend account/period metadata rows
+// (and a blank line) before the actual column header.
+const HANDELSBANKEN_CSV_WITH_PREAMBLE = [
+  'Kontonummer;6789 123 456 789',
+  'Kontohavare;Wiklund, Cristel',
+  'Period;2024-01-01 - 2024-01-31',
+  '',
+  'Reskontradatum;Transaktionsdatum;Text;Belopp;Saldo',
+  '2024-01-15;2024-01-15;SPOTIFY AB;-99,00;12345,67',
+  '2024-01-14;2024-01-14;HEMKÖP;-432,50;12444,67',
+  '2024-01-13;2024-01-13;LÖNEUTBETALNING;25000,00;12877,17',
+].join('\n')
+
+// Negative amounts exported with a Unicode minus (U+2212) instead of ASCII '-'.
+const HANDELSBANKEN_CSV_UNICODE_MINUS = [
+  'Reskontradatum;Transaktionsdatum;Text;Belopp;Saldo',
+  '2024-01-15;2024-01-15;SPOTIFY AB;−139,00;12345,67',
+  '2024-01-14;2024-01-14;HEMKÖP;−1 432,50;12444,67',
+  '2024-01-13;2024-01-13;LÖNEUTBETALNING;25000,00;12877,17',
+].join('\n')
+
+// A quoted Text field that itself contains the semicolon delimiter.
+const HANDELSBANKEN_CSV_QUOTED_SEMICOLON = [
+  'Reskontradatum;Transaktionsdatum;Text;Belopp;Saldo',
+  '2024-01-15;2024-01-15;"BETALNING; FAKTURA 100";-99,00;12345,67',
+  '2024-01-14;2024-01-14;HEMKÖP;-432,50;12444,67',
 ].join('\n')
 
 const CAMT053_XML = `<?xml version="1.0" encoding="UTF-8"?>
@@ -171,6 +208,46 @@ const LUNAR_CSV = [
   '2024-01-13,LÖNEUTBETALNING,"25.000,00","12.877,17"',
 ].join('\n')
 
+// Real Lunar export as of 2026: Time and Transaction ID columns, "Title"
+// instead of "Text", SPACE thousands separator, UTF-8 BOM (issue #915).
+const LUNAR_CSV_2026 = '\uFEFF' + [
+  'Date,Time,Title,Amount,Balance,Transaction ID',
+  '2026-06-30,12:11,Incoming payment,"12 345,00","98 764,94",7f0a4c9e-1111-2222-3333-444455556666',
+  '2026-06-12,05:47,Fee,"-1,49","86 419,94",7f0a4c9e-1111-2222-3333-444455557777',
+  '2026-05-12,05:47,Card purchase,"-2 500,00","86 421,43",7f0a4c9e-1111-2222-3333-444455558888',
+].join('\n')
+
+// The same 2026 Lunar export downloaded with the app in Swedish: identical
+// layout, translated headers. "Transaktions-ID" contains the substring
+// "transaktion", which used to make Nordea's substring detector claim the file
+// and parse the Tid column as the description (2026-08-18 report, 117 rows
+// titled "21:30", "08:38").
+const LUNAR_CSV_2026_SV = '\uFEFF' + [
+  'Datum,Tid,Titel,Belopp,Balans,Transaktions-ID,Utländska belopp',
+  '2026-08-15,21:30,Bankgironummer avgift,"-39,00","13 034,28",3464e5f2-aaaa-bbbb-cccc-111122223333,',
+  '2026-08-15,08:38,Lunar Plan Essential,"-119,00","13 073,28",3464e5f2-aaaa-bbbb-cccc-444455556666,',
+  '2026-08-13,20:12,STRIPE Shopi,"-5 058,13","13 192,28",3464e5f2-aaaa-bbbb-cccc-777788889999,"-456,30 EUR"',
+].join('\n')
+
+// Northmill exports include a 5-line metadata preamble (Kontonummer, Saldo,
+// Kontohavare, Org. Nr, Period) plus blank lines before the actual transaction
+// header. Negative amounts use Unicode minus (U+2212), not ASCII hyphen.
+const NORTHMILL_CSV = [
+  'Kontonummer,9750-8770139',
+  'Saldo,"251495,41",SEK',
+  'Kontohavare,Arcim Technology AB',
+  'Org. Nr,559538-6219',
+  'Period,2025-10-01,2026-04-07',
+  '',
+  '',
+  '',
+  'Bokföringsdag,Beskrivning,Belopp,Saldo,Valuta',
+  '2026-04-01,Månadsavgift företagspaket april,"\u2212139,00","251495,41",SEK',
+  '2026-01-22,200176580348155,"\u22121000,00","251912,41",SEK',
+  '2025-10-16,092221155575,"400000,00","422005,00",SEK',
+  '2025-10-01,Inbetalning av aktiekapital,"25000,00","25000,00",SEK',
+].join('\n')
+
 const UNKNOWN_CSV = [
   'id,name,value,timestamp',
   '1,Widget A,100,2024-01-15T10:00:00',
@@ -261,7 +338,7 @@ describe('detectFileFormat', () => {
   })
 
   it('does not confuse Nordea Datum variant with Länsförsäkringar (which has Datum + Typ)', () => {
-    // Nordea Format D has Datum without Typ — must not be mistaken for LF
+    // Nordea Format D has Datum without Typ: must not be mistaken for LF
     const format = detectFileFormat(NORDEA_BUSINESS_CSV_VARIANT_C, 'export.csv')
     expect(format!.id).toBe('nordea_business')
   })
@@ -357,6 +434,47 @@ describe('detectFileFormat', () => {
     expect(format!.id).toBe('lunar')
   })
 
+  it('detects a Swedish-header Lunar export as lunar, not nordea', () => {
+    // Regression: Nordea is checked first and matched "transaktion" as a
+    // substring of "Transaktions-ID", so it won and mangled the file.
+    const format = detectFileFormat(LUNAR_CSV_2026_SV, 'transactions.csv')
+    expect(format).not.toBeNull()
+    expect(format!.id).toBe('lunar')
+  })
+
+  it('parses the Swedish Lunar export with Titel as the description', () => {
+    const format = detectFileFormat(LUNAR_CSV_2026_SV, 'transactions.csv')
+    const result = format!.parse(LUNAR_CSV_2026_SV)
+    expect(result.transactions).toHaveLength(3)
+    // The bug put the Tid column here ("21:30").
+    expect(result.transactions[0].description).toBe('Bankgironummer avgift')
+    expect(result.transactions[0].amount).toBe(-39)
+    expect(result.transactions[2].amount).toBe(-5058.13)
+    expect(result.transactions.some((t) => /^\d{1,2}:\d{2}$/.test(t.description))).toBe(false)
+  })
+
+  it('detects the 2026 Lunar CSV header (Title column, BOM) as lunar', () => {
+    const format = detectFileFormat(LUNAR_CSV_2026, 'lunar.csv')
+    expect(format).not.toBeNull()
+    expect(format!.id).toBe('lunar')
+  })
+
+  it('detects Northmill CSV from Kontonummer preamble + transaction header', () => {
+    const format = detectFileFormat(NORTHMILL_CSV, 'Northmill-Account-Statement.csv')
+    expect(format).not.toBeNull()
+    expect(format!.id).toBe('northmill')
+  })
+
+  it('does not detect Northmill on a file that just happens to mention Kontonummer in transactions', () => {
+    const fake = [
+      'Datum,Transaktion,Kategori,Belopp,Saldo',
+      '2024-01-15,Överföring kontonummer 1234,Inkomst,"100,00","1000,00"',
+    ].join('\n')
+    const format = detectFileFormat(fake, 'test.csv')
+    // Should detect as Nordea, not Northmill: Northmill needs Kontonummer at start of first line
+    expect(format!.id).toBe('nordea')
+  })
+
   it('returns null for unrecognized CSV content', () => {
     const format = detectFileFormat(UNKNOWN_CSV, 'data.csv')
     expect(format).toBeNull()
@@ -384,7 +502,7 @@ describe('detectFileFormat', () => {
   })
 })
 
-describe('parseBankFile — Nordea format', () => {
+describe('parseBankFile: Nordea format', () => {
   it('parses comma-delimited CSV with comma decimal separator', () => {
     const result = parseBankFile(NORDEA_CSV, 'nordea.csv')
 
@@ -461,7 +579,7 @@ describe('parseBankFile — Nordea format', () => {
   })
 })
 
-describe('parseBankFile — Nordea Business format', () => {
+describe('parseBankFile: Nordea Business format', () => {
   it('parses semicolon-delimited CSV with correct columns', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV, 'nordea_ftg.csv')
 
@@ -492,10 +610,10 @@ describe('parseBankFile — Nordea Business format', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV, 'nordea_ftg.csv')
 
     const spotify = result.transactions[0]
-    expect(spotify.description).toBe('SPOTIFY AB — Kortköp')
+    expect(spotify.description).toBe('SPOTIFY AB - Kortköp')
 
     const salary = result.transactions[2]
-    expect(salary.description).toBe('ARBETSGIVAREN AB — Löneutbetalning')
+    expect(salary.description).toBe('ARBETSGIVAREN AB - Löneutbetalning')
   })
 
   it('extracts counterparty from Mottagare (expense) or Avsändare (income)', () => {
@@ -559,7 +677,7 @@ describe('parseBankFile — Nordea Business format', () => {
   })
 })
 
-describe('parseBankFile — Nordea Business variant A (Betalare/Mottagare)', () => {
+describe('parseBankFile: Nordea Business variant A (Betalare/Mottagare)', () => {
   it('parses the alternate Nordea Business format with combined party column', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV_VARIANT_A, 'nordea_ftg.csv')
 
@@ -571,8 +689,8 @@ describe('parseBankFile — Nordea Business variant A (Betalare/Mottagare)', () 
   it('builds description from Betalningstyp and Meddelande/Referens', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV_VARIANT_A, 'nordea_ftg.csv')
 
-    expect(result.transactions[0].description).toBe('Kortbetalning — Spotify Premium')
-    expect(result.transactions[2].description).toBe('Inbetalning — Lön jan')
+    expect(result.transactions[0].description).toBe('Kortbetalning - Spotify Premium')
+    expect(result.transactions[2].description).toBe('Inbetalning - Lön jan')
   })
 
   it('extracts counterparty from combined Betalare/Mottagare column', () => {
@@ -591,7 +709,7 @@ describe('parseBankFile — Nordea Business variant A (Betalare/Mottagare)', () 
   })
 })
 
-describe('parseBankFile — Nordea Business variant B (Bokföringsdatum)', () => {
+describe('parseBankFile: Nordea Business variant B (Bokföringsdatum)', () => {
   it('parses the simple Nordea Business format with Bokföringsdatum', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV_VARIANT_B, 'nordea_ftg.csv')
 
@@ -624,7 +742,7 @@ describe('parseBankFile — Nordea Business variant B (Bokföringsdatum)', () =>
   })
 })
 
-describe('parseBankFile — Nordea Business variant C (Datum + YYYY/MM/DD)', () => {
+describe('parseBankFile: Nordea Business variant C (Datum + YYYY/MM/DD)', () => {
   it('parses the Nordea format with Datum header and slash dates', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV_VARIANT_C, 'nordea_ftg.csv')
 
@@ -680,7 +798,7 @@ describe('parseBankFile — Nordea Business variant C (Datum + YYYY/MM/DD)', () 
   })
 })
 
-describe('parseBankFile — SEB format', () => {
+describe('parseBankFile: SEB format', () => {
   it('parses semicolon-delimited CSV with comma decimal separator', () => {
     const result = parseBankFile(SEB_CSV, 'seb.csv')
 
@@ -746,9 +864,65 @@ describe('parseBankFile — SEB format', () => {
     const deposit = result.transactions[2]
     expect(deposit.amount).toBe(433.16)
   })
+
+  it('auto-detects the SEB Transaktioner layout (Bokförd + Insättningar/Uttag)', () => {
+    const format = detectFileFormat(SEB_TRANSAKTIONER_CSV, 'transaktioner.csv')
+    expect(format).not.toBeNull()
+    expect(format!.id).toBe('seb')
+  })
+
+  it('parses the Transaktioner layout: BOM, CRLF, dot decimals, split amount columns', () => {
+    const result = parseBankFile(SEB_TRANSAKTIONER_CSV, 'transaktioner.csv')
+
+    expect(result.format).toBe('seb')
+    expect(result.transactions).toHaveLength(2)
+    expect(result.issues).toHaveLength(0)
+
+    const cardPurchase = result.transactions[0]
+    expect(cardPurchase.date).toBe('2026-07-21')
+    expect(cardPurchase.description).toBe('SAN FRANCISC/26-07-20')
+    expect(cardPurchase.amount).toBe(-89.44)
+    expect(cardPurchase.balance).toBe(433217.91)
+
+    const deposit = result.transactions[1]
+    expect(deposit.date).toBe('2026-07-18')
+    expect(deposit.amount).toBe(12500)
+    expect(deposit.balance).toBe(433307.35)
+  })
+
+  it('parses the Transaktioner layout natively on an explicit SEB choice (no fallback)', () => {
+    const result = parseBankFile(SEB_TRANSAKTIONER_CSV, 'transaktioner.csv', 'seb')
+
+    expect(result.format).toBe('seb')
+    expect(result.transactions).toHaveLength(2)
+    // Native parse: no "another format was used instead" info issue.
+    expect(result.issues).toHaveLength(0)
+  })
+
+  it('normalizes an unsigned Uttag magnitude to an expense', () => {
+    const unsignedWithdrawal =
+      'Bokförd;Valutadatum;Text;Typ;Insättningar;Uttag;Bokfört saldo\n' +
+      '2026-07-21;2026-07-21;BANKAVGIFT;Avgift;;120.00;1000.00'
+    const result = parseBankFile(unsignedWithdrawal, 'transaktioner.csv', 'seb')
+
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].amount).toBe(-120)
+  })
+
+  it('skips a Transaktioner row where both Insättningar and Uttag are empty', () => {
+    const emptyAmounts =
+      'Bokförd;Valutadatum;Text;Typ;Insättningar;Uttag;Bokfört saldo\n' +
+      '2026-07-21;2026-07-21;SPÄRRAD RAD;Info;;;1000.00\n' +
+      '2026-07-20;2026-07-20;KORTKÖP;Kortköp;;-50.00;950.00'
+    const result = parseBankFile(emptyAmounts, 'transaktioner.csv', 'seb')
+
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].amount).toBe(-50)
+    expect(result.stats.skipped_rows).toBe(1)
+  })
 })
 
-describe('parseBankFile — Swedbank format', () => {
+describe('parseBankFile: Swedbank format', () => {
   it('parses comma-delimited CSV with PERIOD decimal separator', () => {
     const result = parseBankFile(SWEDBANK_CSV, 'swedbank.csv')
 
@@ -796,7 +970,7 @@ describe('parseBankFile — Swedbank format', () => {
   })
 })
 
-describe('parseBankFile — Handelsbanken format', () => {
+describe('parseBankFile: Handelsbanken format', () => {
   it('parses semicolon-delimited CSV with comma decimal separator', () => {
     const result = parseBankFile(HANDELSBANKEN_CSV, 'handelsbanken.csv')
 
@@ -824,27 +998,84 @@ describe('parseBankFile — Handelsbanken format', () => {
     expect(descriptions).not.toContain(expect.stringContaining('Prel'))
   })
 
-  it('prefers transaktionsdatum over reskontradatum when both are present', () => {
-    // Handelsbanken has both columns; transaktionsdatum should be used
+  it('uses reskontradatum when both date columns are present', () => {
+    // Handelsbanken has both columns; reskontradatum (booking date) should be used
     const result = parseBankFile(HANDELSBANKEN_CSV, 'handelsbanken.csv')
 
     // In our test data both dates are the same, but verify it selects dates properly
     expect(result.transactions[0].date).toBe('2024-01-15')
   })
 
-  it('uses transaktionsdatum as the primary date field', () => {
-    // Create data where reskontradatum differs from transaktionsdatum
+  it('uses reskontradatum (booking date), not transaktionsdatum, as the primary date field', () => {
+    // A card purchase booked two days after the swipe: the PSD2 / Enable Banking
+    // feed delivers this row on its booking_date (the 16th). Emitting the
+    // transaktionsdatum here would put the same affärshändelse in a different
+    // exact-date content-dedup bucket and insert it twice.
     const diffDates = [
       'Reskontradatum;Transaktionsdatum;Text;Belopp;Saldo',
-      '2024-01-16;2024-01-15;PURCHASE;-100,00;5000,00',
+      '2026-03-16;2026-03-14;KORTKÖP CLAS OHLSON;-100,00;5000,00',
     ].join('\n')
 
     const result = parseBankFile(diffDates, 'shb.csv')
-    expect(result.transactions[0].date).toBe('2024-01-15')
+    expect(result.transactions[0].date).toBe('2026-03-16')
+  })
+
+  it('falls back to transaktionsdatum when reskontradatum is absent', () => {
+    const txOnly = [
+      'Transaktionsdatum;Text;Belopp;Saldo',
+      '2026-03-14;KORTKÖP CLAS OHLSON;-100,00;5000,00',
+    ].join('\n')
+
+    const result = parseBankFile(txOnly, 'shb.csv')
+    expect(result.format).toBe('handelsbanken')
+    expect(result.transactions).toHaveLength(1)
+    expect(result.issues).toHaveLength(0)
+    expect(result.transactions[0].date).toBe('2026-03-14')
+  })
+
+  it('detects Handelsbanken CSV when a metadata preamble precedes the header', () => {
+    const format = detectFileFormat(HANDELSBANKEN_CSV_WITH_PREAMBLE, 'kontoutdrag.csv')
+    expect(format).not.toBeNull()
+    expect(format!.id).toBe('handelsbanken')
+  })
+
+  it('skips the metadata preamble rows and parses the transactions', () => {
+    const result = parseBankFile(HANDELSBANKEN_CSV_WITH_PREAMBLE, 'kontoutdrag.csv')
+
+    expect(result.format).toBe('handelsbanken')
+    expect(result.transactions).toHaveLength(3)
+    expect(result.issues).toHaveLength(0)
+    expect(result.stats.skipped_rows).toBe(0)
+
+    const descriptions = result.transactions.map((t) => t.description)
+    expect(descriptions).not.toContain('Kontonummer')
+    expect(result.transactions[0].description).toBe('SPOTIFY AB')
+    expect(result.transactions[2].amount).toBe(25000)
+  })
+
+  it('parses negative amounts that use a Unicode minus (U+2212) instead of dropping them', () => {
+    const result = parseBankFile(HANDELSBANKEN_CSV_UNICODE_MINUS, 'shb.csv')
+
+    expect(result.transactions).toHaveLength(3)
+    expect(result.issues).toHaveLength(0)
+    expect(result.stats.skipped_rows).toBe(0)
+    expect(result.transactions[0].amount).toBe(-139)
+    expect(result.transactions[1].amount).toBe(-1432.5)
+    expect(result.transactions[2].amount).toBe(25000)
+  })
+
+  it('handles a quoted Text field that contains the semicolon delimiter', () => {
+    const result = parseBankFile(HANDELSBANKEN_CSV_QUOTED_SEMICOLON, 'shb.csv')
+
+    expect(result.transactions).toHaveLength(2)
+    expect(result.issues).toHaveLength(0)
+    expect(result.transactions[0].description).toBe('BETALNING; FAKTURA 100')
+    expect(result.transactions[0].amount).toBe(-99)
+    expect(result.transactions[1].amount).toBe(-432.5)
   })
 })
 
-describe('parseBankFile — Länsförsäkringar format', () => {
+describe('parseBankFile: Länsförsäkringar format', () => {
   it('parses semicolon-delimited CSV with quoted fields and comma decimal separator', () => {
     const result = parseBankFile(LANSFORSAKRINGAR_CSV, 'lf.csv')
 
@@ -894,9 +1125,41 @@ describe('parseBankFile — Länsförsäkringar format', () => {
     expect(result.date_from).toBe('2024-01-13')
     expect(result.date_to).toBe('2024-01-15')
   })
+
+  it('uses Bokföringsdag (booking date), not Datum, when the two differ', () => {
+    // Same rationale as Handelsbanken: the PSD2 feed keys the row on its
+    // booking_date, so the CSV must emit the same date or the affärshändelse
+    // lands in two different exact-date dedup buckets and inserts twice.
+    const diffDates = [
+      '"Datum";"Bokföringsdag";"Typ";"Text";"Belopp";"Saldo"',
+      '"2026-03-14";"2026-03-16";"Kortköp";"CLAS OHLSON";"-100,00";"5 000,00"',
+    ].join('\n')
+
+    const result = parseBankFile(diffDates, 'lf.csv')
+    expect(result.format).toBe('lansforsakringar')
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].date).toBe('2026-03-16')
+  })
+
+  it('uses the Bokföringsdag column position on header-less files', () => {
+    // The header-less layout is pinned by isLFRow (two adjacent dates, comma
+    // number in field 4), so field 1 is Bokföringsdag. Header-ful and
+    // header-less exports of the same account must agree on the date, or the
+    // two upload paths duplicate each other.
+    const noHeaderDiffDates = [
+      '"2026-03-14";"2026-03-16";"Kortköp";"CLAS OHLSON";"-100,00";"5 000,00"',
+      '"2026-03-11";"2026-03-12";"Kortköp";"ICA MAXI";"-432,50";"5 100,00"',
+    ].join('\n')
+
+    const result = parseBankFile(noHeaderDiffDates, 'lf.csv')
+    expect(result.format).toBe('lansforsakringar')
+    expect(result.transactions).toHaveLength(2)
+    expect(result.transactions[0].date).toBe('2026-03-16')
+    expect(result.transactions[1].date).toBe('2026-03-12')
+  })
 })
 
-describe('parseBankFile — ICA Banken format', () => {
+describe('parseBankFile: ICA Banken format', () => {
   it('parses semicolon-delimited CSV with metadata rows before header', () => {
     const result = parseBankFile(ICA_BANKEN_CSV, 'ica.csv')
 
@@ -948,7 +1211,7 @@ describe('parseBankFile — ICA Banken format', () => {
   })
 })
 
-describe('parseBankFile — Skandia format', () => {
+describe('parseBankFile: Skandia format', () => {
   it('parses semicolon-delimited CSV with comma decimal separator', () => {
     const result = parseBankFile(SKANDIA_CSV, 'skandia.csv')
 
@@ -1001,7 +1264,7 @@ describe('parseBankFile — Skandia format', () => {
   })
 })
 
-describe('parseBankFile — Lunar format', () => {
+describe('parseBankFile: Lunar format', () => {
   it('parses comma-delimited CSV with English headers', () => {
     const result = parseBankFile(LUNAR_CSV, 'lunar.csv')
 
@@ -1052,9 +1315,158 @@ describe('parseBankFile — Lunar format', () => {
     expect(nordeaResult!.id).toBe('nordea')
     expect(lunarResult!.id).toBe('lunar')
   })
+
+  // Regression tests for issue #915: the real 2026 Lunar export uses a SPACE
+  // thousands separator ("12 345,00") and a "Title" column instead of "Text".
+  it('parses 2026 Lunar amounts with space thousands separator without truncation', () => {
+    const result = parseBankFile(LUNAR_CSV_2026, 'lunar.csv')
+
+    expect(result.format).toBe('lunar')
+    expect(result.transactions).toHaveLength(3)
+    expect(result.issues).toHaveLength(0)
+
+    expect(result.transactions[0].amount).toBe(12345)
+    expect(result.transactions[1].amount).toBe(-1.49)
+    expect(result.transactions[2].amount).toBe(-2500)
+  })
+
+  it('parses 2026 Lunar balance with space thousands separator', () => {
+    const result = parseBankFile(LUNAR_CSV_2026, 'lunar.csv')
+
+    expect(result.transactions[0].balance).toBe(98764.94)
+    expect(result.transactions[1].balance).toBe(86419.94)
+    expect(result.transactions[2].balance).toBe(86421.43)
+  })
+
+  it('takes the description from the Title column in the 2026 format', () => {
+    const result = parseBankFile(LUNAR_CSV_2026, 'lunar.csv')
+
+    expect(result.transactions[0].description).toBe('Incoming payment')
+    expect(result.transactions[1].description).toBe('Fee')
+    expect(result.transactions[2].description).toBe('Card purchase')
+  })
+
+  it('calculates 2026 format stats and date range correctly', () => {
+    const result = parseBankFile(LUNAR_CSV_2026, 'lunar.csv')
+
+    expect(result.stats.total_income).toBe(12345)
+    expect(result.stats.total_expenses).toBe(-2501.49)
+    expect(result.stats.parsed_rows).toBe(3)
+    expect(result.date_from).toBe('2026-05-12')
+    expect(result.date_to).toBe('2026-06-30')
+  })
+
+  // Issue #1671: the same 2026 header set delimited by semicolon or tab (a
+  // spreadsheet re-save, a localized copy) used to fall through to the manual
+  // mapping flow, where Time was picked as the description. The detector now
+  // sniffs the delimiter, so the dedicated parser handles these files.
+  const LUNAR_CSV_2026_SEMICOLON = [
+    'Date;Time;Title;Amount;Balance;Transaction ID',
+    '2026-06-30;12:11;Incoming payment;12 345,00;98 764,94;7f0a4c9e-1111-2222-3333-444455556666',
+    '2026-06-12;05:47;Fee;-1,49;86 419,94;7f0a4c9e-1111-2222-3333-444455557777',
+    '2026-05-12;05:47;Card purchase;"-2 500,00";"86 421,43";7f0a4c9e-1111-2222-3333-444455558888',
+  ].join('\n')
+
+  const LUNAR_CSV_2026_TAB = '\uFEFF' + [
+    'Date\tTime\tTitle\tAmount\tBalance\tTransaction ID',
+    '2026-06-30\t12:11\tIncoming payment\t12 345,00\t98 764,94\t7f0a4c9e-1111-2222-3333-444455556666',
+    '2026-06-12\t05:47\tFee\t-1,49\t86 419,94\t7f0a4c9e-1111-2222-3333-444455557777',
+  ].join('\n')
+
+  it('REGRESSION (#1671): detects and parses a semicolon-delimited 2026 Lunar export', () => {
+    expect(detectFileFormat(LUNAR_CSV_2026_SEMICOLON, 'lunar.csv')!.id).toBe('lunar')
+
+    const result = parseBankFile(LUNAR_CSV_2026_SEMICOLON, 'lunar.csv')
+    expect(result.format).toBe('lunar')
+    expect(result.transactions).toHaveLength(3)
+    expect(result.issues).toHaveLength(0)
+    expect(result.transactions.map((t) => t.description)).toEqual(['Incoming payment', 'Fee', 'Card purchase'])
+    expect(result.transactions.map((t) => t.amount)).toEqual([12345, -1.49, -2500])
+    expect(result.transactions[2].balance).toBe(86421.43)
+    expect(result.transactions[0].date).toBe('2026-06-30')
+  })
+
+  it('REGRESSION (#1671): detects and parses a tab-delimited 2026 Lunar export', () => {
+    expect(detectFileFormat(LUNAR_CSV_2026_TAB, 'lunar.csv')!.id).toBe('lunar')
+
+    const result = parseBankFile(LUNAR_CSV_2026_TAB, 'lunar.csv')
+    expect(result.format).toBe('lunar')
+    expect(result.transactions).toHaveLength(2)
+    expect(result.transactions.map((t) => t.description)).toEqual(['Incoming payment', 'Fee'])
+    expect(result.transactions.map((t) => t.amount)).toEqual([12345, -1.49])
+  })
+
+  it('does not claim a Swedish-header semicolon file or an English file without the Lunar column set', () => {
+    const lunar = getFormat('lunar')!
+    // Swedish labels: not Lunar, whatever the delimiter
+    expect(lunar.detect('Datum;Text;Belopp;Saldo\n2024-01-15;SPOTIFY;-99,00;100,00', 'x.csv')).toBe(false)
+    // "Balance" only as part of another label, no title/text cell: not Lunar
+    expect(lunar.detect('Date,Description,Amount,Running Balance\n2024-01-15,SPOTIFY,-99.00,100.00', 'x.csv')).toBe(false)
+    // Substring hits inside other words are not the Lunar header set
+    expect(lunar.detect('Update,Context,Amounts,Balances\n1,2,3,4', 'x.csv')).toBe(false)
+  })
+
+  it('still parses the legacy Lunar period thousands separator ("1.234,56")', () => {
+    const legacy = [
+      'Date,Text,Amount,Balance',
+      '2024-01-15,PAYMENT,"1.234,56","10.000,00"',
+    ].join('\n')
+    const result = parseBankFile(legacy, 'lunar.csv')
+
+    expect(result.format).toBe('lunar')
+    expect(result.transactions[0].amount).toBe(1234.56)
+    expect(result.transactions[0].balance).toBe(10000)
+  })
 })
 
-describe('parseBankFile — camt.053 XML format', () => {
+describe('parseBankFile: Northmill format', () => {
+  it('skips the 5-line metadata preamble and blank lines, parses transaction rows', () => {
+    const result = parseBankFile(NORTHMILL_CSV, 'Northmill.csv')
+
+    expect(result.format).toBe('northmill')
+    expect(result.format_name).toBe('Northmill')
+    expect(result.transactions).toHaveLength(4)
+    expect(result.issues).toHaveLength(0)
+  })
+
+  it('correctly parses negative amounts that use Unicode minus (U+2212)', () => {
+    const result = parseBankFile(NORTHMILL_CSV, 'Northmill.csv')
+
+    // First transaction is "−139,00" with U+2212: must become -139, not NaN
+    expect(result.transactions[0].amount).toBe(-139)
+    expect(result.transactions[0].description).toBe('Månadsavgift företagspaket april')
+    expect(result.transactions[0].date).toBe('2026-04-01')
+
+    expect(result.transactions[1].amount).toBe(-1000)
+    expect(result.transactions[2].amount).toBe(400000)
+    expect(result.transactions[3].amount).toBe(25000)
+  })
+
+  it('extracts the saldo (running balance) column', () => {
+    const result = parseBankFile(NORTHMILL_CSV, 'Northmill.csv')
+
+    expect(result.transactions[0].balance).toBe(251495.41)
+    expect(result.transactions[3].balance).toBe(25000)
+  })
+
+  it('calculates income vs expenses correctly with Unicode minus amounts', () => {
+    const result = parseBankFile(NORTHMILL_CSV, 'Northmill.csv')
+
+    expect(result.stats.total_income).toBe(425000)
+    expect(result.stats.total_expenses).toBe(-1139)
+    expect(result.stats.parsed_rows).toBe(4)
+    expect(result.stats.skipped_rows).toBe(0)
+  })
+
+  it('extracts the correct date range from the transactions, not the Period metadata row', () => {
+    const result = parseBankFile(NORTHMILL_CSV, 'Northmill.csv')
+
+    expect(result.date_from).toBe('2025-10-01')
+    expect(result.date_to).toBe('2026-04-01')
+  })
+})
+
+describe('parseBankFile: camt.053 XML format', () => {
   it('parses XML with credit and debit entries', () => {
     const result = parseBankFile(CAMT053_XML, 'statement.xml')
 
@@ -1121,9 +1533,11 @@ describe('parseBankFile — camt.053 XML format', () => {
   })
 })
 
-describe('parseBankFile — explicit format override', () => {
+describe('parseBankFile: explicit format override', () => {
   it('uses the specified format instead of auto-detection', () => {
-    // Force parsing Nordea content as SEB (will produce issues but should use SEB format)
+    // Nordea content forced as SEB: the widened SEB parser handles it via
+    // delimiter sniffing + the bare-Datum tier, and a working explicit parse
+    // is never overridden by the auto-detect fallback.
     const result = parseBankFile(
       'Datum,Transaktion,Kategori,Belopp,Saldo\n2024-01-15,Test,,"-100,00","5000,00"',
       'nordea.csv',
@@ -1131,6 +1545,8 @@ describe('parseBankFile — explicit format override', () => {
     )
 
     expect(result.format).toBe('seb')
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].amount).toBe(-100)
   })
 
   it('returns error for unknown formatId', () => {
@@ -1141,7 +1557,7 @@ describe('parseBankFile — explicit format override', () => {
     expect(result.transactions).toHaveLength(0)
     expect(result.issues).toHaveLength(1)
     expect(result.issues[0].severity).toBe('error')
-    expect(result.issues[0].message).toContain('Unknown format')
+    expect(result.issues[0].message).toContain('Okänt format')
   })
 
   it('returns format detection error when no format matches and no override given', () => {
@@ -1161,6 +1577,131 @@ describe('parseBankFile — explicit format override', () => {
     // generic_csv uses a default mapping (date=0, description=1, amount=2)
     // But the first line is treated as header (skip_rows=1), so only second row is data
     expect(result.format).toBe('generic_csv')
+  })
+})
+
+describe('parseBankFile: explicit format fallback to auto-detection', () => {
+  it('falls back to the detected format when the explicit choice parses 0 transactions', () => {
+    const result = parseBankFile(SWEDBANK_CSV, 'export.csv', 'seb')
+
+    expect(result.format).toBe('swedbank')
+    expect(result.transactions).toHaveLength(3)
+    expect(result.issues[0].severity).toBe('info')
+    expect(result.issues[0].message).toContain('SEB')
+    expect(result.issues[0].message).toContain('Swedbank')
+  })
+
+  it('falls back to Handelsbanken when a Handelsbanken file is forced as SEB', () => {
+    const result = parseBankFile(HANDELSBANKEN_CSV, 'export.csv', 'seb')
+
+    expect(result.format).toBe('handelsbanken')
+    expect(result.transactions).toHaveLength(3)
+    expect(result.issues[0].severity).toBe('info')
+    expect(result.issues[0].message).toContain('Handelsbanken')
+  })
+
+  it('never overrides a working explicit parse even when detection prefers another format', () => {
+    // NORDEA_CSV auto-detects as nordea, but forced-SEB parses it fine via
+    // delimiter sniffing + the bare-Datum tier: the user's choice stands.
+    expect(detectFileFormat(NORDEA_CSV, 'nordea.csv')!.id).toBe('nordea')
+
+    const result = parseBankFile(NORDEA_CSV, 'nordea.csv', 'seb')
+
+    expect(result.format).toBe('seb')
+    expect(result.transactions).toHaveLength(3)
+    expect(result.issues.filter((i) => i.severity === 'info')).toHaveLength(0)
+  })
+
+  it('keeps the explicit error result when no other format can parse the file', () => {
+    const result = parseBankFile(UNKNOWN_CSV, 'unknown.csv', 'seb')
+
+    expect(result.format).toBe('seb')
+    expect(result.transactions).toHaveLength(0)
+    expect(result.issues[0].severity).toBe('error')
+    expect(result.issues[0].message).toContain('Kunde inte identifiera nödvändiga kolumner')
+  })
+
+  it('does not fall back for explicit generic_csv (the manual mapping escape hatch)', () => {
+    // The default generic mapping parses 0 rows of a Nordea file, but the
+    // user chose "Annan CSV" to map columns manually: never reroute them.
+    const result = parseBankFile(NORDEA_CSV, 'nordea.csv', 'generic_csv')
+
+    expect(result.format).toBe('generic_csv')
+  })
+})
+
+describe('parseBankFile: BOM handling', () => {
+  it('auto-detects and parses SEB CSV with a real UTF-8 BOM (U+FEFF)', () => {
+    const content = '\uFEFF' + SEB_CSV
+
+    expect(detectFileFormat(content, 'seb.csv')!.id).toBe('seb')
+
+    const result = parseBankFile(content, 'seb.csv')
+    expect(result.format).toBe('seb')
+    expect(result.transactions).toHaveLength(3)
+  })
+
+  it('auto-detects and parses SEB privat CSV with a mojibake BOM prefix', () => {
+    const content = 'ï»¿' + SEB_PRIVAT_CSV
+
+    expect(detectFileFormat(content, 'kontoutdrag.csv')!.id).toBe('seb')
+
+    const result = parseBankFile(content, 'kontoutdrag.csv')
+    expect(result.format).toBe('seb')
+    expect(result.transactions).toHaveLength(3)
+  })
+
+  it('detects an exact-match Datum header behind a mojibake BOM prefix', () => {
+    // Exact-match header checks (h === 'datum') are the genuinely BOM-fragile
+    // ones: a surviving mojibake prefix used to make this file undetectable.
+    const content = 'ï»¿' + [
+      'Datum;Text;Belopp;Saldo',
+      '2026-01-15;SPOTIFY AB;-99,00;1000,00',
+    ].join('\n')
+
+    const format = detectFileFormat(content, 'export.csv')
+    expect(format).not.toBeNull()
+    expect(format!.id).toBe('nordea_business')
+
+    const result = parseBankFile(content, 'export.csv')
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].amount).toBe(-99)
+  })
+})
+
+describe('parseBankFile: SEB delimiter sniffing and bare-Datum tier', () => {
+  it('parses a comma-delimited SEB-labeled file under explicit seb', () => {
+    const commaSeb = [
+      'Bokföringsdag,Valutadag,Verifikationsnummer,Text,Belopp,Saldo',
+      '2024-01-15,2024-01-15,12345,SPOTIFY AB,"-99,00","12345,67"',
+      '2024-01-14,2024-01-14,12346,HEMKÖP,"-432,50","12444,67"',
+    ].join('\n')
+
+    const result = parseBankFile(commaSeb, 'seb.csv', 'seb')
+
+    expect(result.format).toBe('seb')
+    expect(result.transactions).toHaveLength(2)
+    expect(result.transactions[0].amount).toBe(-99)
+    expect(result.transactions[0].description).toBe('SPOTIFY AB')
+    expect(result.transactions[0].balance).toBe(12345.67)
+  })
+
+  it('parses a bare-Datum layout under explicit seb without claiming it in detect', () => {
+    const bareDatum = [
+      'Datum;Text;Belopp;Saldo',
+      '2026-02-01;SPOTIFY AB;-99,00;1000,00',
+      '2026-02-02;LÖN;25000,00;26000,00',
+    ].join('\n')
+
+    // detect must NOT claim the bare-Datum layout: in auto-detection it
+    // belongs to other profiles (nordea_business format D family).
+    expect(getFormat('seb')!.detect(bareDatum, 'seb.csv')).toBe(false)
+
+    const result = parseBankFile(bareDatum, 'seb.csv', 'seb')
+
+    expect(result.format).toBe('seb')
+    expect(result.transactions).toHaveLength(2)
+    expect(result.transactions[1].amount).toBe(25000)
   })
 })
 
@@ -1605,7 +2146,7 @@ describe('edge cases and robustness', () => {
 
 // --- Fix 5: SEB duplicate condition removal ---
 
-describe('SEB detection — no duplicate conditions', () => {
+describe('SEB detection: no duplicate conditions', () => {
   it('detects SEB with bokföringsdag header', () => {
     const content = 'Bokföringsdag;Valutadag;Text;Belopp;Saldo\n2024-01-15;2024-01-15;Test;-100,00;5000,00'
     const format = detectFileFormat(content, 'seb.csv')
@@ -1623,7 +2164,7 @@ describe('SEB detection — no duplicate conditions', () => {
 
 // --- Fix 6: Länsförsäkringar false positive prevention ---
 
-describe('Länsförsäkringar detection — false positive prevention', () => {
+describe('Länsförsäkringar detection: false positive prevention', () => {
   it('detects valid LF data rows with comma-decimal amounts', () => {
     const format = detectFileFormat(LANSFORSAKRINGAR_CSV, 'lf.csv')
     expect(format).not.toBeNull()
@@ -1650,7 +2191,7 @@ describe('Länsförsäkringar detection — false positive prevention', () => {
 
 // --- Fix 7: Generic CSV column bounds checking ---
 
-describe('parseGenericCSV — column bounds checking', () => {
+describe('parseGenericCSV: column bounds checking', () => {
   it('skips rows with too few columns and adds warning', () => {
     const content = [
       'Date,Description,Amount',
@@ -1716,11 +2257,85 @@ describe('parseGenericCSV — column bounds checking', () => {
     expect(result.stats.skipped_rows).toBe(0)
     expect(result.issues).toHaveLength(0)
   })
+
+  it('parses amounts that use Unicode minus (U+2212): was NaN before normalization', () => {
+    const content = [
+      'Date,Description,Amount',
+      '2024-01-15,SPOTIFY,"\u221299,00"',
+      '2024-01-16,REFUND,"\u201350,00"',
+      '2024-01-17,SALARY,"25000,00"',
+    ].join('\n')
+
+    const result = parseGenericCSV(content, {
+      date: 0,
+      description: 1,
+      amount: 2,
+      delimiter: ',',
+      decimal_separator: ',',
+      skip_rows: 1,
+      date_format: 'YYYY-MM-DD',
+    })
+
+    expect(result.transactions).toHaveLength(3)
+    expect(result.transactions[0].amount).toBe(-99)
+    expect(result.transactions[1].amount).toBe(-50)
+    expect(result.transactions[2].amount).toBe(25000)
+  })
+
+  it('skips metadata rows when skip_rows is set higher than 1 (multi-row preamble)', () => {
+    // Mimics a file with 5 metadata rows + header + 2 transactions.
+    const content = [
+      'Account,12345',
+      'Owner,Acme AB',
+      'Period,2024-01,2024-12',
+      'Currency,SEK',
+      'Type,Statement',
+      'Date,Description,Amount',
+      '2024-01-15,SPOTIFY,-99.00',
+      '2024-01-16,SALARY,25000.00',
+    ].join('\n')
+
+    const result = parseGenericCSV(content, {
+      date: 0,
+      description: 1,
+      amount: 2,
+      delimiter: ',',
+      decimal_separator: '.',
+      skip_rows: 6,
+      date_format: 'YYYY-MM-DD',
+    })
+
+    expect(result.transactions).toHaveLength(2)
+    expect(result.transactions[0].amount).toBe(-99)
+    expect(result.transactions[1].amount).toBe(25000)
+    expect(result.issues).toHaveLength(0)
+  })
+})
+
+describe('normalizeMinusSign', () => {
+  it('replaces U+2212 (minus sign) with ASCII hyphen', () => {
+    expect(normalizeMinusSign('\u2212139,00')).toBe('-139,00')
+  })
+
+  it('replaces U+2013 (en dash) and U+2014 (em dash) with ASCII hyphen', () => {
+    expect(normalizeMinusSign('\u2013100')).toBe('-100')
+    expect(normalizeMinusSign('\u2014250')).toBe('-250')
+  })
+
+  it('leaves ASCII hyphen and digits untouched', () => {
+    expect(normalizeMinusSign('-139.00')).toBe('-139.00')
+    expect(normalizeMinusSign('139.00')).toBe('139.00')
+  })
+
+  it('makes parseFloat work on Unicode-minus strings (regression for Northmill)', () => {
+    expect(parseFloat('\u2212139.00')).toBeNaN()
+    expect(parseFloat(normalizeMinusSign('\u2212139.00'))).toBe(-139)
+  })
 })
 
 // --- Fix 8: parseCSVLine unclosed quote handling ---
 
-describe('parseCSVLine — unclosed quote handling', () => {
+describe('parseCSVLine: unclosed quote handling', () => {
   it('handles normal quoted fields correctly', () => {
     const fields = parseCSVLine('"hello","world"', ',')
     expect(fields).toEqual(['hello', 'world'])
@@ -1751,5 +2366,438 @@ describe('parseCSVLine — unclosed quote handling', () => {
   it('handles semicolon delimiter with quotes', () => {
     const fields = parseCSVLine('"2024-01-15";"SPOTIFY AB";"-99,00"', ';')
     expect(fields).toEqual(['2024-01-15', 'SPOTIFY AB', '-99,00'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Wise (TransferWise) multi-currency transaction history
+// ---------------------------------------------------------------------------
+
+const WISE_HEADER =
+  'ID,Status,Direction,"Created on","Finished on","Source fee amount","Source fee currency","Target fee amount","Target fee currency","Source name","Source amount (after fees)","Source currency","Target name","Target amount (after fees)","Target currency","Exchange rate",Reference,Batch,"Created by",Category,Note'
+
+const WISE_CSV = [
+  WISE_HEADER,
+  'TRANSFER-2247230173,COMPLETED,IN,"2026-07-13 13:39:01","2026-07-13 13:39:08",,,,,"Bluedot Impact Ltd",2500.0,USD,"Aligned Intelligence AB",2500.0,USD,1,Facilitation,,,"Money added",',
+  'TRANSFER-2214309703,COMPLETED,IN,"2026-06-26 20:53:33","2026-06-26 20:54:14",2.20,SEK,,,"Aligned Intelligence AB",200.0,SEK,"Aligned Intelligence AB",200.0,SEK,1.0,,,"Peter Alexander Reinthal","Money added",',
+  'PLAN_ORDER-28688820,COMPLETED,OUT,"2026-06-24 06:13:45","2026-06-24 06:41:51",,,,,,520.00,SEK,TransferWise,520.00,SEK,1.00000000,28688820,,"Peter Alexander Reinthal",General,',
+  'TRANSFER-2208605608,COMPLETED,IN,"2026-06-24 06:13:45","2026-06-24 06:41:50",0.00,SEK,,,"Aligned Intelligence AB",520.0,SEK,"Aligned Intelligence AB",520.0,SEK,1.0,invoice-28688820,,"Peter Alexander Reinthal","Money added",',
+].join('\n')
+
+describe('Wise format', () => {
+  it('auto-detects the Wise header', () => {
+    const format = detectFileFormat(WISE_CSV, 'transactionhistory.csv')
+    expect(format?.id).toBe('wise')
+  })
+
+  const byId = (txs: ParsedBankTransaction[], id: string) => txs.find((t) => t.raw_line === id)
+
+  it('signs IN as income and OUT as expense, on the moved-side currency', () => {
+    const result = parseBankFile(WISE_CSV, 'wise.csv')
+    expect(result.format).toBe('wise')
+
+    const usdIn = byId(result.transactions, 'TRANSFER-2247230173')
+    expect(usdIn).toMatchObject({ amount: 2500, currency: 'USD', date: '2026-07-13' })
+
+    const sekOut = byId(result.transactions, 'PLAN_ORDER-28688820')
+    expect(sekOut).toMatchObject({ amount: -520, currency: 'SEK', date: '2026-06-24' })
+    expect(sekOut?.counterparty).toBe('TransferWise')
+  })
+
+  it('emits a non-zero fee as its own negative "Wise avgift" row', () => {
+    const result = parseBankFile(WISE_CSV, 'wise.csv')
+    const fee = byId(result.transactions, 'TRANSFER-2214309703-fee')
+    expect(fee).toBeDefined()
+    expect(fee?.amount).toBe(-2.2)
+    expect(fee?.currency).toBe('SEK')
+    expect(fee?.description).toMatch(/^Wise avgift/)
+
+    // A 0.00 fee produces no extra row.
+    expect(byId(result.transactions, 'TRANSFER-2208605608-fee')).toBeUndefined()
+    // 4 movements + 1 fee row.
+    expect(result.transactions).toHaveLength(5)
+  })
+
+  it('keys external_id on the stable Wise ID, including fee rows', () => {
+    const result = parseBankFile(WISE_CSV, 'wise.csv')
+    const main = byId(result.transactions, 'TRANSFER-2247230173')!
+    const fee = byId(result.transactions, 'TRANSFER-2214309703-fee')!
+    expect(generateExternalId(main, 'wise', 0)).toBe('wise_TRANSFER-2247230173')
+    expect(generateExternalId(fee, 'wise', 1)).toBe('wise_TRANSFER-2214309703-fee')
+  })
+
+  it('skips rows that are not COMPLETED', () => {
+    const withCancelled = [
+      WISE_HEADER,
+      'TRANSFER-9,CANCELLED,IN,"2026-06-01 10:00:00","2026-06-01 10:00:00",,,,,"X",100.0,SEK,"Y",100.0,SEK,1,,,,General,',
+      'TRANSFER-2247230173,COMPLETED,IN,"2026-07-13 13:39:01","2026-07-13 13:39:08",,,,,"Bluedot Impact Ltd",2500.0,USD,"Aligned Intelligence AB",2500.0,USD,1,Facilitation,,,"Money added",',
+    ].join('\n')
+    const result = parseBankFile(withCancelled, 'wise.csv')
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].raw_line).toBe('TRANSFER-2247230173')
+    expect(result.stats.skipped_rows).toBe(1)
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        severity: 'warning',
+        message: expect.stringMatching(/unsupported status "CANCELLED"/),
+      }),
+    )
+  })
+})
+
+describe('Wise format hardening', () => {
+  const row = (over: Partial<Record<string, string>> = {}) => {
+    const f: Record<string, string> = {
+      id: 'TRANSFER-1', status: 'COMPLETED', direction: 'IN',
+      created: '2026-06-01 10:00:00', finished: '2026-06-01 10:00:00',
+      sfeeA: '', sfeeC: '', tfeeA: '', tfeeC: '',
+      sname: 'X', samt: '100.0', scur: 'SEK', tname: 'Y', tamt: '100.0', tcur: 'SEK',
+      rate: '1', ref: '', batch: '', by: '', cat: 'General', note: '', ...over,
+    }
+    return [
+      f.id, f.status, f.direction, `"${f.created}"`, `"${f.finished}"`,
+      f.sfeeA, f.sfeeC, f.tfeeA, f.tfeeC, `"${f.sname}"`, f.samt, f.scur,
+      `"${f.tname}"`, f.tamt, f.tcur, f.rate, f.ref, f.batch, `"${f.by}"`, f.cat, f.note,
+    ].join(',')
+  }
+
+  it('skips and surfaces an unsupported Direction without aborting valid rows', () => {
+    const csv = [
+      WISE_HEADER,
+      row({ id: 'PLAN_ORDER-9', direction: 'NEUTRAL', scur: 'USD', tcur: 'SEK' }),
+      row({ id: 'TRANSFER-2' }),
+    ].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].raw_line).toBe('TRANSFER-2')
+    expect(result.stats.skipped_rows).toBe(1)
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        severity: 'error',
+        message: expect.stringMatching(/unsupported Direction "NEUTRAL"/),
+      }),
+    )
+  })
+
+  it('skips and surfaces a cross-currency row instead of importing one side', () => {
+    const csv = [
+      WISE_HEADER,
+      row({ id: 'TRANSFER-FX', direction: 'OUT', samt: '100', scur: 'USD', tamt: '900', tcur: 'SEK' }),
+    ].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+
+    expect(result.transactions).toHaveLength(0)
+    expect(result.stats.skipped_rows).toBe(1)
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        severity: 'error',
+        message: expect.stringMatching(/Cross-currency Wise row TRANSFER-FX \(USD to SEK\)/),
+      }),
+    )
+  })
+
+  it('surfaces a REFUNDED row instead of silently dropping it', () => {
+    const csv = [WISE_HEADER, row({ id: 'TRANSFER-REFUND', status: 'REFUNDED' })].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+
+    expect(result.transactions).toHaveLength(0)
+    expect(result.stats.skipped_rows).toBe(1)
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        severity: 'error',
+        message: expect.stringMatching(/unsupported status "REFUNDED"/),
+      }),
+    )
+  })
+
+  it('does not import a row with a blank status', () => {
+    const csv = [WISE_HEADER, row({ status: '' })].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+    expect(result.transactions).toHaveLength(0)
+    expect(result.stats.skipped_rows).toBe(1)
+    expect(result.issues[0].severity).toBe('error')
+  })
+
+  it('rejects a partially numeric amount instead of coercing it', () => {
+    const csv = [WISE_HEADER, row({ samt: '12abc', tamt: '12abc' })].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+    expect(result.transactions).toHaveLength(0)
+    expect(result.issues.some((iss) => /Invalid amount/.test(iss.message))).toBe(true)
+  })
+
+  it('skips a row with no movement currency rather than defaulting to SEK', () => {
+    const csv = [WISE_HEADER, row({ direction: 'IN', tcur: '' })].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+    expect(result.transactions).toHaveLength(0)
+    expect(result.issues.some((iss) => /Missing\/invalid currency/.test(iss.message))).toBe(true)
+  })
+
+  it('does not inherit the movement currency for a fee with no currency', () => {
+    const csv = [WISE_HEADER, row({ sfeeA: '2.20', sfeeC: '' })].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+    // Main row still imports; the fee is dropped with a warning, not booked in SEK.
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].raw_line).toBe('TRANSFER-1')
+    expect(result.issues.some((iss) => /no currency/.test(iss.message))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Wise per-currency balance statement
+// ---------------------------------------------------------------------------
+
+const WISE_STATEMENT_HEADER =
+  '"TransferWise ID",Date,Amount,Currency,Description,"Payment Reference","Running Balance","Exchange From","Exchange To","Exchange Rate","Payer Name","Payee Name","Payee Account Number",Merchant,"Card Last Four Digits","Card Holder Full Name",Attachment,Note,"Total fees"'
+
+function wiseStatementRow(over: Partial<Record<string, string>> = {}): string {
+  const fields: Record<string, string> = {
+    id: 'TRANSFER-100',
+    date: '01/08/2026',
+    amount: '1250.50',
+    currency: 'SEK',
+    description: 'Received money from Example AB',
+    reference: 'INV-100',
+    balance: '5000.50',
+    exchangeFrom: '',
+    exchangeTo: '',
+    exchangeRate: '',
+    payerName: 'Example AB',
+    payeeName: '',
+    payeeAccount: '',
+    merchant: '',
+    cardLastFour: '',
+    cardHolder: '',
+    attachment: '',
+    note: '',
+    totalFees: '0',
+    ...over,
+  }
+  return [
+    fields.id,
+    fields.date,
+    fields.amount,
+    fields.currency,
+    fields.description,
+    fields.reference,
+    fields.balance,
+    fields.exchangeFrom,
+    fields.exchangeTo,
+    fields.exchangeRate,
+    fields.payerName,
+    fields.payeeName,
+    fields.payeeAccount,
+    fields.merchant,
+    fields.cardLastFour,
+    fields.cardHolder,
+    fields.attachment,
+    fields.note,
+    fields.totalFees,
+  ].join(',')
+}
+
+const WISE_STATEMENT_CSV = [
+  WISE_STATEMENT_HEADER,
+  wiseStatementRow(),
+  wiseStatementRow({
+    id: 'CARD-200',
+    date: '02-08-2026',
+    amount: '-49.90',
+    description: '',
+    reference: '',
+    balance: '4950.60',
+    payerName: '',
+    merchant: 'Corner Shop',
+    note: 'Lunch',
+  }),
+  wiseStatementRow({
+    id: 'FEE-TRANSFER-300',
+    date: '03.08.2026',
+    amount: '-2.20',
+    description: 'Wise Charges for: TRANSFER-300',
+    reference: '',
+    balance: '4948.40',
+    payerName: '',
+    payeeName: 'Wise',
+  }),
+  wiseStatementRow({
+    id: 'TRANSFER-300',
+    date: '2026-08-04',
+    amount: '-100',
+    description: 'Sent money to Supplier AB',
+    reference: 'BILL-300',
+    balance: '4848.40',
+    payerName: '',
+    payeeName: 'Supplier AB',
+    totalFees: '0.35',
+  }),
+].join('\n')
+
+describe('Wise balance statement format', () => {
+  const byId = (transactions: ParsedBankTransaction[], id: string) =>
+    transactions.find((transaction) => transaction.raw_line === id)
+
+  it('auto-detects the distinct balance statement header', () => {
+    const format = detectFileFormat(WISE_STATEMENT_CSV, 'statement_123_SEK_2026.csv')
+    expect(format?.id).toBe('wise_statement')
+  })
+
+  it('parses signed movements, balances, counterparties, notes, and date variants', () => {
+    const result = parseBankFile(WISE_STATEMENT_CSV, 'statement_123_SEK_2026.csv')
+
+    expect(result.format).toBe('wise_statement')
+    expect(result.transactions).toHaveLength(4)
+    expect(byId(result.transactions, 'TRANSFER-100')).toMatchObject({
+      date: '2026-08-01',
+      amount: 1250.5,
+      currency: 'SEK',
+      balance: 5000.5,
+      reference: 'INV-100',
+      counterparty: 'Example AB',
+    })
+    expect(byId(result.transactions, 'CARD-200')).toMatchObject({
+      date: '2026-08-02',
+      amount: -49.9,
+      description: 'Corner Shop - Lunch',
+      counterparty: 'Corner Shop',
+    })
+    expect(byId(result.transactions, 'FEE-TRANSFER-300')).toMatchObject({
+      date: '2026-08-03',
+      amount: -2.2,
+      counterparty: 'Wise',
+    })
+    expect(byId(result.transactions, 'TRANSFER-300')?.description).toContain(
+      'Wise avgift: 0.35 SEK',
+    )
+    expect(result.date_from).toBe('2026-08-01')
+    expect(result.date_to).toBe('2026-08-04')
+    expect(result.stats).toMatchObject({
+      total_rows: 4,
+      parsed_rows: 4,
+      skipped_rows: 0,
+      total_income: 1250.5,
+      total_expenses: -152.1,
+    })
+  })
+
+  it('imports explicit fee rows exactly once and does not synthesize extra movements', () => {
+    const result = parseBankFile(WISE_STATEMENT_CSV, 'statement.csv')
+
+    expect(result.transactions.filter((transaction) => transaction.amount === -2.2)).toHaveLength(1)
+    expect(result.transactions).toHaveLength(4)
+  })
+
+  it('shares ordinary movement IDs with transaction history across formats', () => {
+    const statement = parseBankFile(
+      [
+        WISE_STATEMENT_HEADER,
+        wiseStatementRow({
+          id: 'TRANSFER-2247230173',
+          currency: 'USD',
+          amount: '2500',
+          balance: '5000',
+        }),
+      ].join('\n'),
+      'statement_USD.csv',
+    ).transactions[0]
+    const history = parseBankFile(WISE_CSV, 'wise.csv').transactions.find(
+      (transaction) => transaction.raw_line === 'TRANSFER-2247230173',
+    )!
+
+    expect(generateExternalId(statement, 'wise_statement', 0)).toBe(
+      generateExternalId(history, 'wise', 0),
+    )
+  })
+
+  it('qualifies conversion legs by statement currency', () => {
+    const conversion = (currency: string) =>
+      parseBankFile(
+        [
+          WISE_STATEMENT_HEADER,
+          wiseStatementRow({
+            id: 'PLAN_ORDER-9',
+            currency,
+            exchangeFrom: '100 USD',
+            exchangeTo: '900 SEK',
+            exchangeRate: '9',
+          }),
+        ].join('\n'),
+        `statement_${currency}.csv`,
+      ).transactions[0]
+
+    expect(generateExternalId(conversion('SEK'), 'wise_statement', 0)).toBe(
+      'wise_PLAN_ORDER-9:SEK',
+    )
+    expect(generateExternalId(conversion('USD'), 'wise_statement', 0)).toBe(
+      'wise_PLAN_ORDER-9:USD',
+    )
+  })
+
+  it('blocks a duplicate scoped Wise movement ID within one statement', () => {
+    const result = parseBankFile(
+      [WISE_STATEMENT_HEADER, wiseStatementRow(), wiseStatementRow()].join('\n'),
+      'statement.csv',
+    )
+
+    expect(result.transactions).toHaveLength(1)
+    expect(result.stats.skipped_rows).toBe(1)
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        severity: 'error',
+        message: 'Duplicate Wise movement ID TRANSFER-100; skipped',
+      }),
+    )
+  })
+
+  it('accepts netted-fee statements in either ordering without continuity warnings', () => {
+    const oldestFirst = parseBankFile(WISE_STATEMENT_CSV, 'statement.csv')
+    const rows = WISE_STATEMENT_CSV.split('\n')
+    const newestFirst = parseBankFile(
+      [rows[0], ...rows.slice(1).reverse()].join('\n'),
+      'statement.csv',
+    )
+
+    for (const result of [oldestFirst, newestFirst]) {
+      expect(result.transactions).toHaveLength(4)
+      expect(result.issues.filter((issue) => /Running balance break/.test(issue.message))).toEqual([])
+    }
+  })
+
+  it('warns when the balance moves by more than Amount (fees not netted)', () => {
+    const csv = [
+      WISE_STATEMENT_HEADER,
+      wiseStatementRow({ id: 'IN-1', amount: '100', balance: '1100' }),
+      wiseStatementRow({
+        id: 'OUT-2',
+        date: '02/08/2026',
+        amount: '-50',
+        balance: '1049.65',
+        totalFees: '0.35',
+      }),
+    ].join('\n')
+    const result = parseBankFile(csv, 'statement.csv')
+
+    expect(result.transactions).toHaveLength(2)
+    expect(
+      result.issues.some(
+        (issue) =>
+          issue.severity === 'warning' && /Running balance break at OUT-2/.test(issue.message),
+      ),
+    ).toBe(true)
+  })
+
+  it('skips malformed movements while retaining non-fatal metadata warnings', () => {
+    const csv = [
+      WISE_STATEMENT_HEADER,
+      wiseStatementRow({ id: 'BAD-AMOUNT', amount: '12abc' }),
+      wiseStatementRow({ id: 'GOOD', balance: 'not-a-balance', totalFees: 'fee?' }),
+    ].join('\n')
+    const result = parseBankFile(csv, 'statement.csv')
+
+    expect(result.transactions).toHaveLength(1)
+    expect(result.stats.skipped_rows).toBe(1)
+    expect(result.issues.some((issue) => /Invalid amount on BAD-AMOUNT/.test(issue.message))).toBe(true)
+    expect(result.issues.some((issue) => /Invalid running balance on GOOD/.test(issue.message))).toBe(true)
+    expect(result.issues.some((issue) => /Invalid total fees on GOOD/.test(issue.message))).toBe(true)
   })
 })

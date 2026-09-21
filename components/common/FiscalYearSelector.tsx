@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
+import { useTranslations } from 'next-intl'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -12,17 +13,27 @@ import {
 } from '@/components/ui/select'
 import { Lock } from 'lucide-react'
 import { useCompany } from '@/contexts/CompanyContext'
+import { STORAGE_KEY_PREFIX, ALL_YEARS_VALUE } from '@/components/common/fiscal-year-storage'
+import { useFiscalPeriods } from '@/lib/reference-data/hooks'
+import { prepareFiscalPeriods, resolveInitialFiscalScope } from '@/lib/reference-data/fiscal-scope'
 import type { FiscalPeriod } from '@/types'
 
-const STORAGE_KEY_PREFIX = 'gnubok:fiscal-year:'
-const ALL_YEARS_VALUE = '__all__'
+// Re-exported so other surfaces (e.g. JournalEntryList's filter dialog) can
+// read and write the same persisted selection without duplicating the magic
+// string. The values live in fiscal-year-storage.ts (dependency-free).
+export { STORAGE_KEY_PREFIX, ALL_YEARS_VALUE }
 
 interface Props {
   /**
-   * Current selection. `null` means "all years" — no filter applied.
+   * Current selection. `null` means "all years": no filter applied.
    */
   value: string | null
-  onChange: (periodId: string | null) => void
+  /**
+   * Called with the selected period id (or null for "all years"). The second
+   * arg is the matching FiscalPeriod object so callers can read period_start
+   * / period_end without an extra fetch.
+   */
+  onChange: (periodId: string | null, period?: FiscalPeriod | null) => void
   /**
    * If true, include an "Alla räkenskapsår" option that clears the filter.
    * Pages that require a specific period (e.g. Reports) should pass false.
@@ -43,6 +54,9 @@ interface Props {
    */
   onReady?: () => void
   className?: string
+  /** Server-loaded periods for the first render, scoped to initialCompanyId. */
+  initialPeriods?: FiscalPeriod[]
+  initialCompanyId?: string | null
 }
 
 /**
@@ -59,14 +73,26 @@ export function FiscalYearSelector({
   value,
   onChange,
   includeAllOption = true,
-  label = 'Räkenskapsår',
+  label,
   hideFuturePeriods = false,
   onReady,
   className,
+  initialPeriods,
+  initialCompanyId,
 }: Props) {
   const { company } = useCompany()
-  const [periods, setPeriods] = useState<FiscalPeriod[]>([])
-  const [loaded, setLoaded] = useState(false)
+  const t = useTranslations('fiscal_year')
+  // Session-cached and seeded by the dashboard layout (see FyPicker): the
+  // restore runs in the first effect tick on a normal visit, no round trip.
+  const { periods: cachedPeriods, isLoading } = useFiscalPeriods()
+  const canUseInitialPeriods = initialCompanyId === company?.id && initialPeriods !== undefined
+  const periods = useMemo(
+    () => prepareFiscalPeriods(canUseInitialPeriods ? initialPeriods : cachedPeriods, hideFuturePeriods),
+    [canUseInitialPeriods, initialPeriods, cachedPeriods, hideFuturePeriods],
+  )
+  const loaded = canUseInitialPeriods || !isLoading
+  const restoredForRef = useRef<string | null>(null)
+  const effectiveLabel = label === null ? null : (label ?? t('label'))
 
   useEffect(() => {
     if (!company?.id) {
@@ -75,53 +101,21 @@ export function FiscalYearSelector({
       onReady?.()
       return
     }
-    let cancelled = false
-    ;(async () => {
-      const res = await fetch('/api/bookkeeping/fiscal-periods')
-      if (!res.ok) {
-        if (!cancelled) {
-          setLoaded(true)
-          onReady?.()
-        }
-        return
-      }
-      const { data } = await res.json()
-      if (cancelled) return
+    if (!loaded || restoredForRef.current === company.id) return
+    restoredForRef.current = company.id
 
-      let fetched: FiscalPeriod[] = data || []
-      if (hideFuturePeriods) {
-        const today = new Date().toISOString().split('T')[0]
-        fetched = fetched.filter((p) => p.period_start <= today)
-      }
-      // Newest first — most migrations list recent years at the top
-      fetched.sort((a, b) => b.period_start.localeCompare(a.period_start))
-      setPeriods(fetched)
-      setLoaded(true)
-
-      // Restore last selection (only if caller hasn't already set a value).
-      // localStorage access is guarded because this is a 'use client' component
-      // but still runs during SSR on first render for some setups.
-      if (value === null && typeof window !== 'undefined') {
-        const stored = window.localStorage.getItem(STORAGE_KEY_PREFIX + company.id)
-        if (stored === ALL_YEARS_VALUE) {
-          if (includeAllOption) onChange(null)
-          else if (fetched.length > 0) onChange(fetched[0].id)
-        } else if (stored && fetched.some((p) => p.id === stored)) {
-          onChange(stored)
-        } else if (!includeAllOption && fetched.length > 0) {
-          onChange(fetched[0].id)
-        }
-      }
-
-      onReady?.()
-    })()
-    return () => {
-      cancelled = true
+    // Restore last selection (only if caller hasn't already set a value).
+    if (value === null && typeof window !== 'undefined') {
+      const stored = window.localStorage.getItem(STORAGE_KEY_PREFIX + company.id)
+      const pick = resolveInitialFiscalScope(periods, stored, { includeAllOption })
+      if (pick) onChange(pick.periodId, pick.period)
     }
-  // onReady is intentionally excluded from deps: it's a lifecycle callback that
-  // should fire once per load, not re-trigger if the parent re-creates it.
+
+    onReady?.()
+  // onReady/onChange are lifecycle callbacks that fire once per load, not
+  // again when the parent re-creates them. `value` is read once at restore.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [company?.id, hideFuturePeriods, includeAllOption])
+  }, [company?.id, loaded, periods])
 
   const handleChange = (next: string) => {
     const nextPeriodId = next === ALL_YEARS_VALUE ? null : next
@@ -131,7 +125,8 @@ export function FiscalYearSelector({
         nextPeriodId ?? ALL_YEARS_VALUE,
       )
     }
-    onChange(nextPeriodId)
+    const nextPeriod = nextPeriodId ? periods.find((p) => p.id === nextPeriodId) ?? null : null
+    onChange(nextPeriodId, nextPeriod)
   }
 
   const selectValue = value ?? (includeAllOption ? ALL_YEARS_VALUE : '')
@@ -149,24 +144,24 @@ export function FiscalYearSelector({
 
   return (
     <div className={className}>
-      {label && <Label>{label}</Label>}
-      <div className={`flex items-center gap-2 ${label ? 'mt-1' : ''}`}>
+      {effectiveLabel && <Label>{effectiveLabel}</Label>}
+      <div className={`flex items-center gap-2 ${effectiveLabel ? 'mt-1' : ''}`}>
         <Select
           value={selectValue}
           onValueChange={handleChange}
           disabled={!loaded || periods.length === 0}
         >
           <SelectTrigger className="w-full sm:w-[280px]">
-            <SelectValue placeholder={loaded ? 'Välj räkenskapsår' : 'Laddar…'} />
+            <SelectValue placeholder={loaded ? t('placeholder') : t('loading')} />
           </SelectTrigger>
           <SelectContent>
             {includeAllOption && (
-              <SelectItem value={ALL_YEARS_VALUE}>Alla räkenskapsår</SelectItem>
+              <SelectItem value={ALL_YEARS_VALUE}>{t('all_years')}</SelectItem>
             )}
             {periods.map((p) => (
               <SelectItem key={p.id} value={p.id}>
-                {p.name} ({p.period_start} — {p.period_end})
-                {p.locked_at ? ' — låst' : p.is_closed ? ' — stängt' : ''}
+                {p.name} ({p.period_start} till {p.period_end})
+                {p.locked_at ? t('suffix_locked') : p.is_closed ? t('suffix_closed') : ''}
               </SelectItem>
             ))}
           </SelectContent>
@@ -175,14 +170,10 @@ export function FiscalYearSelector({
           <Badge
             variant="outline"
             className="gap-1 text-xs font-normal shrink-0"
-            title={
-              lockState === 'locked'
-                ? 'Räkenskapsåret är låst — ingen bokföring kan ändras eller läggas till'
-                : 'Räkenskapsåret är stängt (årsbokslut upprättat) — kan återöppnas av admin'
-            }
+            title={lockState === 'locked' ? t('tooltip_locked') : t('tooltip_closed')}
           >
             <Lock className="h-3 w-3" />
-            {lockState === 'locked' ? 'Låst' : 'Stängt'}
+            {lockState === 'locked' ? t('badge_locked') : t('badge_closed')}
           </Badge>
         )}
       </div>

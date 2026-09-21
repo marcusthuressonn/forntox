@@ -2,6 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import type { CoreEvent } from '@/lib/events/types'
 import { eventBus } from '@/lib/events/bus'
 import { ingestTransactions } from '@/lib/transactions/ingest'
+import { listForCompany as cashAccountsList, getPrimary as cashAccountsGetPrimary } from '@/lib/cash-accounts/service'
 import { createLogger } from '@/lib/logger'
 import type {
   ExtensionContext,
@@ -12,10 +13,13 @@ import type {
 } from './types'
 
 /**
- * Create a prefixed logger for an extension.
+ * Create a prefixed logger for an extension. When `bind` is supplied the
+ * fields (e.g. requestId, userId, companyId) are merged into every log line.
  */
-function createExtLogger(extensionId: string): ExtensionLogger {
-  const logger = createLogger(`ext:${extensionId}`)
+function createExtLogger(extensionId: string, bind?: Record<string, unknown>): ExtensionLogger {
+  const logger = bind
+    ? createLogger(`ext:${extensionId}`, bind)
+    : createLogger(`ext:${extensionId}`)
   return {
     info: (message: string, ...args: unknown[]) => logger.info(message, ...args),
     warn: (message: string, ...args: unknown[]) => logger.warn(message, ...args),
@@ -47,7 +51,7 @@ function createSettings(
     },
 
     async set<T>(key: string, value: T): Promise<void> {
-      await supabase
+      const { error } = await supabase
         .from('extension_data')
         .upsert(
           {
@@ -59,6 +63,21 @@ function createSettings(
           },
           { onConflict: 'company_id,extension_id,key' }
         )
+      if (error) {
+        throw new Error(`extension_data set failed for ${extensionId}/${key}: ${error.message}`)
+      }
+    },
+
+    async clear(key: string): Promise<void> {
+      const { error } = await supabase
+        .from('extension_data')
+        .delete()
+        .eq('company_id', companyId)
+        .eq('extension_id', extensionId)
+        .eq('key', key)
+      if (error) {
+        throw new Error(`extension_data clear failed for ${extensionId}/${key}: ${error.message}`)
+      }
     },
   }
 }
@@ -98,6 +117,9 @@ function createStorage(supabase: SupabaseClient): ExtensionStorage {
 function createServices(): ExtensionServices {
   return {
     ingestTransactions,
+    getCashAccounts: (supabase, companyId, opts) => cashAccountsList(supabase, companyId, opts),
+    getPrimaryCashAccount: (supabase, companyId, currency) =>
+      cashAccountsGetPrimary(supabase, companyId, currency),
   }
 }
 
@@ -105,23 +127,32 @@ function createServices(): ExtensionServices {
  * Build a fully populated ExtensionContext.
  *
  * The context gives extensions access to Supabase, event emission, settings,
- * storage, logging, and core services — without importing from core modules.
+ * storage, logging, and core services: without importing from core modules.
+ *
+ * `requestId` (when supplied by the dispatcher) flows through the bound logger
+ * and is exposed on the context so handlers can pass it into
+ * `errorResponseFromCode(...)` for the envelope + `X-Request-Id` header.
  */
 export function createExtensionContext(
   supabase: SupabaseClient,
   userId: string,
   companyId: string,
-  extensionId: string
+  extensionId: string,
+  requestId?: string,
 ): ExtensionContext {
+  const logBindings: Record<string, unknown> = { userId, companyId, extensionId }
+  if (requestId) logBindings.requestId = requestId
+
   return {
     userId,
     companyId,
     extensionId,
+    requestId,
     supabase,
     emit: (event: CoreEvent) => eventBus.emit(event),
     settings: createSettings(supabase, userId, companyId, extensionId),
     storage: createStorage(supabase),
-    log: createExtLogger(extensionId),
+    log: createExtLogger(extensionId, logBindings),
     services: createServices(),
   }
 }

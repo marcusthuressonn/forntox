@@ -1,13 +1,20 @@
 'use client'
 
+import Image from 'next/image'
+import { useTranslations } from 'next-intl'
 import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { BankIdAuth } from '@/components/auth/BankIdAuth'
 import type { BankIdResult } from '@/components/auth/BankIdAuth'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Shield, ShieldCheck, Loader2 } from 'lucide-react'
+import { Loader2 } from 'lucide-react'
 import { useToast } from '@/components/ui/use-toast'
+import { formatDateLong } from '@/lib/utils'
+import {
+  SettingsRow,
+  SettingsRowEnd,
+  SettingsRowNote,
+} from '@/components/settings/SettingsRows'
 
 interface BankIdIdentity {
   given_name: string | null
@@ -16,6 +23,7 @@ interface BankIdIdentity {
 }
 
 export function BankIdSettings() {
+  const t = useTranslations('settings_bankid')
   const [identity, setIdentity] = useState<BankIdIdentity | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isLinking, setIsLinking] = useState(false)
@@ -44,20 +52,20 @@ export function BankIdSettings() {
   const handleLinkComplete = async (result: BankIdResult) => {
     if (result.error) {
       const message = result.error === 'already_linked'
-        ? 'Detta BankID ar redan kopplat till ett annat konto.'
-        : 'Kunde inte koppla BankID.'
+        ? t('toast_already_linked')
+        : t('toast_link_failed')
       toast({ title: message, variant: 'destructive' })
       setIsLinking(false)
       return
     }
 
-    toast({ title: 'BankID kopplat till ditt konto' })
+    toast({ title: t('toast_linked') })
     setIsLinking(false)
     fetchIdentity()
   }
 
   const handleUnlink = async () => {
-    if (!confirm('Vill du koppla bort BankID fran ditt konto?')) return
+    if (!confirm(t('confirm_unlink'))) return
 
     setIsUnlinking(true)
     try {
@@ -65,9 +73,9 @@ export function BankIdSettings() {
       if (!res.ok) throw new Error('Unlink failed')
 
       setIdentity(null)
-      toast({ title: 'BankID bortkopplat' })
+      toast({ title: t('toast_unlinked') })
     } catch {
-      toast({ title: 'Kunde inte koppla bort BankID', variant: 'destructive' })
+      toast({ title: t('toast_unlink_failed'), variant: 'destructive' })
     } finally {
       setIsUnlinking(false)
     }
@@ -75,75 +83,84 @@ export function BankIdSettings() {
 
   if (isLoading) {
     return (
-      <Card>
-        <CardContent className="flex items-center justify-center py-8">
-          <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-        </CardContent>
-      </Card>
-    )
-  }
-
-  if (isLinking) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Koppla BankID</CardTitle>
-          <CardDescription>Skanna QR-koden med BankID-appen</CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col items-center">
-          <BankIdAuth mode="link" onComplete={handleLinkComplete} />
-        </CardContent>
-      </Card>
+      <SettingsRow label={t('title')}>
+        <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+      </SettingsRow>
     )
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
-          {identity ? (
-            <ShieldCheck className="h-4 w-4 text-green-600" />
-          ) : (
-            <Shield className="h-4 w-4 text-muted-foreground" />
-          )}
-          BankID
-        </CardTitle>
-        <CardDescription>
-          {identity
-            ? 'Ditt konto ar kopplat till BankID.'
-            : 'Koppla BankID for sakrare inloggning.'}
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
+    <>
+      <SettingsRow
+        label={
+          <span className="inline-flex items-center gap-2">
+            <Image
+              src="/logos/bankid-seeklogo.svg"
+              alt=""
+              aria-hidden="true"
+              width={16}
+              height={16}
+              className="dark:invert"
+            />
+            {t('title')}
+          </span>
+        }
+        help={identity ? t('linked_description') : t('not_linked_description')}
+        borderless={isLinking}
+      >
         {identity ? (
-          <div className="flex items-center justify-between">
-            <div className="text-sm text-muted-foreground">
-              <span className="font-medium text-foreground">
-                {identity.given_name} {identity.surname}
-              </span>
-              <span className="ml-2">
-                Kopplat {new Date(identity.linked_at).toLocaleDateString('sv-SE')}
-              </span>
-            </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={handleUnlink}
-              disabled={isUnlinking}
-              className="text-destructive hover:text-destructive"
-            >
-              {isUnlinking ? 'Kopplar bort...' : 'Koppla bort'}
-            </Button>
-          </div>
+          <>
+            <span className="text-sm font-medium">
+              {identity.given_name} {identity.surname}
+            </span>
+            <SettingsRowNote>
+              {t('linked_on', { date: formatDateLong(identity.linked_at) })}
+            </SettingsRowNote>
+            <SettingsRowEnd>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleUnlink}
+                disabled={isUnlinking}
+                className="text-destructive hover:text-destructive"
+              >
+                {isUnlinking ? t('unlinking') : t('unlink_button')}
+              </Button>
+            </SettingsRowEnd>
+          </>
+        ) : isLinking ? (
+          // Active flow: the scan instruction is the actionable content and
+          // stays visible while the QR block below is open.
+          <SettingsRowNote>{t('link_bankid_description')}</SettingsRowNote>
         ) : (
-          <Button
-            variant="outline"
-            onClick={() => setIsLinking(true)}
-          >
-            Koppla BankID
-          </Button>
+          <SettingsRowEnd>
+            <Button variant="outline" size="sm" onClick={() => setIsLinking(true)}>
+              <Image
+                src="/logos/bankid-seeklogo.svg"
+                alt=""
+                aria-hidden="true"
+                width={16}
+                height={16}
+                className="mr-2 dark:invert"
+              />
+              {t('link_button')}
+            </Button>
+          </SettingsRowEnd>
         )}
-      </CardContent>
-    </Card>
+      </SettingsRow>
+
+      {/* QR flow: an expanding block below the row. Mounted only while
+          linking so the BankID session starts exactly when requested. */}
+      {isLinking && (
+        <div className="flex flex-col items-center gap-3 border-b border-border px-1 py-4">
+          <BankIdAuth mode="link" onComplete={handleLinkComplete} />
+          {/* BankIdAuth's own Avbryt only resets its internal session; give
+              the row an exit so isLinking can't get stuck. */}
+          <Button variant="outline" size="sm" onClick={() => setIsLinking(false)}>
+            {t('cancel_linking')}
+          </Button>
+        </div>
+      )}
+    </>
   )
 }

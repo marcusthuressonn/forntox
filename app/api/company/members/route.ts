@@ -1,17 +1,16 @@
-import { createClient, createServiceClient } from '@/lib/supabase/server'
+import { createServiceClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { requireCompanyId } from '@/lib/company/context'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { getMultiUserState } from '@/lib/entitlements/multi-user'
 
 /**
  * GET /api/company/members
  * Returns members and pending invitations for the current company.
+ * Service client on purpose: profiles/emails of other members aren't readable
+ * through the caller's RLS context; every query still scopes by companyId.
  */
-export async function GET() {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
-  const companyId = await requireCompanyId(supabase, user.id)
+export const GET = withRouteContext('company_members.list', async (_request, ctx) => {
+  const { companyId, user } = ctx
   const serviceClient = await createServiceClient()
 
   // Fetch members (source column may not exist if migration not yet applied)
@@ -62,6 +61,13 @@ export async function GET() {
   const currentMember = members?.find((m) => m.user_id === user.id)
   const canInvite = currentMember?.role === 'owner' || currentMember?.role === 'admin'
 
+  // Multi-user seat gate: when the company is frozen (no multi_user grant
+  // active or in grace), the invite POST answers 403, so the UI swaps the
+  // invite form for the paid-plan upsell instead of a dead form.
+  const multiUserAccess = canInvite
+    ? await getMultiUserState(serviceClient, companyId)
+    : null
+
   return NextResponse.json({
     data: {
       members: (members || []).map((m) => ({
@@ -75,6 +81,7 @@ export async function GET() {
       })),
       invitations: invitations || [],
       canInvite,
+      inviteRequiresUpgrade: multiUserAccess?.state === 'frozen',
     },
   })
-}
+})

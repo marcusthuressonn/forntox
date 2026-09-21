@@ -4,53 +4,53 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { use } from 'react'
 import Link from 'next/link'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { DetailSection, DefRow, DefEmpty } from '@/components/ui/detail-section'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useToast } from '@/components/ui/use-toast'
+import {
+  UNDECRYPTABLE_PERSONAL_NUMBER_MASK,
+  maskCustomerPersonalNumber,
+} from '@/lib/customers/mask-personal-number'
+import { AttnLine } from '@/components/ui/attn-line'
 import CustomerForm from '@/components/customers/CustomerForm'
 import { DestructiveConfirmDialog, useDestructiveConfirm } from '@/components/ui/destructive-confirm-dialog'
-import {
-  ArrowLeft,
-  Building,
-  Globe,
-  User,
-  Mail,
-  Phone,
-  MapPin,
-  Edit2,
-  Trash2,
-  Loader2,
-  Receipt,
-  Lock,
-} from 'lucide-react'
+import { Loader2, Lock, Eye, EyeOff } from 'lucide-react'
+import { useLocale } from 'next-intl'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
-import type { Customer, CustomerType, CreateCustomerInput } from '@/types'
+import { getErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-message'
+import { cn, formatDate } from '@/lib/utils'
+import { invoiceNumberDisplay } from '@/lib/invoices/display'
+import { getCountryName } from '@/lib/vat/country-codes'
+import type { Customer, CustomerType, CreateCustomerInput, InvoiceStatus } from '@/types'
+import { DetailPageSkeleton } from '@/components/common/DetailPageSkeleton'
+import { PartyFactsSection } from '@/components/parties/PartyFactsSection'
+import { usePartyDossier } from '@/components/parties/use-party-dossier'
+import { fromRegistry, addressRowsFromRegistry, listSv } from '@/lib/parties/registry-summary'
 
-const customerTypeLabels: Record<CustomerType, string> = {
-  individual: 'Privatperson',
-  swedish_business: 'Svenskt företag',
-  eu_business: 'EU-företag',
-  non_eu_business: 'Utanför EU',
+const CUSTOMER_TYPE_KEY: Record<CustomerType, string> = {
+  individual: 'type_individual',
+  swedish_business: 'type_swedish_business',
+  eu_business: 'type_eu_business',
+  non_eu_business: 'type_non_eu_business',
 }
 
-const customerTypeIcons: Record<CustomerType, React.ElementType> = {
-  individual: User,
-  swedish_business: Building,
-  eu_business: Globe,
-  non_eu_business: Globe,
-}
-
+/**
+ * The columns GET /api/customers/[id] selects from `invoices`. `status` is
+ * the lifecycle column the invoice list and detail pages read for the paid
+ * state; there is no payment_status column, and reading one here rendered
+ * every invoice on the customer card as "Obetald" (crm #91).
+ */
 interface RelatedInvoice {
   id: string
-  invoice_number: string
+  invoice_number: string | null
   invoice_date: string
   due_date: string
-  status: string
+  status: InvoiceStatus
   total: number
   currency: string
-  payment_status: string
 }
 
 interface CustomerWithRelations extends Customer {
@@ -66,11 +66,65 @@ export default function CustomerDetailPage({
   const router = useRouter()
   const { toast } = useToast()
   const { canWrite } = useCanWrite()
+  const t = useTranslations('customer_detail')
+  const tParties = useTranslations('parties')
+  const errorLocale = useLocale() as ErrorLocale
   const [customer, setCustomer] = useState<CustomerWithRelations | null>(null)
+  const partyId = customer && customer.customer_type !== 'individual' ? ((customer as { party_id?: string | null }).party_id ?? null) : null
+  const party = usePartyDossier(partyId)
+  const registryAddress = party.registry?.contact.address ? addressRowsFromRegistry(party.registry.contact.address) : null
+  // Which contact fields carry what the register said: one note for the
+  // section, not a tag under every row.
+  const registryFields = [
+    fromRegistry(customer?.email, party.registry?.contact.email) ? tParties('fact_email') : null,
+    fromRegistry(customer?.phone, party.registry?.contact.phone) ? tParties('fact_phone') : null,
+    !!registryAddress && fromRegistry(customer?.address_line1, registryAddress.address_line1) && fromRegistry(customer?.city, registryAddress.city) ? tParties('facts_address_short') : null,
+    fromRegistry(customer?.vat_number, party.registry?.vat_number) ? tParties('fact_vat') : null,
+  ].filter((x): x is string => !!x)
+  const registryNote = registryFields.length ? (
+    <p className="pt-2 text-xs text-muted-foreground">{tParties('facts_contact_from_registry', { fields: listSv(registryFields, tParties('facts_list_and')) })}</p>
+  ) : null
   const [isLoading, setIsLoading] = useState(true)
   const [isEditOpen, setIsEditOpen] = useState(false)
   const [isUpdating, setIsUpdating] = useState(false)
+  // Full personnummer, fetched on demand and held only for this view. Cleared
+  // whenever the customer is refetched so it can never outlive the row it
+  // belongs to.
+  const [revealedPersonalNumber, setRevealedPersonalNumber] = useState<string | null>(null)
+  const [isRevealing, setIsRevealing] = useState(false)
   const { dialogProps: confirmDialogProps, confirm: confirmAction } = useDestructiveConfirm()
+
+  const isUnreadablePersonalNumber =
+    customer?.personal_number === UNDECRYPTABLE_PERSONAL_NUMBER_MASK
+
+  async function togglePersonalNumber() {
+    if (revealedPersonalNumber) {
+      setRevealedPersonalNumber(null)
+      return
+    }
+    setIsRevealing(true)
+    try {
+      const response = await fetch(`/api/customers/${id}/personal-number`)
+      const result = await response.json()
+      if (!response.ok) {
+        toast({
+          title: t('personal_number_reveal_failed_title'),
+          description: getErrorMessage(result, { context: 'customer', locale: errorLocale }),
+          variant: 'destructive',
+        })
+        return
+      }
+      setRevealedPersonalNumber(result.data.personal_number)
+    } catch {
+      toast({
+        title: t('personal_number_reveal_failed_title'),
+        description: t('retry'),
+        variant: 'destructive',
+      })
+    } finally {
+      setIsRevealing(false)
+    }
+  }
 
   useEffect(() => {
     fetchCustomer()
@@ -78,6 +132,7 @@ export default function CustomerDetailPage({
 
   async function fetchCustomer() {
     setIsLoading(true)
+    setRevealedPersonalNumber(null)
     try {
       const response = await fetch(`/api/customers/${id}`)
       if (!response.ok) {
@@ -87,8 +142,8 @@ export default function CustomerDetailPage({
       setCustomer(data)
     } catch {
       toast({
-        title: 'Kunde inte ladda kund',
-        description: 'Kunden hittades inte.',
+        title: t('load_failed_title'),
+        description: t('load_failed_description'),
         variant: 'destructive',
       })
       router.push('/customers')
@@ -111,15 +166,15 @@ export default function CustomerDetailPage({
       }
 
       toast({
-        title: 'Kund uppdaterad',
+        title: t('updated_title'),
         description: data.name,
       })
       setIsEditOpen(false)
       fetchCustomer()
     } catch {
       toast({
-        title: 'Kunde inte uppdatera kund',
-        description: 'Försök igen.',
+        title: t('update_failed_title'),
+        description: t('retry'),
         variant: 'destructive',
       })
     } finally {
@@ -130,9 +185,9 @@ export default function CustomerDetailPage({
   async function handleDelete() {
     if (!customer) return
     const ok = await confirmAction({
-      title: `Ta bort ${customer.name}`,
-      description: 'Kunden och tillhörande data tas bort permanent. Denna åtgärd kan inte ångras.',
-      confirmLabel: 'Ta bort',
+      title: t('delete_confirm_title', { name: customer.name }),
+      description: t('delete_confirm_description'),
+      confirmLabel: t('delete_confirm_label'),
       variant: 'destructive',
     })
     if (!ok) return
@@ -147,14 +202,14 @@ export default function CustomerDetailPage({
       }
 
       toast({
-        title: 'Kund borttagen',
+        title: t('deleted_title'),
         description: customer.name,
       })
       router.push('/customers')
     } catch {
       toast({
-        title: 'Kunde inte ta bort kund',
-        description: 'Försök igen.',
+        title: t('delete_failed_title'),
+        description: t('retry'),
         variant: 'destructive',
       })
     }
@@ -171,205 +226,225 @@ export default function CustomerDetailPage({
   }
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <Loader2 className="h-8 w-8 animate-spin text-primary" />
-      </div>
-    )
+    return <DetailPageSkeleton />
   }
 
   if (!customer) return null
 
-  const Icon = customerTypeIcons[customer.customer_type]
-
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <Link
-            href="/customers"
-            className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1 mb-2"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Tillbaka till kunder
-          </Link>
-          <div className="flex items-center gap-3">
-            <div className="h-12 w-12 rounded-full bg-primary/10 flex items-center justify-center">
-              <Icon className="h-6 w-6 text-primary" />
-            </div>
-            <div>
-              <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">{customer.name}</h1>
-              <Badge variant="secondary">{customerTypeLabels[customer.customer_type]}</Badge>
-            </div>
+    <div className="space-y-8 stagger-enter">
+      {/* Header: serif name over a quiet type kicker, quiet actions right */}
+      <div>
+        <div className="page-header flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div className="page-header-lead min-w-0">
+            <h1 className="page-header-title font-display text-2xl leading-8 tracking-tight">{customer.name}</h1>
+            <p className="page-header-meta mt-1 text-sm text-muted-foreground">
+              {t(CUSTOMER_TYPE_KEY[customer.customer_type])}
+            </p>
+          </div>
+
+          <div className="page-header-action flex shrink-0 items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setIsEditOpen(true)}
+              className="min-h-10 text-muted-foreground hover:text-foreground"
+              disabled={!canWrite}
+              title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+            >
+              {!canWrite && <Lock className="h-4 w-4 mr-1" />}
+              {t('edit')}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleDelete}
+              className="min-h-10 text-muted-foreground hover:text-destructive"
+              disabled={!canWrite}
+              title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+            >
+              {!canWrite && <Lock className="h-4 w-4 mr-1" />}
+              {t('delete')}
+            </Button>
           </div>
         </div>
-
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setIsEditOpen(true)}
-            disabled={!canWrite}
-            title={!canWrite ? 'Du har endast läsbehörighet i detta företag' : undefined}
-          >
-            {canWrite ? <Edit2 className="h-4 w-4 mr-1" /> : <Lock className="h-4 w-4 mr-1" />}
-            Redigera
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleDelete}
-            className="text-destructive hover:text-destructive"
-            disabled={!canWrite}
-            title={!canWrite ? 'Du har endast läsbehörighet i detta företag' : undefined}
-          >
-            {canWrite ? <Trash2 className="h-4 w-4 mr-1" /> : <Lock className="h-4 w-4 mr-1" />}
-            Ta bort
-          </Button>
-        </div>
       </div>
 
-      {/* Info cards */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        {/* Contact */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Kontaktuppgifter</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {customer.email && (
-              <div className="flex items-center gap-2 text-sm">
-                <Mail className="h-4 w-4 text-muted-foreground" />
-                <a href={`mailto:${customer.email}`} className="hover:underline">
-                  {customer.email}
-                </a>
-              </div>
-            )}
-            {customer.phone && (
-              <div className="flex items-center gap-2 text-sm">
-                <Phone className="h-4 w-4 text-muted-foreground" />
-                {customer.phone}
-              </div>
-            )}
-            {(customer.address_line1 || customer.city) && (
-              <div className="flex items-start gap-2 text-sm">
-                <MapPin className="h-4 w-4 text-muted-foreground mt-0.5" />
-                <div>
-                  {customer.address_line1 && <p>{customer.address_line1}</p>}
-                  {customer.address_line2 && <p>{customer.address_line2}</p>}
-                  {(customer.postal_code || customer.city) && (
-                    <p>{[customer.postal_code, customer.city].filter(Boolean).join(' ')}</p>
-                  )}
-                  {customer.country && <p>{customer.country}</p>}
-                </div>
-              </div>
-            )}
-            {!customer.email && !customer.phone && !customer.address_line1 && !customer.city && (
-              <p className="text-sm text-muted-foreground">Inga kontaktuppgifter</p>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* Business details */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Företagsuppgifter</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {customer.org_number && (
-              <div className="text-sm">
-                <span className="text-muted-foreground">Org.nr: </span>
-                {customer.org_number}
-              </div>
-            )}
-            {customer.vat_number && (
-              <div className="text-sm flex items-center gap-2">
-                <span className="text-muted-foreground">VAT: </span>
-                {customer.vat_number}
-                {customer.vat_number_validated && (
-                  <Badge variant="success" className="text-xs">Verifierad</Badge>
-                )}
-              </div>
-            )}
-            <div className="text-sm">
-              <span className="text-muted-foreground">Betalningsvillkor: </span>
-              {customer.default_payment_terms || 30} dagar
-            </div>
-            {!customer.org_number && !customer.vat_number && (
-              <p className="text-sm text-muted-foreground">Inga företagsuppgifter</p>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* Summary */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Översikt</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="flex items-center gap-2 text-sm">
-              <Receipt className="h-4 w-4 text-muted-foreground" />
-              <span>{customer.invoices?.length || 0} fakturor</span>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Notes */}
-      {customer.notes && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Anteckningar</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm text-muted-foreground whitespace-pre-wrap">{customer.notes}</p>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Related invoices */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base flex items-center gap-2">
-            <Receipt className="h-4 w-4" />
-            Fakturor
-            {customer.invoices?.length > 0 && (
-              <Badge variant="secondary">{customer.invoices.length}</Badge>
-            )}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          {customer.invoices?.length > 0 ? (
-            <div className="space-y-2">
-              {customer.invoices.map((invoice) => (
-                <Link
-                  key={invoice.id}
-                  href={`/invoices/${invoice.id}`}
-                  className="flex items-center justify-between p-3 rounded-lg border hover:bg-muted/50 transition-colors"
-                >
-                  <div>
-                    <p className="font-medium">{invoice.invoice_number}</p>
-                    <p className="text-sm text-muted-foreground">{invoice.invoice_date}</p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span className="text-sm tabular-nums">
-                      {formatCurrency(invoice.total, invoice.currency)}
-                    </span>
-                    <Badge variant={invoice.payment_status === 'paid' ? 'success' : 'secondary'}>
-                      {invoice.payment_status === 'paid' ? 'Betald' : invoice.payment_status === 'overdue' ? 'Förfallen' : 'Obetald'}
-                    </Badge>
-                  </div>
-                </Link>
-              ))}
+      <div className="grid gap-8 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] lg:items-start lg:gap-x-12">
+      <div className="space-y-8">
+      <DetailSection kicker={t('section_contact')}>
+        <DefRow label={t('def_contact_person')}>
+          {customer.contact_person || <DefEmpty />}
+        </DefRow>
+        <DefRow label={t('def_email')}>
+          {customer.email ? (
+            <a href={`mailto:${customer.email}`} className="hover:underline">
+              {customer.email}
+            </a>
+          ) : (
+            <DefEmpty />
+          )}
+        </DefRow>
+        <DefRow label={t('def_phone')}>
+          {customer.phone || <DefEmpty />}
+        </DefRow>
+        <DefRow label={t('def_address')}>
+          {customer.address_line1 || customer.city ? (
+            <div>
+              {customer.address_line1 && <p>{customer.address_line1}</p>}
+              {customer.address_line2 && <p>{customer.address_line2}</p>}
+              {(customer.postal_code || customer.city) && (
+                <p>{[customer.postal_code, customer.city].filter(Boolean).join(' ')}</p>
+              )}
+              {customer.country && <p>{getCountryName(customer.country, errorLocale)}</p>}
             </div>
           ) : (
-            <p className="text-sm text-muted-foreground text-center py-4">
-              Inga fakturor kopplade till denna kund
-            </p>
+            <DefEmpty />
           )}
-        </CardContent>
-      </Card>
+        </DefRow>
+        {registryNote}
+      </DetailSection>
+
+      {partyId && party.dossier ? (
+        <PartyFactsSection
+          partyId={partyId}
+          rowName={customer.name}
+          canWrite={canWrite}
+          dossier={party.dossier}
+          registry={party.registry}
+          scbEnabled={party.scbEnabled}
+          onChanged={async () => {
+            await party.reload()
+            await fetchCustomer()
+          }}
+        />
+      ) : null}
+
+      <DetailSection kicker={t('section_business')}>
+        <DefRow label={t('def_customer_number')}>
+          {customer.customer_number || <DefEmpty />}
+        </DefRow>
+        {customer.customer_type !== 'individual' && (
+          <DefRow label={t('def_org_number')}>
+            {customer.org_number ? (
+              <span className="tabular-nums">{customer.org_number}</span>
+            ) : (
+              <DefEmpty />
+            )}
+          </DefRow>
+        )}
+        {customer.customer_type === 'individual' && (customer.personal_number || customer.org_number) && (
+          <DefRow label={t('def_personal_number')}>
+            <span className="tabular-nums">
+              {revealedPersonalNumber ??
+                maskCustomerPersonalNumber(customer.personal_number || customer.org_number)}
+            </span>
+            {/* Viewers keep the mask: the endpoint refuses them anyway. */}
+            {canWrite && customer.personal_number && !isUnreadablePersonalNumber && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="ml-1 h-10 w-10 -my-2 align-middle"
+                onClick={togglePersonalNumber}
+                disabled={isRevealing}
+                aria-label={revealedPersonalNumber ? t('personal_number_hide') : t('personal_number_show')}
+                title={revealedPersonalNumber ? t('personal_number_hide') : t('personal_number_show')}
+              >
+                {isRevealing ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : revealedPersonalNumber ? (
+                  <EyeOff className="h-4 w-4" />
+                ) : (
+                  <Eye className="h-4 w-4" />
+                )}
+              </Button>
+            )}
+            {isUnreadablePersonalNumber && (
+              <AttnLine
+                className="mt-1"
+                action={{ label: t('personal_number_unreadable_action'), onClick: () => setIsEditOpen(true) }}
+              >
+                {t('personal_number_unreadable')}
+              </AttnLine>
+            )}
+          </DefRow>
+        )}
+        {customer.vat_number && (
+          <DefRow label={t('def_vat')}>
+            <span className="inline-flex flex-wrap items-center gap-2">
+              {customer.vat_number}
+              {customer.vat_number_validated && (
+                <Badge variant="success" className="text-xs">{t('verified')}</Badge>
+              )}
+            </span>
+          </DefRow>
+        )}
+        <DefRow label={t('def_payment_terms')}>
+          {t('payment_terms_value', { days: customer.default_payment_terms || 30 })}
+        </DefRow>
+      </DetailSection>
+
+      {customer.notes && (
+        <DetailSection kicker={t('section_notes')}>
+          <p className="text-sm text-muted-foreground whitespace-pre-wrap">{customer.notes}</p>
+        </DetailSection>
+      )}
+
+      </div>
+      <div className="space-y-8">
+      <DetailSection
+        kicker={t('section_invoices')}
+        aside={
+          customer.invoices?.length > 0 ? (
+            <span className="text-[11px] tabular-nums text-muted-foreground">
+              {t('invoice_count', { count: customer.invoices.length })}
+            </span>
+          ) : undefined
+        }
+      >
+        {customer.invoices?.length > 0 ? (
+          <div className="divide-y divide-border">
+            {customer.invoices.map((invoice) => (
+              <Link
+                key={invoice.id}
+                href={`/invoices/${invoice.id}`}
+                className="flex items-center gap-3 py-3 text-sm transition-colors duration-150 hover:bg-secondary/35"
+              >
+                <span
+                  className={cn(
+                    'min-w-0 truncate',
+                    !invoice.invoice_number && 'italic text-muted-foreground',
+                  )}
+                >
+                  {invoiceNumberDisplay(invoice.invoice_number)}
+                </span>
+                <span className="text-muted-foreground tabular-nums">
+                  {formatDate(invoice.invoice_date)}
+                </span>
+                <span className="ml-auto tabular-nums">
+                  {formatCurrency(invoice.total, invoice.currency)}
+                </span>
+                {/* Chips mark exceptions: an overdue invoice is the deviation
+                    worth a chip; paid and not-yet-due render as muted text. */}
+                {invoice.status === 'overdue' ? (
+                  <Badge variant="destructive">{t('invoice_status_overdue')}</Badge>
+                ) : (
+                  <span className="min-w-14 text-right text-xs text-muted-foreground">
+                    {invoice.status === 'paid'
+                      ? t('invoice_status_paid')
+                      : t('invoice_status_unpaid')}
+                  </span>
+                )}
+              </Link>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">{t('no_invoices')}</p>
+        )}
+      </DetailSection>
+      </div>
+      </div>
 
       <DestructiveConfirmDialog {...confirmDialogProps} />
 
@@ -377,7 +452,7 @@ export default function CustomerDetailPage({
       <Dialog open={isEditOpen} onOpenChange={setIsEditOpen}>
         <DialogContent className="sm:max-w-2xl max-h-[95dvh] sm:max-h-[90vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Redigera kund</DialogTitle>
+            <DialogTitle>{t('edit_dialog_title')}</DialogTitle>
           </DialogHeader>
           <CustomerForm
             onSubmit={handleUpdate}
@@ -385,6 +460,15 @@ export default function CustomerDetailPage({
             initialData={{
               name: customer.name,
               customer_type: customer.customer_type,
+              customer_number: customer.customer_number || undefined,
+              // Every field the form submits must round-trip here: the form
+              // sends '' / [] for an omitted value on edit as an explicit
+              // clear, so leaving one out wiped it on the next save
+              // (contact_person and the per-customer copy lists did exactly
+              // that, and the contact person also never showed on the page).
+              contact_person: customer.contact_person || undefined,
+              invoice_email_cc_addresses: customer.invoice_email_cc_addresses ?? undefined,
+              invoice_email_bcc_addresses: customer.invoice_email_bcc_addresses ?? undefined,
               email: customer.email || undefined,
               phone: customer.phone || undefined,
               address_line1: customer.address_line1 || undefined,
@@ -394,6 +478,10 @@ export default function CustomerDetailPage({
               country: customer.country || undefined,
               org_number: customer.org_number || undefined,
               vat_number: customer.vat_number || undefined,
+              personal_number: customer.personal_number || undefined,
+              // Must round-trip: the form defaults omitted values ('sv') and
+              // submits every field, so leaving language out resets it on save.
+              language: customer.language,
               default_payment_terms: customer.default_payment_terms || undefined,
               notes: customer.notes || undefined,
             }}

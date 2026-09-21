@@ -4,6 +4,14 @@ vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(),
 }))
 
+const contextMocks = vi.hoisted(() => ({
+  getActiveCompanyId: vi.fn(),
+}))
+
+vi.mock('@/lib/company/active-company', () => ({
+  getActiveCompanyId: (...args: unknown[]) => contextMocks.getActiveCompanyId(...args),
+}))
+
 import {
   generateApiKey,
   hashApiKey,
@@ -11,7 +19,12 @@ import {
   validateScopes,
   hasScope,
   validateApiKey,
+  findStageApproveConflict,
   DEFAULT_SCOPES,
+  DEFAULT_OAUTH_SCOPES,
+  STAGING_SCOPES,
+  TOOL_SCOPE_MAP,
+  API_KEY_SCOPES,
 } from '../api-keys'
 import { createClient } from '@supabase/supabase-js'
 
@@ -158,6 +171,69 @@ describe('hasScope', () => {
 })
 
 // ============================================================
+// findStageApproveConflict
+// ============================================================
+
+describe('findStageApproveConflict', () => {
+  it('returns null when approve scope is absent', () => {
+    expect(findStageApproveConflict(['invoices:write', 'reports:read'])).toBeNull()
+  })
+
+  it('returns null when approve scope present but no staging scope', () => {
+    expect(
+      findStageApproveConflict(['pending_operations:approve', 'reports:read']),
+    ).toBeNull()
+  })
+
+  it('returns the offending staging scope when both are present', () => {
+    expect(
+      findStageApproveConflict(['invoices:write', 'pending_operations:approve']),
+    ).toBe('invoices:write')
+  })
+
+  it('treats every STAGING_SCOPES member as a conflict alongside approve', () => {
+    for (const staging of STAGING_SCOPES) {
+      expect(findStageApproveConflict([staging, 'pending_operations:approve'])).toBe(staging)
+    }
+  })
+
+  it('does NOT treat agent:write as a staging scope', () => {
+    expect(STAGING_SCOPES).not.toContain('agent:write')
+    // agent:write + approve is not a SoD conflict: memory writes don't stage
+    // bookkeeping that approve would commit.
+    expect(
+      findStageApproveConflict(['agent:write', 'pending_operations:approve']),
+    ).toBeNull()
+  })
+})
+
+// ============================================================
+// agent:write scope wiring
+// ============================================================
+
+describe('agent:write scope', () => {
+  it('is a registered scope with a Swedish label and description', () => {
+    expect(API_KEY_SCOPES['agent:write']).toBeDefined()
+    expect(API_KEY_SCOPES['agent:write'].label).toBe('Agent: skriv')
+    expect(typeof API_KEY_SCOPES['agent:write'].description).toBe('string')
+  })
+
+  it('maps the memory write tools to agent:write', () => {
+    expect(TOOL_SCOPE_MAP.gnubok_remember_fact).toBe('agent:write')
+    expect(TOOL_SCOPE_MAP.gnubok_forget_fact).toBe('agent:write')
+  })
+
+  it('keeps gnubok_get_agent_briefing on agent:read', () => {
+    expect(TOOL_SCOPE_MAP.gnubok_get_agent_briefing).toBe('agent:read')
+  })
+
+  it('is excluded from the default scope grants', () => {
+    expect(DEFAULT_SCOPES).not.toContain('agent:write')
+    expect(DEFAULT_OAUTH_SCOPES).not.toContain('agent:write')
+  })
+})
+
+// ============================================================
 // validateApiKey
 // ============================================================
 
@@ -171,6 +247,12 @@ describe('validateApiKey', () => {
   it('rejects keys not starting with "gnubok_sk_"', async () => {
     const result = await validateApiKey('invalid-key-format')
     expect(result).toEqual({ error: 'Invalid API key format', status: 401 })
+  })
+
+  it('rejects a refresh token presented as Bearer with a specific message', async () => {
+    const result = await validateApiKey('gnubok_rt_some_refresh_token')
+    expect('status' in result && result.status).toBe(401)
+    expect('error' in result && result.error).toContain('Refresh token')
   })
 
   it('rejects when RPC returns error', async () => {
@@ -212,7 +294,11 @@ describe('validateApiKey', () => {
     expect(result).toEqual({
       userId: 'user-123',
       companyId: 'company-456',
+      apiKeyId: undefined,
+      apiKeyName: undefined,
       scopes: ['transactions:read', 'reports:read'],
+      mode: 'live',
+      unattendedCommitLimit: null,
     })
   })
 
@@ -231,7 +317,146 @@ describe('validateApiKey', () => {
     expect(result).toEqual({
       userId: 'user-123',
       companyId: 'company-456',
+      apiKeyId: undefined,
+      apiKeyName: undefined,
       scopes: DEFAULT_SCOPES,
+      mode: 'live',
+      unattendedCommitLimit: null,
+    })
+  })
+
+  it('surfaces mode from the RPC row', async () => {
+    setupMockRpc({
+      data: [{
+        user_id: 'user-123',
+        company_id: 'company-456',
+        api_key_id: 'ak_1',
+        api_key_name: 'CI test key',
+        scopes: ['transactions:read'],
+        rate_limited: false,
+        mode: 'test',
+      }],
+      error: null,
+    })
+
+    const result = await validateApiKey('gnubok_sk_test-key-value')
+    expect(result).toEqual({
+      userId: 'user-123',
+      companyId: 'company-456',
+      apiKeyId: 'ak_1',
+      apiKeyName: 'CI test key',
+      scopes: ['transactions:read'],
+      mode: 'test',
+      unattendedCommitLimit: null,
+    })
+  })
+
+  describe('unattended commit limit', () => {
+    it('surfaces a positive ceiling from the RPC row', async () => {
+      setupMockRpc({
+        data: [{
+          user_id: 'user-123',
+          company_id: 'company-456',
+          scopes: ['transactions:read'],
+          rate_limited: false,
+          // numeric(14,2) comes back from PostgREST as a string.
+          unattended_commit_limit: '25000.00',
+        }],
+        error: null,
+      })
+
+      const result = await validateApiKey('gnubok_sk_test-key-value')
+      expect(result).toMatchObject({ unattendedCommitLimit: 25000 })
+    })
+
+    it('reads anything that is not a positive number as no ceiling', async () => {
+      // The whole guard is NULL-first: an unparseable or non-positive value
+      // must mean "unlimited", never "block every commit this key attempts".
+      for (const raw of [null, undefined, 0, -1, 'abc', {}]) {
+        setupMockRpc({
+          data: [{
+            user_id: 'user-123',
+            company_id: 'company-456',
+            scopes: ['transactions:read'],
+            rate_limited: false,
+            unattended_commit_limit: raw,
+          }],
+          error: null,
+        })
+        const result = await validateApiKey('gnubok_sk_test-key-value')
+        expect(result).toMatchObject({ unattendedCommitLimit: null })
+      }
+    })
+  })
+
+  describe('unbound keys (minted before the first company existed, issue #1814)', () => {
+    function setupUnboundKeyClient(rpcRow: Record<string, unknown>) {
+      const chain = {
+        update: vi.fn(),
+        eq: vi.fn(),
+        is: vi.fn().mockResolvedValue({ data: null, error: null }),
+      }
+      chain.update.mockReturnValue(chain)
+      chain.eq.mockReturnValue(chain)
+      const from = vi.fn().mockReturnValue(chain)
+      const rpc = vi.fn().mockResolvedValue({ data: [rpcRow], error: null })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mockCreateClient.mockReturnValue({ rpc, from } as any)
+      return { from, chain }
+    }
+
+    const unboundRow = {
+      user_id: 'user-123',
+      company_id: null,
+      api_key_id: 'ak_1',
+      api_key_name: 'MCP-klient (OAuth)',
+      scopes: ['transactions:read'],
+      rate_limited: false,
+      mode: 'live',
+    }
+
+    it('binds the key to the user\'s company once one exists and heals the row', async () => {
+      const { from, chain } = setupUnboundKeyClient(unboundRow)
+      contextMocks.getActiveCompanyId.mockResolvedValue('company-789')
+
+      const result = await validateApiKey('gnubok_sk_test-key-value')
+
+      expect('companyId' in result && result.companyId).toBe('company-789')
+      expect(from).toHaveBeenCalledWith('api_keys')
+      expect(chain.update).toHaveBeenCalledWith({ company_id: 'company-789' })
+      expect(chain.eq).toHaveBeenCalledWith('id', 'ak_1')
+      // Only an unbound row is ever rewritten: a concurrent bind must not be clobbered.
+      expect(chain.is).toHaveBeenCalledWith('company_id', null)
+    })
+
+    it('returns companyId null while the user still has no company', async () => {
+      const { from } = setupUnboundKeyClient(unboundRow)
+      contextMocks.getActiveCompanyId.mockResolvedValue(null)
+
+      const result = await validateApiKey('gnubok_sk_test-key-value')
+
+      expect('companyId' in result && result.companyId).toBeNull()
+      expect(from).not.toHaveBeenCalled()
+    })
+
+    it('treats a failed company resolution as still unbound rather than failing the key', async () => {
+      setupUnboundKeyClient(unboundRow)
+      contextMocks.getActiveCompanyId.mockRejectedValue(new Error('db blip'))
+
+      const result = await validateApiKey('gnubok_sk_test-key-value')
+
+      expect('companyId' in result && result.companyId).toBeNull()
+      expect('userId' in result && result.userId).toBe('user-123')
+    })
+
+    it('skips the heal when the RPC predates api_key_id in its return shape', async () => {
+      const { from } = setupUnboundKeyClient({ ...unboundRow, api_key_id: undefined })
+      contextMocks.getActiveCompanyId.mockResolvedValue('company-789')
+
+      const result = await validateApiKey('gnubok_sk_test-key-value')
+
+      expect('companyId' in result && result.companyId).toBe('company-789')
+      expect(from).not.toHaveBeenCalled()
     })
   })
 })

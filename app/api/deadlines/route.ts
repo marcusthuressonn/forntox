@@ -1,9 +1,8 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateBody } from '@/lib/api/validate'
 import { CreateDeadlineSchema } from '@/lib/api/schemas'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 /**
  * GET /api/deadlines
@@ -14,18 +13,8 @@ import { requireWritePermission } from '@/lib/auth/require-write'
  *   - from: ISO date string (optional)
  *   - to: ISO date string (optional)
  */
-export async function GET(request: Request) {
-  const supabase = await createClient()
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
+export const GET = withRouteContext('deadline.list', async (request, ctx) => {
+  const { supabase, companyId } = ctx
 
   // Parse query params
   const { searchParams } = new URL(request.url)
@@ -34,11 +23,13 @@ export async function GET(request: Request) {
   const from = searchParams.get('from')
   const to = searchParams.get('to')
 
-  // Build query
+  // Build query. Dismissed system deadlines are an explicit opt-out and
+  // never listed.
   let query = supabase
     .from('deadlines')
     .select('*, customer:customers(id, name)')
     .eq('company_id', companyId)
+    .is('dismissed_at', null)
 
   // Apply filters
   if (status === 'pending') {
@@ -62,31 +53,20 @@ export async function GET(request: Request) {
   const { data, error } = await query.order('due_date', { ascending: true })
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
   }
 
   return NextResponse.json({ data })
-}
+})
 
 /**
  * POST /api/deadlines
  * Create a new deadline
  */
-export async function POST(request: Request) {
-  const supabase = await createClient()
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
+export const POST = withRouteContext(
+  'deadline.create',
+  async (request, ctx) => {
+  const { supabase, companyId, user } = ctx
 
   const validation = await validateBody(request, CreateDeadlineSchema)
   if (!validation.success) return validation.response
@@ -110,8 +90,10 @@ export async function POST(request: Request) {
     .single()
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
   }
 
   return NextResponse.json({ data })
-}
+  },
+  { requireWrite: true },
+)

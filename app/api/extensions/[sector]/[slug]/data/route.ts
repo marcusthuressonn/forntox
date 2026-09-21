@@ -1,21 +1,11 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ sector: string; slug: string }> }
-) {
+export const GET = withRouteContext<{ params: Promise<{ sector: string; slug: string }> }>(
+  'extension.data.get',
+  async (request, { supabase, companyId }, { params }) => {
   const { sector, slug } = await params
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
 
   const extensionId = `${sector}/${slug}`
 
@@ -39,28 +29,17 @@ export async function GET(
   const { data, error } = await query
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
   }
 
   return NextResponse.json({ data })
-}
+  },
+)
 
-export async function POST(
-  request: Request,
-  { params }: { params: Promise<{ sector: string; slug: string }> }
-) {
+export const POST = withRouteContext<{ params: Promise<{ sector: string; slug: string }> }>(
+  'extension.data.set',
+  async (request, { supabase, user, companyId }, { params }) => {
   const { sector, slug } = await params
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
 
   const body = await request.json()
   const { key, value } = body
@@ -87,28 +66,18 @@ export async function POST(
     .single()
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
   }
 
   return NextResponse.json({ data })
-}
+  },
+  { requireWrite: true },
+)
 
-export async function DELETE(
-  request: Request,
-  { params }: { params: Promise<{ sector: string; slug: string }> }
-) {
+export const DELETE = withRouteContext<{ params: Promise<{ sector: string; slug: string }> }>(
+  'extension.data.delete',
+  async (request, { supabase, companyId }, { params }) => {
   const { sector, slug } = await params
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
 
   const { searchParams } = new URL(request.url)
   const key = searchParams.get('key')
@@ -127,8 +96,10 @@ export async function DELETE(
     .eq('key', key)
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
   }
 
   return NextResponse.json({ success: true })
-}
+  },
+  { requireWrite: true },
+)

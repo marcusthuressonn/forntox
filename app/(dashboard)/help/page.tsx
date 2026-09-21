@@ -1,21 +1,24 @@
 'use client'
 
 import { useState, useMemo } from 'react'
+import { useTranslations } from 'next-intl'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
-import { Badge } from '@/components/ui/badge'
 import { HelpLink } from '@/components/ui/info-tooltip'
+import { PageHeader } from '@/components/ui/page-header'
+import { EmptyState } from '@/components/ui/empty-state'
 import {
   Search,
   BookOpen,
   Receipt,
   Calculator,
-  Building2,
   FileText,
   FileDown,
   ExternalLink,
   ChevronDown,
   ChevronUp,
+  Briefcase,
+  Landmark,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { SupportLink } from '@/components/ui/support-link'
@@ -197,23 +200,32 @@ const glossaryTerms: GlossaryTerm[] = [
       'Ditt företags unika identitetsnummer. För enskild firma är det ditt personnummer + 100 på århundradesiffran (199001011234 blir 199101011234).',
     category: 'företag',
   },
+  {
+    term: 'Eget utlägg',
+    simpleTerm: 'Betalat privat för bolagets räkning',
+    definition:
+      'När du som ägare lägger ut pengar privat för en kostnad som bolaget ska stå för. Registrera under Leverantörsfakturor → Ny, kryssa i "Jag har betalat detta privat". Verifikatet bokförs då direkt mot skuld till ägare (2893 för AB, 2018 för EF) istället för via leverantörsskuld. När bolaget senare ersätter dig kategoriserar du den utgående banktransaktionen mot samma konto.',
+    category: 'bokföring',
+    relatedTerms: ['Aktiebolag', 'Enskild firma'],
+  },
 ]
 
 const categoryConfig = {
-  skatt: { label: 'Skatt', icon: Calculator, color: 'bg-orange-500/10 text-orange-600' },
-  moms: { label: 'Moms', icon: Receipt, color: 'bg-blue-500/10 text-blue-600' },
-  faktura: { label: 'Faktura', icon: FileText, color: 'bg-success/10 text-success' },
-  bokföring: { label: 'Bokföring', icon: BookOpen, color: 'bg-purple-500/10 text-purple-600' },
-  bank: { label: 'Bank', icon: Building2, color: 'bg-pink-500/10 text-pink-600' },
-  företag: { label: 'Företag', icon: Building2, color: 'bg-cyan-500/10 text-cyan-600' },
+  skatt: { labelKey: 'category_skatt', icon: Calculator, color: 'bg-secondary text-muted-foreground' },
+  moms: { labelKey: 'category_moms', icon: Receipt, color: 'bg-secondary text-muted-foreground' },
+  faktura: { labelKey: 'category_faktura', icon: FileText, color: 'bg-secondary text-muted-foreground' },
+  bokföring: { labelKey: 'category_bokforing', icon: BookOpen, color: 'bg-secondary text-muted-foreground' },
+  bank: { labelKey: 'category_bank', icon: Landmark, color: 'bg-secondary text-muted-foreground' },
+  företag: { labelKey: 'category_foretag', icon: Briefcase, color: 'bg-secondary text-muted-foreground' },
 }
 
 function TermCard({ term, isExpanded, onToggle }: { term: GlossaryTerm; isExpanded: boolean; onToggle: () => void }) {
+  const t = useTranslations('help')
   const config = categoryConfig[term.category]
   const CategoryIcon = config.icon
 
   return (
-    <Card className={cn('transition-all', isExpanded && 'ring-2 ring-primary/20')}>
+    <Card className={cn('transition-colors', isExpanded && 'ring-2 ring-primary/20')}>
       <CardContent className="pt-4">
         <button
           onClick={onToggle}
@@ -226,11 +238,11 @@ function TermCard({ term, isExpanded, onToggle }: { term: GlossaryTerm; isExpand
               </div>
               <div>
                 <div className="flex items-center gap-2 flex-wrap">
-                  <h3 className="font-medium">{term.term}</h3>
+                  <h3>{term.term}</h3>
                   {term.simpleTerm && (
-                    <Badge variant="secondary" className="font-normal">
+                    <span className="text-sm text-muted-foreground font-normal">
                       {term.simpleTerm}
-                    </Badge>
+                    </span>
                   )}
                 </div>
                 {!isExpanded && (
@@ -256,18 +268,16 @@ function TermCard({ term, isExpanded, onToggle }: { term: GlossaryTerm; isExpand
 
             {term.relatedTerms && term.relatedTerms.length > 0 && (
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs text-muted-foreground">Relaterat:</span>
-                {term.relatedTerms.map((related) => (
-                  <Badge key={related} variant="outline" className="text-xs">
-                    {related}
-                  </Badge>
-                ))}
+                <span className="text-xs text-muted-foreground">{t('related_label')}</span>
+                <span className="text-xs text-muted-foreground">
+                  {term.relatedTerms.join(', ')}
+                </span>
               </div>
             )}
 
             {term.skatteverketUrl && (
               <HelpLink href={term.skatteverketUrl}>
-                Läs mer på Skatteverket
+                {t('read_more_skv')}
                 <ExternalLink className="h-3 w-3" />
               </HelpLink>
             )}
@@ -279,6 +289,7 @@ function TermCard({ term, isExpanded, onToggle }: { term: GlossaryTerm; isExpand
 }
 
 export default function HelpPage() {
+  const t = useTranslations('help')
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
   const [expandedTerms, setExpandedTerms] = useState<Set<string>>(new Set())
@@ -319,20 +330,17 @@ export default function HelpPage() {
 
   return (
     <div className="space-y-8">
-      {/* Header */}
-      <header>
-        <h1 className="font-display text-3xl font-medium tracking-tight mb-2">Hjälp & Ordlista</h1>
-        <p className="text-muted-foreground">
-          Förklaringar av skatte- och bokföringstermer på ren svenska.
-        </p>
-      </header>
+      <PageHeader
+        title={t('title')}
+        description={t('subtitle')}
+      />
 
       {/* Search */}
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
         <Input
           type="search"
-          placeholder="Sök efter term..."
+          placeholder={t('search_placeholder')}
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           className="pl-9"
@@ -344,41 +352,38 @@ export default function HelpPage() {
         <button
           onClick={() => setSelectedCategory(null)}
           className={cn(
-            'px-3 py-1.5 rounded-lg text-sm font-medium transition-colors',
+            'rounded-full px-4 py-[7px] text-[13px] transition-colors duration-150',
             selectedCategory === null
               ? 'bg-primary text-primary-foreground'
-              : 'bg-secondary text-muted-foreground hover:text-foreground'
+              : 'bg-secondary/60 text-muted-foreground hover:bg-secondary hover:text-foreground'
           )}
         >
-          Alla
+          {t('filter_all')}
         </button>
         {Object.entries(categoryConfig).map(([key, config]) => (
           <button
             key={key}
             onClick={() => setSelectedCategory(selectedCategory === key ? null : key)}
             className={cn(
-              'px-3 py-1.5 rounded-lg text-sm font-medium transition-colors',
+              'rounded-full px-4 py-[7px] text-[13px] transition-colors duration-150',
               selectedCategory === key
                 ? 'bg-primary text-primary-foreground'
-                : 'bg-secondary text-muted-foreground hover:text-foreground'
+                : 'bg-secondary/60 text-muted-foreground hover:bg-secondary hover:text-foreground'
             )}
           >
-            {config.label}
+            {t(config.labelKey)}
           </button>
         ))}
       </div>
 
       {/* Terms list */}
-      <div className="space-y-3">
+      <div className="space-y-4">
         {filteredTerms.length === 0 ? (
-          <Card>
-            <CardContent className="py-12 text-center">
-              <Search className="h-8 w-8 text-muted-foreground mx-auto mb-3" />
-              <p className="text-muted-foreground">
-                Inga termer hittades för &quot;{searchQuery}&quot;
-              </p>
-            </CardContent>
-          </Card>
+          <EmptyState
+            icon={Search}
+            title={t('no_results_title')}
+            description={<span data-ph-mask="">{t('no_results', { query: searchQuery })}</span>}
+          />
         ) : (
           filteredTerms.map((term) => (
             <TermCard
@@ -394,35 +399,35 @@ export default function HelpPage() {
       {/* Document templates */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Dokument & Mallar</CardTitle>
-          <CardDescription>Lagstadgade mallar för din bokföring — ladda ner, fyll i och spara</CardDescription>
+          <CardTitle className="text-base">{t('templates_title')}</CardTitle>
+          <CardDescription>{t('templates_subtitle')}</CardDescription>
         </CardHeader>
         <CardContent>
           <div className="grid gap-3 sm:grid-cols-2">
             <a
               href="/docs/arkivplan-mall.md"
               download
-              className="p-3 rounded-lg border border-border hover:border-primary/50 transition-colors block"
+              className="p-3 rounded-lg border border-border transition-colors duration-150 hover:bg-secondary/60 block"
             >
               <div className="flex items-center gap-2">
                 <FileDown className="h-4 w-4" />
                 <span className="font-medium">Arkivplan</span>
               </div>
               <p className="text-xs text-muted-foreground mt-1">
-                Mall enligt BFNAR 2013:2 — beskriver var räkenskapsinformation förvaras
+                Mall enligt BFNAR 2013:2: beskriver var räkenskapsinformation förvaras
               </p>
             </a>
             <a
               href="/docs/systemdokumentation-mall.md"
               download
-              className="p-3 rounded-lg border border-border hover:border-primary/50 transition-colors block"
+              className="p-3 rounded-lg border border-border transition-colors duration-150 hover:bg-secondary/60 block"
             >
               <div className="flex items-center gap-2">
                 <FileDown className="h-4 w-4" />
                 <span className="font-medium">Systemdokumentation</span>
               </div>
               <p className="text-xs text-muted-foreground mt-1">
-                Mall enligt BFL 5 kap. 11 § — beskriver bokföringssystemets uppbyggnad
+                Mall enligt BFL 5 kap. 11 §: beskriver bokföringssystemets uppbyggnad
               </p>
             </a>
           </div>
@@ -432,14 +437,13 @@ export default function HelpPage() {
       {/* External resources */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Externa resurser</CardTitle>
-          <CardDescription>Mer hjälp från officiella källor</CardDescription>
+          <CardTitle className="text-base">{t('external_resources_title')}</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="grid gap-3 sm:grid-cols-2">
             <HelpLink
               href="https://www.skatteverket.se/foretag/foretagarguiden.4.361dc8c15312eff6fd1f87f.html"
-              className="p-3 rounded-lg border border-border hover:border-primary/50 transition-colors block"
+              className="p-3 rounded-lg border border-border transition-colors duration-150 hover:bg-secondary/60 block"
             >
               <div className="flex items-center gap-2">
                 <ExternalLink className="h-4 w-4" />
@@ -451,7 +455,7 @@ export default function HelpPage() {
             </HelpLink>
             <HelpLink
               href="https://www.verksamt.se/"
-              className="p-3 rounded-lg border border-border hover:border-primary/50 transition-colors block"
+              className="p-3 rounded-lg border border-border transition-colors duration-150 hover:bg-secondary/60 block"
             >
               <div className="flex items-center gap-2">
                 <ExternalLink className="h-4 w-4" />
@@ -470,10 +474,10 @@ export default function HelpPage() {
         <CardHeader>
           <div className="flex items-center gap-2">
             <Mail className="h-5 w-5 text-muted-foreground" />
-            <CardTitle>Behöver du mer hjälp?</CardTitle>
+            <CardTitle>{t('support_title')}</CardTitle>
           </div>
           <CardDescription>
-            Hittar du inte svaret? Kontakta oss så hjälper vi dig.
+            {t('support_subtitle')}
           </CardDescription>
         </CardHeader>
         <CardContent>

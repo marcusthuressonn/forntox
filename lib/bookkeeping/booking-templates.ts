@@ -7,7 +7,15 @@ import type {
   VatTreatment,
   RiskLevel,
 } from '@/types'
-import { getVatRate, generateReverseChargeLines, generateInputVatLine } from './vat-entries'
+import {
+  getVatRate,
+  generateReverseChargeLines,
+  generateReverseChargeBasisLines,
+  generateInputVatLine,
+} from './vat-entries'
+import { resolveSekAmount } from './currency-utils'
+import { templateAccountForForm } from '@/lib/company/entity-type'
+import { vatTreatmentForRegistration, type VatRegistration } from './vat-registration'
 
 // ============================================================
 // Types
@@ -31,6 +39,12 @@ export type TemplateGroup =
   | 'financial'
   | 'private_transfers'
   | 'equipment'
+  // Three families the library (system + own templates) files under. Goods
+  // has static templates since 2026-09-10; tax and VAT settlements
+  // (1630/2650/25xx) and year-end postings (88xx) are library only.
+  | 'goods'
+  | 'tax'
+  | 'closing'
 
 export interface BookingTemplate {
   id: string
@@ -38,7 +52,7 @@ export interface BookingTemplate {
   name_en: string
   group: TemplateGroup
   direction: 'expense' | 'income' | 'transfer'
-  entity_applicability: 'all' | 'enskild_firma' | 'aktiebolag'
+  entity_applicability: 'all' | EntityType
   debit_account: string
   credit_account: string
   debit_account_ab?: string
@@ -59,6 +73,13 @@ export interface BookingTemplate {
   description_sv: string
   common: boolean
   requires_vat_registration_data?: boolean
+  /**
+   * Supplier-type hint for reverse-charge bookings. Determines which 44xx/45xx
+   * basbelopp account is emitted alongside the 2645/2614 fiktiv-moms pair so
+   * Skatteverket's momsdeklaration rutor 20-24 line up with rutor 30-32
+   * (felkod FK004 if absent). Default 'eu_business' when unset.
+   */
+  reverse_charge_supplier_type?: 'eu_business' | 'non_eu_business' | 'swedish_business'
 }
 
 export interface TemplateGroupInfo {
@@ -95,6 +116,9 @@ const GROUP_LABELS: Record<TemplateGroup, { sv: string; en: string }> = {
   financial: { sv: 'Finansiella poster', en: 'Financial Items' },
   private_transfers: { sv: 'Privata transaktioner', en: 'Private Transfers' },
   equipment: { sv: 'Inventarier & Utrustning', en: 'Equipment' },
+  goods: { sv: 'Varor & material', en: 'Goods & Materials' },
+  tax: { sv: 'Skatt & moms', en: 'Tax & VAT' },
+  closing: { sv: 'Bokslut', en: 'Year-end' },
 }
 
 // ============================================================
@@ -214,7 +238,7 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     deductibility: 'conditional',
     deductibility_note_sv: 'Max 50% momsavdrag för personbil',
     special_rules_sv: 'Personbil: halvt momsavdrag. Lastbil/lätt lastbil: fullt avdrag.',
-    mcc_codes: [7512, 7513],
+    mcc_codes: [7513],
     keywords: ['leasing', 'billeasing', 'car lease', 'leasingavgift'],
     risk_level: 'LOW',
     requires_review: false,
@@ -255,7 +279,9 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     group: 'vehicle',
     direction: 'expense',
     entity_applicability: 'all',
-    debit_account: '5614',
+    debit_account: '5619',  // 5614 does not exist in BAS 2026 (the 561x run skips it), so every
+    // booking through this template failed with AccountsNotInChartError.
+    // 5619 is the sibling 'Övriga kostnader för personbilar och mc'.
     credit_account: '1930',
     vat_treatment: 'standard_25',
     vat_rate: 0.25,
@@ -328,7 +354,8 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     group: 'it_software',
     direction: 'expense',
     entity_applicability: 'all',
-    debit_account: '5421',
+    debit_account: '5420',  // 5421 does not exist in BAS 2026. 5420 Programvaror is what the two
+    // sibling SaaS templates already use.
     credit_account: '1930',
     vat_treatment: 'reverse_charge',
     vat_rate: 0,
@@ -484,7 +511,7 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     deductibility: 'full',
     special_rules_sv: 'Persontransport har 6% moms (flyg, tåg, taxi)',
     mcc_codes: [3000, 3001, 3002, 3003, 4511, 4011, 4111, 4112, 4131, 4121],
-    keywords: ['flyg', 'sas', 'norwegian', 'bra', 'flight', 'tåg', 'train', 'sj', 'sl', 'västtrafik', 'skånetrafiken', 'kollektivtrafik', 'taxi', 'uber', 'bolt', 'cab', 'hyrbil', 'rental car', 'europcar', 'hertz'],
+    keywords: ['flyg', 'sas', 'norwegian', 'bra', 'flight', 'tåg', 'train', 'sj', 'sl', 'västtrafik', 'skånetrafiken', 'kollektivtrafik', 'taxi', 'uber', 'bolt', 'cab'],
     risk_level: 'LOW',
     requires_review: false,
     impact_score: 7,
@@ -525,12 +552,14 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     group: 'travel',
     direction: 'expense',
     entity_applicability: 'all',
-    debit_account: '5820',
+    debit_account: '5830',  // 5820 is Hyrbilskostnader (rental car). This template is Hotell, so it
+    // posted hotel nights into car hire: it balanced and was silently wrong.
+    // 5830 is 'Kost och logi'.
     credit_account: '1930',
     vat_treatment: 'reduced_12',
     vat_rate: 0.12,
     deductibility: 'full',
-    special_rules_sv: 'Logi har 12% moms. Frukost särredovisas med 12% moms.',
+    special_rules_sv: 'Frukost särredovisas från logikostnaden.',
     mcc_codes: [3501, 3502, 3503, 3504, 7011],
     keywords: ['hotell', 'hotel', 'logi', 'övernattning', 'scandic', 'elite', 'best western', 'booking', 'airbnb'],
     risk_level: 'LOW',
@@ -556,8 +585,8 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     vat_treatment: 'reduced_12',
     vat_rate: 0.12,
     deductibility: 'conditional',
-    deductibility_note_sv: 'Avdragsgill moms max 46 kr/person. Representationskostnad max 300 kr/person exkl moms (IL 16 kap 2§)',
-    special_rules_sv: 'Dokumentera: syfte, deltagare, företag. Momsavdrag max 300 kr/person.',
+    deductibility_note_sv: 'Momsavdrag på högst 300 kr/person (schablon 46 kr/person vid mat och alkohol); måltider inte avdragsgilla för inkomstskatt sedan 2017',
+    special_rules_sv: 'Dokumentera syfte, deltagare och företag.',
     mcc_codes: [5812, 5813, 5814],
     keywords: ['representation', 'lunch', 'middag', 'restaurang', 'restaurant', 'kund', 'kundmöte', 'gåva', 'present', 'representationsgåva'],
     risk_level: 'HIGH',
@@ -576,13 +605,13 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     group: 'representation',
     direction: 'expense',
     entity_applicability: 'all',
-    debit_account: '7622',
+    debit_account: '7631',
     credit_account: '1930',
-    vat_treatment: null,
-    vat_rate: 0,
+    vat_treatment: 'reduced_12',
+    vat_rate: 0.12,
     deductibility: 'conditional',
-    deductibility_note_sv: 'Max 60 kr/person',
-    special_rules_sv: 'Personalfest, intern lunch etc. Momsfritt. Max 60 kr/person för avdragsrätt.',
+    deductibility_note_sv: 'Enklare förtäring avdragsgill upp till 60 kr/person; måltider inte avdragsgilla för inkomstskatt sedan 2017',
+    special_rules_sv: 'Personalfest, teamlunch, fika. Momsavdrag på högst 300 kr/person (schablon 46 kr/person vid mat och alkohol).',
     mcc_codes: [5812, 5813, 5814],
     keywords: ['personalfest', 'intern representation', 'teamlunch', 'personallunch', 'fika', 'julfest', 'after work', 'intern lunch'],
     risk_level: 'LOW',
@@ -756,7 +785,7 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     deductibility: 'full',
     special_rules_sv: 'Banktjänster är momsfria',
     mcc_codes: [6010, 6011, 6012],
-    keywords: ['bankavgift', 'bank fee', 'kontoavgift', 'årsavgift', 'månadsavgift', 'kortavgift', 'zettle', 'izettle', 'stripe', 'klarna', 'swish', 'betalterminal', 'nets'],
+    keywords: ['bankavgift', 'bank fee', 'kontoavgift', 'årsavgift', 'månadsavgift', 'kortavgift', 'zettle', 'izettle', 'klarna', 'swish', 'betalterminal', 'nets'],
     risk_level: 'NONE',
     requires_review: false,
     impact_score: 9,
@@ -765,6 +794,35 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     fallback_category: 'expense_bank_fees',
     description_sv: 'Bankavgifter, kontoavgifter och kortavgifter',
     common: true,
+  },
+  {
+    // Stripe Payments Europe Ltd (Ireland) invoices its fees without VAT and
+    // the Swedish buyer reports them under reverse charge, the same way the
+    // Stripe extension books fees inside a payout (extensions/general/stripe/
+    // lib/payouts.ts): ruta 21 basis, 25 % fictitious VAT on 2614 and 2645.
+    id: 'payment_fees_eu',
+    name_sv: 'Stripe-avgifter (omvänd moms)',
+    name_en: 'Stripe fees (reverse charge)',
+    group: 'bank_finance',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '6570',
+    credit_account: '1930',
+    vat_treatment: 'reverse_charge',
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Fakturerat utan moms från Irland; köparen redovisar omvänd moms (ruta 21, 30 och 48).',
+    mcc_codes: [],
+    keywords: ['stripe'],
+    risk_level: 'LOW',
+    requires_review: false,
+    impact_score: 8,
+    auto_match_confidence: 0.85,
+    default_private: false,
+    fallback_category: 'expense_bank_fees',
+    description_sv: 'Avgifter från Stripe (EU-leverantör) med omvänd skattskyldighet',
+    common: true,
+    requires_vat_registration_data: true,
   },
   {
     id: 'bank_interest_income',
@@ -959,7 +1017,7 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     common: false,
   },
 
-  // --- PERSONNEL (3) ---
+  // --- PERSONNEL (10) ---
   {
     id: 'personnel_salary',
     name_sv: 'Lön (netto)',
@@ -1031,6 +1089,177 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     description_sv: 'Preliminärskatt till Skatteverket',
     common: false,
   },
+  {
+    id: 'personnel_mileage_taxfree',
+    name_sv: 'Skattefri bilersättning (mil)',
+    name_en: 'Tax-free mileage reimbursement',
+    group: 'personnel',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '7331',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Ersättning till anställd för bil- och körersättning, skattefri inom Skatteverkets gränsbelopp (för 2026: kontrollera aktuell mil-ersättning). Underlag: körjournal. Ingen ingående moms.',
+    mcc_codes: [],
+    keywords: ['milersättning', 'mil ersättning', 'milerstättning', 'körersättning', 'kör ersättning', 'bilersättning', 'reseersättning', 'kilometerersättning'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 5,
+    auto_match_confidence: 0.95,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Skattefri milersättning till anställd (kräver körjournal)',
+    common: true,
+  },
+  {
+    id: 'personnel_mileage_taxable',
+    name_sv: 'Skattepliktig bilersättning (mil)',
+    name_en: 'Taxable mileage reimbursement',
+    group: 'personnel',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '7332',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Den del av bilersättningen som överstiger Skatteverkets skattefria gränsbelopp. Skattepliktig för mottagaren och ska tas upp på AGI. Ingen ingående moms.',
+    mcc_codes: [],
+    keywords: ['skattepliktig milersättning', 'skattepliktig bilersättning', 'överskjutande bilersättning'],
+    risk_level: 'MEDIUM',
+    requires_review: true,
+    impact_score: 5,
+    auto_match_confidence: 0.90,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Skattepliktig del av bilersättning (AGI-pliktig)',
+    common: false,
+  },
+  {
+    id: 'personnel_per_diem_sweden_taxfree',
+    name_sv: 'Skattefritt traktamente (Sverige)',
+    name_en: 'Tax-free per diem (Sweden)',
+    group: 'personnel',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '7321',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Skattefritt traktamente för tjänsteresa i Sverige inom Skatteverkets schablonbelopp. Kräver reseräkning + övernattning >50 km från tjänstestället. Ingen ingående moms.',
+    mcc_codes: [],
+    // Note: keywords are intentionally narrow. "utlandstraktamente" must route
+    // to the abroad template, not here: so we avoid the bare "traktament"
+    // substring (which would also fire on "utlandstraktamente").
+    keywords: ['traktamente', 'dagtraktamente', 'helt dygn', 'halvt dygn'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 5,
+    auto_match_confidence: 0.95,
+    default_private: false,
+    fallback_category: 'expense_travel',
+    description_sv: 'Skattefritt traktamente för tjänsteresa i Sverige (kräver reseräkning)',
+    common: true,
+  },
+  {
+    id: 'personnel_per_diem_sweden_taxable',
+    name_sv: 'Skattepliktigt traktamente (Sverige)',
+    name_en: 'Taxable per diem (Sweden)',
+    group: 'personnel',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '7322',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Den del av traktamentet som överstiger Skatteverkets skattefria schablon. Skattepliktigt för mottagaren och ska tas upp på AGI.',
+    mcc_codes: [],
+    keywords: ['skattepliktigt traktamente', 'överskjutande traktamente'],
+    risk_level: 'MEDIUM',
+    requires_review: true,
+    impact_score: 4,
+    auto_match_confidence: 0.90,
+    default_private: false,
+    fallback_category: 'expense_travel',
+    description_sv: 'Skattepliktig del av traktamente Sverige (AGI-pliktig)',
+    common: false,
+  },
+  {
+    id: 'personnel_per_diem_abroad_taxfree',
+    name_sv: 'Skattefritt traktamente (utlandet)',
+    name_en: 'Tax-free per diem (abroad)',
+    group: 'personnel',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '7323',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Skattefritt utlandstraktamente per land enligt Skatteverkets normalbelopp. Kräver reseräkning. Tremånadersregeln gäller efter 3 mån.',
+    mcc_codes: [],
+    keywords: ['utlandstraktamente', 'traktamente utland', 'utlandsresa', 'utlands', 'normalbelopp'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 4,
+    auto_match_confidence: 0.90,
+    default_private: false,
+    fallback_category: 'expense_travel',
+    description_sv: 'Skattefritt traktamente för tjänsteresa utomlands',
+    common: false,
+  },
+  {
+    id: 'personnel_per_diem_abroad_taxable',
+    name_sv: 'Skattepliktigt traktamente (utlandet)',
+    name_en: 'Taxable per diem (abroad)',
+    group: 'personnel',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '7324',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Del av utlandstraktamente som överstiger Skatteverkets normalbelopp. Skattepliktig och AGI-pliktig.',
+    mcc_codes: [],
+    keywords: ['skattepliktigt utlandstraktamente'],
+    risk_level: 'MEDIUM',
+    requires_review: true,
+    impact_score: 3,
+    auto_match_confidence: 0.90,
+    default_private: false,
+    fallback_category: 'expense_travel',
+    description_sv: 'Skattepliktig del av utlandstraktamente (AGI-pliktig)',
+    common: false,
+  },
+  {
+    id: 'personnel_congestion_charge_taxfree',
+    name_sv: 'Trängselskatt (skattefri ersättning)',
+    name_en: 'Congestion charge (tax-free reimbursement)',
+    group: 'personnel',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '7333',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Ersättning till anställd för trängselskatt vid tjänsteresa, skattefri enligt 11 kap 26 § IL.',
+    mcc_codes: [],
+    keywords: ['trängselskatt', 'trängselavgift', 'congestion'],
+    risk_level: 'LOW',
+    requires_review: false,
+    impact_score: 3,
+    auto_match_confidence: 0.85,
+    default_private: false,
+    fallback_category: 'expense_travel',
+    description_sv: 'Ersättning för trängselskatt vid tjänsteresa',
+    common: false,
+  },
 
   // --- REVENUE (4) ---
   {
@@ -1080,6 +1309,35 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     common: true,
   },
   {
+    id: 'revenue_reduced_6',
+    name_sv: 'Försäljning 6% moms (böcker/kultur/transport)',
+    name_en: 'Revenue 6% VAT (books/culture/transport)',
+    group: 'revenue',
+    direction: 'income',
+    entity_applicability: 'all',
+    debit_account: '1930',
+    credit_account: '3003',
+    vat_treatment: 'reduced_6',
+    vat_rate: 0.06,
+    deductibility: 'full',
+    mcc_codes: [],
+    // Dance keywords: tillträde till danstillställningar dropped from 25% to
+    // 6% on 2026-07-01 (2025/26:SkU25, aligned with other cultural events).
+    // Admission sold and paid before that stays 25%; the descriptor reflects
+    // current law only. Deliberately admission-specific terms only: bare
+    // 'dans' or 'entré' would also match dance courses, artist fees and
+    // generic entrance charges, which are not all reduced-rate. (#1483)
+    keywords: ['bok', 'böcker', 'tidning', 'tidskrift', 'e-bok', 'persontransport', 'taxi', 'buss', 'tåg', 'kultur', 'konsert', 'teater', 'museum', 'bio', 'idrott', 'danstillställning', 'dansband', 'danskväll', 'books', 'culture', 'transport'],
+    risk_level: 'NONE',
+    requires_review: false,
+    impact_score: 5,
+    auto_match_confidence: 0.75,
+    default_private: false,
+    fallback_category: 'income_services',
+    description_sv: 'Intäkter med 6% moms (böcker, persontransport, kultur, idrott, danstillställningar fr.o.m. 2026-07-01)',
+    common: true,
+  },
+  {
     id: 'revenue_eu_services',
     name_sv: 'Tjänsteförsäljning EU (omvänd moms)',
     name_en: 'Service revenue EU (reverse charge)',
@@ -1126,6 +1384,31 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     default_private: false,
     fallback_category: 'income_services',
     description_sv: 'Export av varor/tjänster utanför EU (momsfritt, ruta 40)',
+    common: true,
+  },
+  {
+    id: 'revenue_exempt_domestic',
+    name_sv: 'Momsfri försäljning (Sverige)',
+    name_en: 'VAT-exempt sales (domestic)',
+    group: 'revenue',
+    direction: 'income',
+    entity_applicability: 'all',
+    debit_account: '1930',
+    credit_account: '3100',
+    credit_account_ab: '3004',
+    vat_treatment: 'exempt',
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Momsfri försäljning inom Sverige (t.ex. sjukvård, tandvård, utbildning, social omsorg, försäkring, finansiella tjänster) → rapportera i ruta 42',
+    mcc_codes: [],
+    keywords: ['momsfri', 'momsfritt', 'sjukvård', 'tandvård', 'utbildning', 'undervisning', 'social omsorg', 'kultur', 'försäkring', 'finansiella tjänster', 'exempt', 'healthcare', 'education'],
+    risk_level: 'LOW',
+    requires_review: false,
+    impact_score: 5,
+    auto_match_confidence: 0.70,
+    default_private: false,
+    fallback_category: 'income_services',
+    description_sv: 'Momsfri försäljning inom Sverige (sjukvård, utbildning m.m., ruta 42)',
     common: true,
   },
 
@@ -1327,7 +1610,11 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     group: 'equipment',
     direction: 'expense',
     entity_applicability: 'all',
-    debit_account: '1250',
+    // BAS 2026 head account for inventarier, verktyg och installationer, the
+    // same asset account the fixed-asset module defaults an equipment asset to
+    // (DEFAULT_ACCOUNTS_BY_CATEGORY.equipment). 1250 became a "(Fritt konto)"
+    // in BAS 2026; template-accounts-exist.test.ts pins both facts.
+    debit_account: '1220',
     credit_account: '1930',
     vat_treatment: 'standard_25',
     vat_rate: 0.25,
@@ -1342,6 +1629,565 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     default_private: false,
     fallback_category: 'expense_equipment',
     description_sv: 'Inventarie som ska aktiveras och skrivas av',
+    common: false,
+  },
+  // ============================================================
+  // Measured gaps (2026-09-10)
+  //
+  // Twelve months of bank bookings across the fleet landed roughly a third
+  // of their company-account pairs on accounts no template covered. These
+  // fill the gaps in that order: goods and materials (the catalog had no
+  // 4xxx account at all), owner and equity flows, then the long tail.
+  // ============================================================
+
+  // --- Goods & materials ---
+  {
+    id: 'goods_purchase_domestic',
+    name_sv: 'Varuinköp Sverige',
+    name_en: 'Goods purchase (Sweden)',
+    group: 'goods',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '4010',
+    credit_account: '1930',
+    vat_treatment: 'standard_25',
+    vat_rate: 0.25,
+    deductibility: 'full',
+    special_rules_sv: 'Varor för vidareförsäljning eller som ingår i det du levererar. Till eget bruk på kontoret: förbrukningsmaterial (5460) eller inventarier (5410).',
+    mcc_codes: [5211, 5039, 5085, 5198],
+    keywords: ['varuinköp', 'handelsvaror', 'inköp varor', 'råvaror', 'byggmaterial', 'byggvaror', 'byggmax', 'beijer', 'ahlsell', 'jem & fix', 'jem&fix', 'hornbach', 'k-rauta', 'grossist', 'wholesale'],
+    risk_level: 'LOW',
+    requires_review: false,
+    impact_score: 9,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'expense_consumables',
+    description_sv: 'Inköp av varor och material som säljs vidare eller ingår i det du levererar',
+    common: true,
+  },
+  {
+    id: 'goods_purchase_eu',
+    name_sv: 'Varuinköp från EU (omvänd moms)',
+    name_en: 'Goods purchase from EU (reverse charge)',
+    group: 'goods',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '4515',
+    credit_account: '1930',
+    vat_treatment: 'reverse_charge',
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Unionsinternt förvärv: säljaren fakturerar utan moms mot ditt VAT-nummer och du redovisar 25 % själv (ruta 20, 30 och 48). Kontot 4515 bär både kostnaden och beskattningsunderlaget.',
+    mcc_codes: [],
+    keywords: ['eu-varor', 'varor från eu', 'unionsinternt', 'gemenskapsinternt', 'intra-community', 'amazon.de', 'amazon.nl', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.pl'],
+    risk_level: 'MEDIUM',
+    requires_review: true,
+    impact_score: 7,
+    auto_match_confidence: 0.70,
+    default_private: false,
+    fallback_category: 'expense_consumables',
+    description_sv: 'Varor köpta från säljare i annat EU-land utan moms på fakturan',
+    common: false,
+    requires_vat_registration_data: true,
+    reverse_charge_supplier_type: 'eu_business',
+  },
+  {
+    id: 'consumables',
+    name_sv: 'Förbrukningsmaterial',
+    name_en: 'Consumables',
+    group: 'goods',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '5460',
+    credit_account: '1930',
+    vat_treatment: 'standard_25',
+    vat_rate: 0.25,
+    deductibility: 'full',
+    special_rules_sv: 'Sådant som förbrukas i verksamheten: rengöring, skruv, batterier, engångsartiklar. Saker som håller längre än ett år: inventarier (5410).',
+    mcc_codes: [],
+    keywords: ['förbrukningsmaterial', 'förbrukningsmtrl', 'rengöring', 'städmaterial', 'batterier', 'skruv', 'engångsartiklar', 'swedol', 'würth', 'wurth'],
+    risk_level: 'NONE',
+    requires_review: false,
+    impact_score: 8,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'expense_consumables',
+    description_sv: 'Material som förbrukas löpande i verksamheten',
+    common: true,
+  },
+  {
+    id: 'goods_freight',
+    name_sv: 'Frakt på varor',
+    name_en: 'Freight on goods',
+    group: 'goods',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '5710',
+    credit_account: '1930',
+    vat_treatment: 'standard_25',
+    vat_rate: 0.25,
+    deductibility: 'full',
+    special_rules_sv: 'Frakt och transportförsäkring för varor du köper eller säljer. Vanligt porto och paket från kontoret: porto och frakt (6250).',
+    mcc_codes: [4214],
+    keywords: ['fraktkostnad', 'fraktavgift', 'varufrakt', 'leveransavgift', 'shipping fee', 'freight', 'transportförsäkring'],
+    risk_level: 'NONE',
+    requires_review: false,
+    impact_score: 5,
+    auto_match_confidence: 0.75,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Fraktkostnader knutna till varor',
+    common: false,
+  },
+  {
+    id: 'customs_duties',
+    name_sv: 'Tull och spedition',
+    name_en: 'Customs and forwarding',
+    group: 'goods',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '5720',
+    credit_account: '1930',
+    vat_treatment: 'exempt',
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Tullavgiften saknar moms. Importmomsen redovisas i momsdeklarationen (ruta 50 och 60) utifrån tullräkningen, inte som ingående moms på speditörens faktura.',
+    mcc_codes: [],
+    keywords: ['tull', 'tullverket', 'tullavgift', 'förtullning', 'customs', 'import duty', 'spedition', 'speditör', 'importavgift'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 5,
+    auto_match_confidence: 0.75,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Tullavgifter och speditionskostnader vid import',
+    common: false,
+  },
+
+  // --- IT services (the 6540 family, distinct from licences on 5420) ---
+  {
+    id: 'it_services',
+    name_sv: 'IT-tjänster och utveckling',
+    name_en: 'IT services and development',
+    group: 'it_software',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '6540',
+    credit_account: '1930',
+    vat_treatment: 'standard_25',
+    vat_rate: 0.25,
+    deductibility: 'full',
+    special_rules_sv: 'Köpta IT-tjänster: utveckling, support, drift. Licenser och abonnemang: programvara (5420).',
+    mcc_codes: [7372, 7379],
+    keywords: ['it-tjänst', 'it-tjänster', 'it-konsult', 'it-support', 'webbutveckling', 'systemutveckling', 'apputveckling', 'utvecklare', 'webbyrå', 'devops', 'drift och support'],
+    risk_level: 'NONE',
+    requires_review: false,
+    impact_score: 8,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'expense_professional_services',
+    description_sv: 'IT-tjänster köpta från svensk leverantör',
+    common: true,
+  },
+  {
+    id: 'it_services_foreign',
+    name_sv: 'IT-tjänster utanför EU (omvänd moms)',
+    name_en: 'IT services from outside the EU (reverse charge)',
+    group: 'it_software',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '6540',
+    credit_account: '1930',
+    vat_treatment: 'reverse_charge',
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Frilansplattformar och byråer utanför EU fakturerar utan moms; du redovisar 25 % själv (ruta 22, 30 och 48). Leverantör inom EU: samma booking men ruta 21, välj EU-leverantör vid granskningen.',
+    mcc_codes: [],
+    keywords: ['upwork', 'fiverr', 'toptal', 'freelancer.com', 'outsourcing', 'offshore', 'utländsk utvecklare'],
+    risk_level: 'LOW',
+    requires_review: false,
+    impact_score: 7,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'expense_professional_services',
+    description_sv: 'IT-tjänster köpta från leverantör utanför EU med omvänd skattskyldighet',
+    common: false,
+    requires_vat_registration_data: true,
+    reverse_charge_supplier_type: 'non_eu_business',
+  },
+
+  // --- Long tail of external costs ---
+  {
+    id: 'newspapers_literature',
+    name_sv: 'Tidningar och facklitteratur',
+    name_en: 'Newspapers and trade literature',
+    group: 'education',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '6970',
+    credit_account: '1930',
+    vat_treatment: 'reduced_6',
+    vat_rate: 0.06,
+    deductibility: 'full',
+    special_rules_sv: 'Tryckta och digitala tidningar, tidskrifter och böcker har 6 % moms. Utländsk digital prenumeration: omvänd moms.',
+    mcc_codes: [5192, 5942, 5994],
+    keywords: ['tidning', 'tidskrift', 'dagstidning', 'facklitteratur', 'dagens industri', 'svenska dagbladet', 'dagens nyheter', 'breakit', 'bonnier news', 'adlibris', 'bokus', 'akademibokhandeln', 'prenumeration tidning'],
+    risk_level: 'NONE',
+    requires_review: false,
+    impact_score: 5,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'expense_education',
+    description_sv: 'Tidningar, tidskrifter och facklitteratur för verksamheten',
+    common: false,
+  },
+  {
+    id: 'non_deductible_fees',
+    name_sv: 'Böter och förseningsavgifter',
+    name_en: 'Fines and late fees',
+    group: 'financial',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '6992',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'non_deductible',
+    deductibility_note_sv: 'Böter, viten, förseningsavgifter och skattetillägg är inte avdragsgilla och saknar moms',
+    mcc_codes: [9222],
+    keywords: ['böter', 'bot', 'förseningsavgift', 'kontrollavgift', 'skattetillägg', 'felparkering', 'parkeringsanmärkning', 'parkeringsböter', 'fortkörning', 'penalty'],
+    risk_level: 'LOW',
+    requires_review: false,
+    impact_score: 5,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Ej avdragsgilla avgifter: böter, viten, förseningsavgifter',
+    common: false,
+  },
+
+  // --- Personnel ---
+  {
+    id: 'personnel_refreshments',
+    name_sv: 'Personalfika och frukt',
+    name_en: 'Staff refreshments',
+    group: 'personnel',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '7690',
+    credit_account: '1930',
+    vat_treatment: 'reduced_6',
+    vat_rate: 0.06,
+    deductibility: 'full',
+    special_rules_sv: 'Enklare förtäring på arbetsplatsen är personalvård med fullt avdrag. Livsmedel har 6 % moms, från kafé eller restaurang 12 %. Måltider med personalen: intern representation.',
+    mcc_codes: [5411, 5499],
+    keywords: ['personalfika', 'fruktkorg', 'frukt till kontoret', 'kontorskaffe', 'kaffe till kontoret', 'fruktbudet', 'selecta', 'jobmeal', 'kontorsfika'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 6,
+    auto_match_confidence: 0.70,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Fika, frukt och kaffe till personalen',
+    common: true,
+  },
+  {
+    id: 'personnel_wellness',
+    name_sv: 'Friskvård',
+    name_en: 'Wellness benefit',
+    group: 'personnel',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '7699',
+    credit_account: '1930',
+    vat_treatment: 'reduced_6',
+    vat_rate: 0.06,
+    deductibility: 'full',
+    special_rules_sv: 'Skattefri friskvård för anställda upp till 5 000 kr per person och år. Gym och motion har 6 % moms, massage och naprapat 25 %. Ägaren av en enskild firma är inte anställd och får ingen friskvård.',
+    mcc_codes: [7997],
+    keywords: ['friskvård', 'friskvårdsbidrag', 'gym', 'gymkort', 'träningskort', 'sats sverige', 'nordic wellness', 'fitness24seven', 'actic', 'friskis', 'epassi', 'wellnet', 'massage'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 6,
+    auto_match_confidence: 0.75,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Friskvård för anställda',
+    common: false,
+  },
+
+  // --- Vehicle ---
+  {
+    id: 'vehicle_tax',
+    name_sv: 'Fordonsskatt',
+    name_en: 'Vehicle tax',
+    group: 'vehicle',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '5612',
+    credit_account: '1930',
+    vat_treatment: 'exempt',
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Fordonsskatt saknar moms. Gäller fordon som verksamheten äger; privat bil i enskild firma ersätts med milersättning i stället.',
+    mcc_codes: [],
+    keywords: ['fordonsskatt', 'vägtrafikskatt', 'transportstyrelsen', 'transportstyr', 'vehicle tax'],
+    risk_level: 'LOW',
+    requires_review: false,
+    impact_score: 5,
+    auto_match_confidence: 0.85,
+    default_private: false,
+    fallback_category: 'expense_vehicle',
+    description_sv: 'Fordonsskatt för verksamhetens fordon',
+    common: false,
+  },
+  {
+    id: 'vehicle_rental',
+    name_sv: 'Hyrbil',
+    name_en: 'Car rental',
+    group: 'vehicle',
+    direction: 'expense',
+    entity_applicability: 'all',
+    debit_account: '5820',
+    credit_account: '1930',
+    vat_treatment: 'standard_25',
+    vat_rate: 0.25,
+    deductibility: 'conditional',
+    deductibility_note_sv: 'Max 50 % momsavdrag vid hyra av personbil',
+    special_rules_sv: 'Personbil: halvt momsavdrag, som vid leasing. Lastbil och lätt lastbil: fullt avdrag.',
+    mcc_codes: [7512, 3355, 3357, 3366, 3381, 3387, 3389, 3393, 3405],
+    keywords: ['hyrbil', 'hyra bil', 'biluthyrning', 'rental car', 'car rental', 'europcar', 'hertz', 'sixt', 'enterprise rent', 'kinto', 'recordgo', 'mabi'],
+    risk_level: 'LOW',
+    requires_review: false,
+    impact_score: 5,
+    auto_match_confidence: 0.85,
+    default_private: false,
+    fallback_category: 'expense_travel',
+    description_sv: 'Hyrbil vid tjänsteresa eller tillfälligt behov',
+    common: false,
+  },
+
+  // --- Owner and equity flows (AB) ---
+  {
+    id: 'share_capital_deposit',
+    name_sv: 'Insättning av aktiekapital',
+    name_en: 'Share capital paid in',
+    group: 'private_transfers',
+    direction: 'transfer',
+    entity_applicability: 'aktiebolag',
+    debit_account: '1930',
+    credit_account: '2081',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'non_deductible',
+    special_rules_sv: 'Aktiekapitalet vid bolagsbildning eller nyemission. Nyemission till överkurs: överkursen på fri överkursfond (2097).',
+    mcc_codes: [],
+    keywords: ['aktiekapital', 'share capital', 'bolagsbildning', 'nyemission', 'aktieteckning', 'inbetalning aktiekapital'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 8,
+    auto_match_confidence: 0.85,
+    default_private: false,
+    fallback_category: 'income_other',
+    description_sv: 'Inbetalt aktiekapital från ägarna vid bildande eller nyemission',
+    common: true,
+  },
+  {
+    id: 'shareholder_contribution',
+    name_sv: 'Aktieägartillskott',
+    name_en: 'Shareholder contribution',
+    group: 'private_transfers',
+    direction: 'transfer',
+    entity_applicability: 'aktiebolag',
+    debit_account: '1930',
+    credit_account: '2093',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'non_deductible',
+    special_rules_sv: 'Ovillkorat och villkorat tillskott bokförs båda på 2093; villkoret om återbetalning noteras i årsredovisningen. Ett lån från ägaren är i stället en skuld (2393).',
+    mcc_codes: [],
+    keywords: ['aktieägartillskott', 'ovillkorat aktieägartillskott', 'villkorat aktieägartillskott', 'shareholder contribution', 'kapitaltillskott'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 7,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'income_other',
+    description_sv: 'Tillskott från ägarna som stärker bolagets egna kapital',
+    common: false,
+  },
+  {
+    id: 'dividend_paid',
+    name_sv: 'Utbetald utdelning',
+    name_en: 'Dividend paid',
+    group: 'private_transfers',
+    direction: 'transfer',
+    entity_applicability: 'aktiebolag',
+    debit_account: '2898',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'non_deductible',
+    special_rules_sv: 'Bokför stämmans beslut först: debet 2091, kredit 2898. Sedan utbetalningen härifrån. Utdelning kräver fritt eget kapital i senaste fastställda balansräkning.',
+    mcc_codes: [],
+    keywords: ['utdelning', 'aktieutdelning', 'vinstutdelning', 'dividend', 'beslutad utdelning'],
+    risk_level: 'HIGH',
+    requires_review: true,
+    impact_score: 8,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Utbetalning av beslutad utdelning till aktieägarna',
+    common: true,
+  },
+
+  // --- Placements (AB) ---
+  {
+    id: 'capital_insurance_deposit',
+    name_sv: 'Insättning kapitalförsäkring',
+    name_en: 'Capital insurance deposit',
+    group: 'financial',
+    direction: 'transfer',
+    entity_applicability: 'aktiebolag',
+    debit_account: '1385',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'non_deductible',
+    special_rules_sv: 'Insättningen är en finansiell tillgång, inte en kostnad. Uttag bokförs mot 1385 och vinst eller förlust på 8220. Avkastningsskatten dras av försäkringsbolaget.',
+    mcc_codes: [],
+    keywords: ['kapitalförsäkring', 'kf', 'insättning kapitalförsäkring', 'avanza kf', 'nordnet kf', 'skandia kapitalförsäkring'],
+    risk_level: 'MEDIUM',
+    requires_review: true,
+    impact_score: 6,
+    auto_match_confidence: 0.75,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Placering av överskott i en kapitalförsäkring',
+    common: false,
+  },
+  {
+    id: 'securities_purchase',
+    name_sv: 'Köp av aktier och fonder',
+    name_en: 'Purchase of shares and funds',
+    group: 'financial',
+    direction: 'transfer',
+    entity_applicability: 'aktiebolag',
+    debit_account: '1810',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'non_deductible',
+    special_rules_sv: 'Kortfristig placering av överskott i noterade aktier och fonder. Långsiktigt innehav: andra långfristiga värdepappersinnehav (1350). Vinst och förlust bokförs som finansiell post vid försäljning.',
+    mcc_codes: [],
+    keywords: ['aktier', 'fonder', 'värdepapper', 'fondköp', 'aktieköp', 'depå', 'avanza', 'nordnet'],
+    risk_level: 'HIGH',
+    requires_review: true,
+    impact_score: 6,
+    auto_match_confidence: 0.70,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Placering av överskott i aktier eller fonder',
+    common: false,
+  },
+
+  // --- Income without VAT logic of its own ---
+  {
+    id: 'grant_received',
+    name_sv: 'Erhållet bidrag',
+    name_en: 'Grant received',
+    group: 'revenue',
+    direction: 'income',
+    entity_applicability: 'all',
+    debit_account: '1930',
+    credit_account: '3985',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'full',
+    special_rules_sv: 'Bidrag utan motprestation ligger utanför momsen. EU-bidrag: 3981, kommunala bidrag: 3987, bidrag för personal som lönebidrag: 3988.',
+    mcc_codes: [],
+    keywords: ['bidrag', 'projektbidrag', 'tillväxtverket', 'vinnova', 'kulturrådet', 'konstnärsnämnden', 'energimyndigheten', 'jordbruksverket', 'länsstyrelsen', 'grant'],
+    risk_level: 'MEDIUM',
+    requires_review: true,
+    impact_score: 7,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'income_other',
+    description_sv: 'Statligt bidrag eller stöd utan motprestation',
+    common: false,
+  },
+  {
+    id: 'royalty_income',
+    name_sv: 'Royalty och upphovsrättsersättning',
+    name_en: 'Royalty and copyright income',
+    group: 'revenue',
+    direction: 'income',
+    entity_applicability: 'all',
+    debit_account: '1930',
+    credit_account: '3922',
+    vat_treatment: 'reduced_6',
+    vat_rate: 0.06,
+    deductibility: 'full',
+    special_rules_sv: 'Upplåtelse av upphovsrätt till litterära och musikaliska verk har 6 % moms. Licens på programvara eller varumärke: 25 %.',
+    mcc_codes: [],
+    keywords: ['royalty', 'royalties', 'upphovsrätt', 'upphovsrättslig ersättning', 'stim', 'sami', 'ifpi', 'licensintäkt', 'distrokid', 'cd baby', 'tunecore'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 6,
+    auto_match_confidence: 0.75,
+    default_private: false,
+    fallback_category: 'income_other',
+    description_sv: 'Royalty och ersättning för upphovsrätt',
+    common: false,
+  },
+
+  // --- Settlements of liabilities booked elsewhere ---
+  {
+    id: 'company_card_settlement',
+    name_sv: 'Avräkning företagskort',
+    name_en: 'Company card settlement',
+    group: 'financial',
+    direction: 'transfer',
+    entity_applicability: 'all',
+    debit_account: '2890',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'non_deductible',
+    special_rules_sv: 'Kortköpen bokförs var för sig när kvittona kommer in, mot 2890. Överföringen till kortbolaget kvittar skulden.',
+    mcc_codes: [],
+    keywords: ['mynt', 'pleo', 'soldo', 'företagskort', 'kortavräkning', 'kortfaktura', 'card settlement'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 6,
+    auto_match_confidence: 0.80,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Betalning till kortbolag för köp som bokförts på kvittona',
+    common: false,
+  },
+  {
+    id: 'expense_reimbursement',
+    name_sv: 'Återbetalning av utlägg',
+    name_en: 'Expense reimbursement',
+    group: 'personnel',
+    direction: 'transfer',
+    entity_applicability: 'all',
+    debit_account: '2820',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_rate: 0,
+    deductibility: 'non_deductible',
+    special_rules_sv: 'Kvittot bokförs som utlägg mot 2820 när det registreras; den här utbetalningen kvittar skulden till den anställde. Är kvittot inte registrerat: bokför utbetalningen direkt på kostnadskontot.',
+    mcc_codes: [],
+    keywords: ['utlägg', 'ers utlägg', 'ers. utlägg', 'ersättning utlägg', 'återbetalning utlägg', 'expense reimbursement', 'reimbursement'],
+    risk_level: 'LOW',
+    requires_review: true,
+    impact_score: 6,
+    auto_match_confidence: 0.70,
+    default_private: false,
+    fallback_category: 'expense_other',
+    description_sv: 'Utbetalning till anställd för registrerat utlägg',
     common: false,
   },
 ]
@@ -1406,6 +2252,26 @@ export function getTemplateGroups(): TemplateGroupInfo[] {
  * Fuzzy search templates by name, keywords, or description.
  * Optionally filter by entity type.
  */
+/**
+ * Account-number matching for template search: an all-digit token prefix-
+ * matches the template's BUSINESS account(s), i.e. the cost/revenue side,
+ * not the settlement side. Matching the settlement leg too would make "1930"
+ * (the default bank account) light up nearly every template, which is noise,
+ * not search. Transfers have no business/settlement split, so both legs
+ * match. AB-variant accounts are included so the search works for both
+ * entity types. Account numbers are identifiers (strings): prefix match only.
+ */
+function templateAccountMatches(t: BookingTemplate, token: string): boolean {
+  if (!/^\d+$/.test(token)) return false
+  const candidates =
+    t.direction === 'expense'
+      ? [t.debit_account, t.debit_account_ab]
+      : t.direction === 'income'
+        ? [t.credit_account, t.credit_account_ab]
+        : [t.debit_account, t.credit_account, t.debit_account_ab, t.credit_account_ab]
+  return candidates.some((acc) => !!acc && acc.startsWith(token))
+}
+
 export function searchTemplates(query: string, entityType?: EntityType): BookingTemplate[] {
   if (!query.trim()) return []
   const q = query.toLowerCase()
@@ -1423,7 +2289,8 @@ export function searchTemplates(query: string, entityType?: EntityType): Booking
       t.name_en.toLowerCase().includes(token) ||
       t.description_sv.toLowerCase().includes(token) ||
       t.keywords.some((kw) => kw.toLowerCase().includes(token)) ||
-      t.id.includes(token)
+      t.id.includes(token) ||
+      templateAccountMatches(t, token)
     )
   })
 }
@@ -1474,9 +2341,74 @@ export function validateTemplateForEntity(
 }
 
 /**
+ * Common Swedish bank-description prefixes/suffixes that describe HOW a payment
+ * was made, not WHAT was purchased. These get stripped before keyword matching
+ * so a transaction text like "milersättning april Överföring via internet" no
+ * longer collides with the `telecom_internet` template's `internet` keyword.
+ *
+ * Order matters: list longer phrases first so substring removal hits them
+ * before shorter ones (e.g. "överföring via internet" before "internet").
+ */
+const BANK_NOISE_PHRASES: readonly string[] = [
+  'överföring via internet',
+  'överföring via mobil',
+  'överföring via app',
+  'överföring inom bank',
+  'överföring mellan konton',
+  'internetbetalning',
+  // Handelsbanken's truncated form ("INTERNET BET 1"): a supplier payment
+  // made in the internet bank, not an internet subscription.
+  'internet bet',
+  'mobilbetalning',
+  'direktbetalning',
+  'direktöverföring',
+  'autogirobetalning',
+  'autogiro',
+  'bg-betalning',
+  'bg betalning',
+  'pg-betalning',
+  'pg betalning',
+  'bgmax',
+  'bg-inb',
+  'plusgiro',
+  'bankgiro',
+  'swish till',
+  'swish från',
+  'swish-betalning',
+  'kortköp',
+  'kortbetalning',
+  'webbköp',
+  'överföring',
+  'insättning',
+]
+
+/**
+ * Strip bank-payment-method noise from a description so the substring matcher
+ * doesn't match on the bank's own prefix vocabulary. Operates on lowercase
+ * input and collapses the whitespace it leaves behind.
+ */
+export function stripBankNoise(lowerText: string): string {
+  let out = lowerText
+  for (const phrase of BANK_NOISE_PHRASES) {
+    if (out.includes(phrase)) {
+      out = out.split(phrase).join(' ')
+    }
+  }
+  return out.replace(/\s+/g, ' ').trim()
+}
+
+/**
  * Multi-signal matching against a transaction.
  * Returns top matches sorted by confidence descending.
  */
+/** Keywords up to this length are matched as whole words; longer ones may sit inside a word ("fjärruppvärmning"). */
+const WHOLE_WORD_KEYWORD_MAX = 3
+
+function keywordMatches(searchText: string, searchWords: ReadonlySet<string>, keyword: string): boolean {
+  if (keyword.length <= WHOLE_WORD_KEYWORD_MAX) return searchWords.has(keyword)
+  return searchText.includes(keyword)
+}
+
 export function findMatchingTemplates(
   transaction: Transaction,
   entityType?: EntityType
@@ -1487,7 +2419,11 @@ export function findMatchingTemplates(
 
   const descLower = (transaction.description || '').toLowerCase()
   const merchantLower = (transaction.merchant_name || '').toLowerCase()
-  const searchText = `${descLower} ${merchantLower}`
+  const rawSearchText = `${descLower} ${merchantLower}`
+  // Strip bank-method noise so e.g. "Överföring via internet" doesn't make
+  // the matcher believe the merchant is "Internet" (→ 6230 telecom).
+  const searchText = stripBankNoise(rawSearchText)
+  const searchWords = new Set(searchText.split(/[^\p{L}\p{N}]+/u).filter(Boolean))
 
   for (const t of BOOKING_TEMPLATES) {
     // Filter entity applicability
@@ -1507,11 +2443,13 @@ export function findMatchingTemplates(
       score += 0.4
     }
 
-    // Keyword matches in description + merchant: +0.3 (proportional)
+    // Keyword matches in description + merchant: +0.3 (proportional).
+    // Short keywords match whole words only: "el" inside "vercel" or
+    // "hotel" made El & Uppvärmning the top proposal for a hosting bill.
     if (t.keywords.length > 0) {
       let matchedKeywords = 0
       for (const kw of t.keywords) {
-        if (searchText.includes(kw.toLowerCase())) {
+        if (keywordMatches(searchText, searchWords, kw.toLowerCase())) {
           matchedKeywords++
         }
       }
@@ -1537,34 +2475,63 @@ export function findMatchingTemplates(
 }
 
 /**
+ * Whether an account number sits in the reverse-charge basbelopp range
+ * (44xx/45xx series, ruta 20-24 inputs). Used to skip redundant basis
+ * emission when the template already books to such an account.
+ */
+function isBasisAccount(account: string): boolean {
+  return /^4[45]\d{2}$/.test(account)
+}
+
+/**
  * Convert a booking template into a MappingResult.
  * Follows the same pattern as buildMappingResultFromCategory in category-mapping.ts.
  */
 export function buildMappingResultFromTemplate(
   template: BookingTemplate,
   transaction: Transaction,
-  entityType: EntityType = 'enskild_firma'
+  entityType: EntityType,
+  vatRegistered?: VatRegistration
 ): MappingResult {
   const isExpense = transaction.amount < 0
   const isBusiness = !template.default_private
+  // The template's treatment resolved for the company's VAT registration: a
+  // non-registered company books a rate-bearing template as exempt, reverse
+  // charge stays (lib/bookkeeping/vat-registration.ts).
+  const vatTreatment = vatTreatmentForRegistration(template.vat_treatment, vatRegistered)
 
-  // Resolve entity-specific accounts
-  let debitAccount = template.debit_account
-  let creditAccount = template.credit_account
-  if (entityType === 'aktiebolag') {
-    if (template.debit_account_ab) debitAccount = template.debit_account_ab
-    if (template.credit_account_ab) creditAccount = template.credit_account_ab
-  }
+  // Resolve entity-specific accounts (EF base, AB override, förening: base
+  // with owner accounts translated to the member settlement account).
+  const debitAccount = templateAccountForForm(entityType, template.debit_account, template.debit_account_ab)!
+  const creditAccount = templateAccountForForm(entityType, template.credit_account, template.credit_account_ab)!
+
+  // Always work in SEK. For non-SEK transactions, resolve the SEK-equivalent
+  // (via amount_sek or amount * exchange_rate); for SEK rows this is a no-op.
+  // Without this, VAT and reverse-charge lines would be emitted in the
+  // original currency and the resulting verifikation would mix currencies.
+  const absAmount = Math.abs(resolveSekAmount(
+    transaction.amount,
+    transaction.amount_sek,
+    transaction.currency,
+    transaction.exchange_rate
+  ))
 
   // Generate VAT lines
   const vatLines: VatJournalLine[] = []
-  if (isBusiness && template.vat_treatment && template.deductibility !== 'non_deductible') {
-    const vatRate = getVatRate(template.vat_treatment)
+  if (isBusiness && vatTreatment && template.deductibility !== 'non_deductible') {
+    const vatRate = getVatRate(vatTreatment)
 
-    if (template.vat_treatment === 'reverse_charge' && isExpense) {
-      // EU reverse charge: fiktiv moms (offsetting entries)
-      const absAmount = Math.abs(transaction.amount)
-      const rcLines = generateReverseChargeLines(absAmount)
+    if (vatTreatment === 'reverse_charge' && isExpense) {
+      // EU/non-EU/domestic reverse charge: emit BOTH the fiktiv-moms pair
+      // (2645|2647 / 2614) AND the basbelopp pair (44xx|45xx / 4598). The
+      // basbelopp pair populates momsdeklaration rutor 20-24; without it
+      // Skatteverket rejects with FK004 ("ruta 30-32 utan motsvarande
+      // basbelopp i 20-24", ML 13 kap kräver båda sidor).
+      const supplierType = template.reverse_charge_supplier_type ?? 'eu_business'
+      const isDomestic = supplierType === 'swedish_business'
+      const rcRate = 0.25 // fiktiv moms rate; current templates are 25%
+
+      const rcLines = generateReverseChargeLines(absAmount, rcRate, isDomestic)
       for (const rcl of rcLines) {
         vatLines.push({
           account_number: rcl.account_number,
@@ -1573,9 +2540,22 @@ export function buildMappingResultFromTemplate(
           description: rcl.line_description || '',
         })
       }
+
+      // Skip basbelopp emission if the template already books the expense
+      // directly to a basis account (44xx/45xx series): would double-count.
+      if (!isBasisAccount(debitAccount)) {
+        const basisLines = generateReverseChargeBasisLines(absAmount, rcRate, supplierType)
+        for (const bl of basisLines) {
+          vatLines.push({
+            account_number: bl.account_number,
+            debit_amount: bl.debit_amount,
+            credit_amount: bl.credit_amount,
+            description: bl.line_description || '',
+          })
+        }
+      }
     } else if (vatRate > 0 && isExpense) {
       // Input VAT deduction
-      const absAmount = Math.abs(transaction.amount)
       const vatLine = generateInputVatLine(absAmount, vatRate)
       if (vatLine) {
         vatLines.push({
@@ -1587,10 +2567,9 @@ export function buildMappingResultFromTemplate(
       }
     } else if (vatRate > 0 && !isExpense) {
       // Output VAT (income)
-      const grossAmount = Math.abs(transaction.amount)
-      const vatAmount = Math.round((grossAmount * vatRate / (1 + vatRate)) * 100) / 100
+      const vatAmount = Math.round((absAmount * vatRate / (1 + vatRate)) * 100) / 100
       let vatAccount: string
-      switch (template.vat_treatment) {
+      switch (vatTreatment) {
         case 'standard_25': vatAccount = '2611'; break
         case 'reduced_12': vatAccount = '2621'; break
         case 'reduced_6': vatAccount = '2631'; break

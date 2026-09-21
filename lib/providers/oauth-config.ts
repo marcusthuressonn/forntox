@@ -16,8 +16,10 @@ export function getOAuthConfig(provider: string): OAuthConfig {
     };
   }
   if (provider === 'briox') {
+    // No app-level credentials: the user's account ID + application token are
+    // exchanged per consent (exchangeBrioxCode). No env vars needed.
     return {
-      clientId: process.env.BRIOX_CLIENT_ID ?? '',
+      clientId: '',
       clientSecret: '',
       redirectUri: '',
     };
@@ -36,9 +38,14 @@ export function getOAuthConfig(provider: string): OAuthConfig {
       redirectUri: '',
     };
   }
+  if (provider === 'wint') {
+    // No app-level credentials: WINT has no OAuth. The user's login is
+    // exchanged once for a token pair at submit (loginWint). No env vars.
+    return {
+      clientId: '',
+      clientSecret: '',
+      redirectUri: '',
+    };
+  }
   throw new Error(`Unknown provider: ${provider}`);
-}
-
-export function validateProvider(provider: string): boolean {
-  return provider === 'fortnox' || provider === 'visma' || provider === 'briox' || provider === 'bokio' || provider === 'bjornlunden';
 }
