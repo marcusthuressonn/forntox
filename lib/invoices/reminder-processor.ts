@@ -1,11 +1,22 @@
 import { createServerClient } from '@supabase/ssr'
 import { getEmailService } from '@/lib/email/service'
+import { getSenderForCompany, getBaseUrlForBrand } from '@/lib/email/brand-sender'
+import { resolveInvoiceSender, type InvoiceSenderIdentity } from '@/lib/email/invoice-sender'
+import { resolveInvoiceReplyTo } from '@/lib/invoices/email-recipients'
 import {
   generateReminderEmailHtml,
   generateReminderEmailText,
   generateReminderEmailSubject,
-  getReminderDaysConfig
+  reminderPrincipal,
+  getReminderDaysConfig,
+  type ReminderDaysConfig,
 } from '@/lib/email/reminder-templates'
+import { calculateLatePaymentInterest } from '@/lib/invoices/late-payment-interest'
+import {
+  hasUsableInvoicePaymentAccount,
+  resolveInvoicePaymentAccount,
+} from '@/lib/invoices/payment-accounts'
+import { createReminderFeeEntry } from '@/lib/bookkeeping/reminder-fee-entries'
 import { createLogger } from '@/lib/logger'
 import type { Invoice, Customer, CompanySettings } from '@/types'
 
@@ -47,21 +58,19 @@ export interface ProcessRemindersResult {
  */
 export function determineReminderLevel(
   daysOverdue: number,
-  existingLevels: number[]
+  existingLevels: number[],
+  config: ReminderDaysConfig = getReminderDaysConfig(),
 ): 1 | 2 | 3 | null {
-  const config = getReminderDaysConfig()
-
-  // Check level 3 (45 days)
+  // Check the highest eligible level first, preserving the existing behavior
+  // when a previous cron run was missed.
   if (daysOverdue >= config[3] && !existingLevels.includes(3)) {
     return 3
   }
 
-  // Check level 2 (30 days)
   if (daysOverdue >= config[2] && !existingLevels.includes(2)) {
     return 2
   }
 
-  // Check level 1 (15 days)
   if (daysOverdue >= config[1] && !existingLevels.includes(1)) {
     return 1
   }
@@ -81,13 +90,34 @@ export function calculateDaysOverdue(dueDate: string): number {
 }
 
 /**
+ * Surcharges computed before sending the reminder. These are passed to the
+ * email template and persisted on the invoice_reminders row for audit.
+ */
+export interface ReminderSurcharges {
+  /** Dröjsmålsränta: a share of the invoice total, so it carries the INVOICE currency. */
+  interestAmount: number
+  interestRate: number
+  interestFromDate: string
+  interestDays: number
+  /**
+   * Lagstadgad påminnelseavgift, always in SEK (Lag 1981:739; booked 1510/3990
+   * in SEK). Deliberately NOT summed with the invoice-currency amounts here:
+   * the template derives the per-currency amount to pay via
+   * calculateReminderAmounts().
+   */
+  reminderFee: number
+}
+
+/**
  * Send a single reminder email
  */
 export async function sendReminder(
   invoice: Invoice & { customer: Customer },
   company: CompanySettings,
   reminderLevel: 1 | 2 | 3,
-  actionToken: string
+  actionToken: string,
+  surcharges: ReminderSurcharges,
+  sender?: InvoiceSenderIdentity,
 ): Promise<{ success: boolean; error?: string }> {
   const customer = invoice.customer
 
@@ -95,19 +125,41 @@ export async function sendReminder(
     return { success: false, error: 'Customer has no email' }
   }
 
+  // Backstop for direct callers: processOverdueReminders applies this same
+  // gate BEFORE booking the fee and inserting the reminder row. A reminder
+  // with no payment account for the invoice currency would print nothing to
+  // pay to, or (before this gate) the SEK account's IBAN on a EUR invoice.
+  const currency = invoice.currency
+  if (!hasUsableInvoicePaymentAccount(resolveInvoicePaymentAccount(company, currency, invoice.payment_details ?? null), currency)) {
+    log.warn('Skipping reminder: no payment account configured for invoice currency', {
+      invoiceId: invoice.id,
+      invoiceNumber: invoice.invoice_number,
+      currency,
+    })
+    return { success: false, error: `INVOICE_PAYMENT_ACCOUNT_MISSING:${currency}` }
+  }
+
   const daysOverdue = calculateDaysOverdue(invoice.due_date)
 
-  // Build action URL (public page for customer response)
-  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://app.erp-base.se'
+  // Brand mail (WL-13): the action link points at the company's home domain
+  // and the mail rides the brand's verified sender domain, while the COMPANY
+  // stays the displayed sender exactly as today. No brand = canonical URL
+  // and today's From header.
+  const brandSender = await getSenderForCompany(invoice.company_id)
+  const baseUrl = getBaseUrlForBrand(brandSender.brand)
   const actionUrl = `${baseUrl}/invoice-action/${actionToken}`
 
+  // Cron send: no user to fall back to for Reply-To.
+  const replyTo = resolveInvoiceReplyTo(company)
   const emailData = {
     invoice,
     customer,
     company,
+    replyTo,
     reminderLevel,
     daysOverdue,
-    actionUrl
+    actionUrl,
+    ...surcharges,
   }
 
   const result = await getEmailService().sendEmail({
@@ -115,8 +167,12 @@ export async function sendReminder(
     subject: generateReminderEmailSubject(emailData),
     html: generateReminderEmailHtml(emailData),
     text: generateReminderEmailText(emailData),
-    replyTo: company.email || undefined,
-    fromName: company.trade_name || company.company_name || undefined
+    replyTo,
+    fromName: company.company_name || undefined,
+    ...(brandSender.fromAddress ? { fromAddress: brandSender.fromAddress } : {}),
+    // The company's own verified sender wins over the brand address
+    // (buildFromHeader gives `from` precedence).
+    from: sender,
   })
 
   return result
@@ -129,20 +185,28 @@ export async function sendReminder(
 export async function processOverdueReminders(): Promise<ProcessRemindersResult> {
   const supabase = createServiceClient()
   const results: ReminderResult[] = []
-  const config = getReminderDaysConfig()
 
-  // Find all sent invoices that are past due date (at least 15 days overdue)
-  const minOverdueDays = config[1]
+  // Company schedules can start as early as one day overdue. Fetch that
+  // bounded candidate set, then apply each company's thresholds below.
   const cutoffDate = new Date()
-  cutoffDate.setDate(cutoffDate.getDate() - minOverdueDays)
+  cutoffDate.setDate(cutoffDate.getDate() - 1)
 
+  // Positive allowlist: inherently excludes 'paid', 'partially_paid', 'cancelled', 'credited'.
+  // Including 'overdue' ensures level-2 / level-3 reminders re-fire after the first reminder
+  // flips status to 'overdue' (see status update below).
   const { data: overdueInvoices, error: invoiceError } = await supabase
     .from('invoices')
     .select(`
       *,
-      customer:customers(*)
+      customer:customers(*),
+      credit_notes:invoices!credited_invoice_id(id, status, creation_complete)
     `)
-    .eq('status', 'sent')
+    .in('status', ['sent', 'overdue'])
+    // Only fakturor are payment requests. A sent proforma or quote past its
+    // date is not overdue and must never receive a betalningspåminnelse or
+    // be flipped to 'overdue' below.
+    .eq('document_type', 'invoice')
+    .is('credited_invoice_id', null)
     .lte('due_date', cutoffDate.toISOString().split('T')[0])
     .order('due_date', { ascending: true })
 
@@ -160,6 +224,17 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
 
   // Process each invoice
   for (const invoice of overdueInvoices) {
+    const activeCreditNotes = ((invoice as { credit_notes?: Array<{
+      status: string
+      creation_complete?: boolean
+    }> }).credit_notes ?? []).filter(
+      (creditNote) => creditNote.status !== 'cancelled' && creditNote.creation_complete !== false,
+    )
+    if (activeCreditNotes.length > 0) {
+      log.info(`Skipping invoice ${invoice.invoice_number}: active credit note exists`)
+      continue
+    }
+
     const customer = invoice.customer as Customer
 
     // Skip if customer has no email
@@ -171,18 +246,23 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
     // Get existing reminders for this invoice
     const { data: existingReminders } = await supabase
       .from('invoice_reminders')
-      .select('reminder_level')
+      .select('reminder_level, response_type')
       .eq('invoice_id', invoice.id)
+
+    // Skip if customer already responded (marked paid OR disputed): they've
+    // told us they don't want another reminder. The business owner still needs
+    // to record the actual payment (mark-paid / match-invoice) to flip status
+    // and post the journal entry; we don't do that here because the customer
+    // action is unauthenticated and posting a JE without a verified payment
+    // would put the books out of sync.
+    const customerResponded = existingReminders?.some(r => r.response_type !== null)
+    if (customerResponded) {
+      log.info(`Skipping invoice ${invoice.invoice_number}: customer already responded via reminder link`)
+      continue
+    }
 
     const existingLevels = existingReminders?.map(r => r.reminder_level) || []
     const daysOverdue = calculateDaysOverdue(invoice.due_date)
-    const reminderLevel = determineReminderLevel(daysOverdue, existingLevels)
-
-    // Skip if no reminder needed
-    if (!reminderLevel) {
-      log.info(`Skipping invoice ${invoice.invoice_number}: no reminder needed (${daysOverdue} days overdue, existing levels: ${existingLevels.join(', ')})`)
-      continue
-    }
 
     // Get company settings for this user
     const { data: company, error: companyError } = await supabase
@@ -193,18 +273,140 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
 
     if (companyError || !company) {
       log.error(`Skipping invoice ${invoice.invoice_number}: company settings not found`)
+      const fallbackLevel = determineReminderLevel(daysOverdue, existingLevels)
+      if (fallbackLevel) {
+        results.push({
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.invoice_number,
+          customerEmail: customer.email,
+          reminderLevel: fallbackLevel,
+          success: false,
+          error: 'Company settings not found',
+        })
+      }
+      continue
+    }
+
+    // Per-company kill switch (settings → Fakturering → "Skicka automatiska påminnelser")
+    if (company.send_invoice_reminders === false) {
+      log.info(`Skipping invoice ${invoice.invoice_number}: automatic reminders disabled for company ${invoice.company_id}`)
+      continue
+    }
+
+    const reminderConfig = getReminderDaysConfig(company as CompanySettings)
+    const reminderLevel = determineReminderLevel(daysOverdue, existingLevels, reminderConfig)
+
+    if (!reminderLevel) {
+      log.info(`Skipping invoice ${invoice.invoice_number}: no reminder needed (${daysOverdue} days overdue, existing levels: ${existingLevels.join(', ')})`)
+      continue
+    }
+
+    // Payment-account gate, BEFORE any write: the fee journal entry and the
+    // invoice_reminders row below must not exist for a reminder that never
+    // goes out (that would book a 60 kr fee and burn the level for an email
+    // the customer never got). Same rule as invoice send: no usable account
+    // for the invoice currency means no reminder until the user configures
+    // one under Inställningar; the level stays open and fires next run.
+    const invoiceCurrency = invoice.currency
+    if (
+      !hasUsableInvoicePaymentAccount(
+        resolveInvoicePaymentAccount(company as CompanySettings, invoiceCurrency, invoice.payment_details ?? null),
+        invoiceCurrency,
+      )
+    ) {
+      log.warn('Skipping reminder: no payment account configured for invoice currency', {
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoice_number,
+        currency: invoiceCurrency,
+      })
       results.push({
         invoiceId: invoice.id,
         invoiceNumber: invoice.invoice_number,
         customerEmail: customer.email,
         reminderLevel,
         success: false,
-        error: 'Company settings not found'
+        error: `INVOICE_PAYMENT_ACCOUNT_MISSING:${invoiceCurrency}`,
       })
       continue
     }
 
-    // Create reminder record first (to get action token)
+    // Race-window guard: re-check invoice status immediately before sending.
+    // The cron runs at 08:00; a payment match arriving during the run shouldn't
+    // produce a reminder for an already-paid invoice.
+    const { data: currentInvoice } = await supabase
+      .from('invoices')
+      .select('status, credit_notes:invoices!credited_invoice_id(id, status, creation_complete)')
+      .eq('id', invoice.id)
+      .eq('company_id', invoice.company_id)
+      .single()
+
+    const currentCreditNotes = ((currentInvoice as { credit_notes?: Array<{
+      status: string
+      creation_complete?: boolean
+    }> } | null)?.credit_notes ?? []).filter(
+      (creditNote) => creditNote.status !== 'cancelled' && creditNote.creation_complete !== false,
+    )
+    if (
+      !currentInvoice ||
+      !['sent', 'overdue'].includes(currentInvoice.status as string) ||
+      currentCreditNotes.length > 0
+    ) {
+      log.info(`Skipping invoice ${invoice.invoice_number}: status changed to ${currentInvoice?.status ?? 'unknown'} mid-run`)
+      continue
+    }
+
+    // Compute statutory late-payment interest (Räntelagen §6) using the
+    // company override if set, else Riksbankens referensränta + 8 pp.
+    const asOfDate = new Date().toISOString().split('T')[0]
+    // Interest accrues on what the customer actually owes: the invoice's
+    // "Att betala" (öre-rounded total minus any ROT/RUT-avdrag), never on the
+    // Skatteverket share sitting on 1513.
+    const interest = calculateLatePaymentInterest({
+      overdueAmount: reminderPrincipal(invoice as Invoice, company as CompanySettings),
+      dueDate: invoice.due_date,
+      asOfDate,
+      overrideRate: company.reminder_interest_rate_override,
+    })
+
+    // Determine the lagstadgad påminnelseavgift (Lag 1981:739, max 60 kr).
+    // Clamp at 60 kr: the statute caps the fee even if company_settings
+    // somehow holds a higher value (defense in depth against a stale DB row).
+    const reminderFee = company.reminder_fee_enabled
+      ? Math.min(60, Math.round((company.reminder_fee_amount ?? 60) * 100) / 100)
+      : 0
+
+    // Book the fee as a journal entry. Booked BEFORE creating the
+    // invoice_reminders row so we can persist fee_journal_entry_id.
+    // Failure to book the fee is logged but does not abort the reminder
+    // send: the customer still needs to receive the notification.
+    let feeJournalEntryId: string | null = null
+    if (reminderFee > 0) {
+      try {
+        const feeResult = await createReminderFeeEntry(supabase, {
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.invoice_number,
+          companyId: invoice.company_id,
+          userId: invoice.user_id,
+          feeAmount: reminderFee,
+          asOfDate,
+        })
+        feeJournalEntryId = feeResult?.journal_entry_id ?? null
+      } catch (feeError) {
+        log.error(
+          `Failed to book reminder fee for invoice ${invoice.invoice_number}:`,
+          feeError as Error,
+        )
+        // Continue: surcharge still appears in the email, but no JE is linked.
+      }
+    }
+
+    // No "totalDue" scalar is computed here on purpose: invoice.total and
+    // interest.amount are in the invoice currency while reminderFee is a
+    // statutory SEK amount. Summing them would produce a nonsense figure for a
+    // EUR/USD invoice. The email template splits the amount to pay per currency.
+
+    // Create reminder record first (to get action token), persisting the
+    // computed surcharges so the public action page + audit trail show them.
     const { data: reminderRecord, error: reminderError } = await supabase
       .from('invoice_reminders')
       .insert({
@@ -212,7 +414,13 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
         user_id: invoice.user_id,
         company_id: invoice.company_id,
         reminder_level: reminderLevel,
-        email_to: customer.email
+        email_to: customer.email,
+        interest_amount: interest.amount,
+        interest_rate: interest.rate,
+        interest_from_date: interest.fromDate,
+        interest_days: interest.days,
+        reminder_fee: reminderFee,
+        fee_journal_entry_id: feeJournalEntryId,
       })
       .select('action_token')
       .single()
@@ -235,7 +443,15 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
       invoice as Invoice & { customer: Customer },
       company as CompanySettings,
       reminderLevel,
-      reminderRecord.action_token
+      reminderRecord.action_token,
+      {
+        interestAmount: interest.amount,
+        interestRate: interest.rate,
+        interestFromDate: interest.fromDate,
+        interestDays: interest.days,
+        reminderFee,
+      },
+      await resolveInvoiceSender(supabase, invoice.company_id, company.company_name),
     )
 
     if (sendResult.success) {

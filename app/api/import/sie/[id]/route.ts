@@ -1,103 +1,59 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { z } from 'zod'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 
 /**
  * GET /api/import/sie/[id]
  * Get details of a specific SIE import
  */
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const supabase = await createClient()
-  const { id } = await params
+export const GET = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'sie_import.get',
+  async (request, { supabase, companyId, log, requestId }, { params }) => {
+    const id = z.uuid().parse((await params).id)
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+    const query = new URL(request.url).searchParams.has('progress')
+      ? supabase.from('sie_imports').select('id,company_id,fiscal_period_id,job_state,job_kind,job_phase,chunks_total,chunks_done,transactions_count,prepared_through,error_message,job_result,supersedes_import_id')
+      : supabase.from('sie_imports').select('*')
+    const { data, error } = await query
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .maybeSingle()
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+    if (error) throw error
 
-  const companyId = await requireCompanyId(supabase, user.id)
+    if (!data) {
+      return errorResponseFromCode('NOT_FOUND', log, { requestId })
+    }
 
-  const { data, error } = await supabase
-    .from('sie_imports')
-    .select('*')
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .single()
-
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
-  }
-
-  if (!data) {
-    return NextResponse.json({ error: 'Import not found' }, { status: 404 })
-  }
-
-  return NextResponse.json({ data })
-}
+    return NextResponse.json({ data, ...(!data.job_state ? { recovery_url: `/api/import/sie/${id}/recovery` } : {}) },
+      { headers: { 'Cache-Control': 'private, no-store' } })
+  },
+)
 
 /**
  * DELETE /api/import/sie/[id]
- * Delete an import record.
- *
- * Only failed or pending imports can be deleted. Completed imports have created
- * journal entries that are part of räkenskapsinformation — deleting the metadata
- * without reversing entries would leave orphaned bookkeeping data, and deleting
- * both is prohibited under BFL 7 kap (7-year retention).
+ * Retain import history, including legacy failed rows whose outcome is unknown.
  */
-export async function DELETE(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const supabase = await createClient()
-  const { id } = await params
+export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'sie_import.delete',
+  async (_request, { supabase, companyId, log, requestId }, { params }) => {
+    const id = z.uuid().parse((await params).id)
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+    const { data: importRecord, error } = await supabase
+      .from('sie_imports')
+      .select('status, job_state')
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .maybeSingle()
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+    if (error) throw error
 
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
+    if (!importRecord) {
+      return errorResponseFromCode('NOT_FOUND', log, { requestId })
+    }
 
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  // Check current status before deleting
-  const { data: importRecord } = await supabase
-    .from('sie_imports')
-    .select('status')
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .single()
-
-  if (!importRecord) {
-    return NextResponse.json({ error: 'Import not found' }, { status: 404 })
-  }
-
-  if (importRecord.status === 'completed') {
-    return NextResponse.json({
-      error: 'Slutförd import kan inte raderas. Importerade verifikationer ingår i räkenskapsinformationen (BFL 7 kap).',
-    }, { status: 403 })
-  }
-
-  const { error } = await supabase
-    .from('sie_imports')
-    .delete()
-    .eq('id', id)
-    .eq('company_id', companyId)
-
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
-  }
-
-  return NextResponse.json({ success: true })
-}
+    return errorResponseFromCode(importRecord.job_state ? 'SIE_IMPORT_HISTORY_RETAINED' : 'SIE_IMPORT_LEGACY_REVIEW_REQUIRED', log, { requestId })
+  },
+  { requireWrite: true },
+)

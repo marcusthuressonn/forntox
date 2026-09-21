@@ -1,5 +1,10 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse } from 'next/server'
+import {
+  calculateReminderAmounts,
+  REMINDER_FEE_CURRENCY,
+} from '@/lib/email/reminder-templates'
+import { resolveBrandForCompany } from '@/lib/branding/resolve'
 
 // Create a service client (no auth needed - public endpoint with token validation)
 function createServiceClient() {
@@ -116,10 +121,16 @@ export async function GET(request: Request) {
     .from('invoice_reminders')
     .select(`
       id,
+      company_id,
       reminder_level,
       sent_at,
       response_type,
       action_token_used,
+      interest_amount,
+      interest_rate,
+      interest_from_date,
+      interest_days,
+      reminder_fee,
       invoice:invoices(
         id,
         invoice_number,
@@ -159,6 +170,27 @@ export async function GET(request: Request) {
   const customerData = invoice.customer
   const customer = Array.isArray(customerData) ? customerData[0] : customerData
 
+  const interestAmount = Number(reminder.interest_amount ?? 0)
+  const reminderFee = Number(reminder.reminder_fee ?? 0)
+
+  // The invoice total and the dröjsmålsränta are in the invoice currency; the
+  // påminnelseavgift is a statutory SEK amount booked 1510/3990 in SEK. They are
+  // split per currency instead of summed into one scalar: adding 60 kr to a EUR
+  // total, or relabelling it as 60 EUR, would demand the wrong money from the
+  // customer on a public page.
+  const amounts = calculateReminderAmounts({
+    invoiceTotal: Number(invoice.total),
+    interestAmount,
+    reminderFee,
+    currency: invoice.currency,
+  })
+
+  // Brand of the COMPANY the invoice concerns (WL-13): the public page styles
+  // itself by this regardless of host. Null (no brand) = today's page.
+  const brand = reminder.company_id
+    ? await resolveBrandForCompany(reminder.company_id as string)
+    : null
+
   return NextResponse.json({
     invoiceNumber: invoice.invoice_number,
     invoiceDate: invoice.invoice_date,
@@ -168,6 +200,24 @@ export async function GET(request: Request) {
     customerName: customer?.name,
     reminderLevel: reminder.reminder_level,
     alreadyResponded: reminder.action_token_used,
-    previousResponse: reminder.response_type
+    previousResponse: reminder.response_type,
+    // Dröjsmålsränta + lagstadgad påminnelseavgift surfaced to the
+    // customer-facing action page. Numeric defaults preserve back-compat
+    // for old reminders sent before the surcharge feature shipped.
+    interestAmount,
+    interestRate: reminder.interest_rate !== null ? Number(reminder.interest_rate) : 0,
+    interestFromDate: reminder.interest_from_date,
+    interestDays: reminder.interest_days,
+    reminderFee,
+    /** Always 'SEK': the fee is a krona statute, never the invoice currency. */
+    reminderFeeCurrency: REMINDER_FEE_CURRENCY,
+    /** In `currency`. Includes the fee only when the invoice is itself in SEK. */
+    totalDue: amounts.totalDue,
+    /** In SEK. Non-zero only when the fee must be demanded outside `totalDue`. */
+    feeDueSeparately: amounts.feeDueSeparately,
+    /** White-label brand of the invoice's company; null keeps today's page. */
+    brand: brand
+      ? { appName: brand.appName, logoUrl: brand.logoUrl, brandColor: brand.brandColor }
+      : null,
   })
 }

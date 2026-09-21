@@ -1,3 +1,5 @@
+import { sruAmount as formatAmount, sruDate as formatDate, sruTime as formatTime } from '@/lib/reports/sru/format'
+import { getBranding } from '@/lib/branding/service'
 import type {
   INK2Declaration,
   INK2RSRUCode,
@@ -24,7 +26,6 @@ import {
  */
 
 const CRLF = '\r\n'
-const PROGRAM_NAME = 'gnubok'
 const PROGRAM_VERSION = '1.0'
 
 /**
@@ -64,34 +65,6 @@ function formatOrgNumber12(orgNumber: string): string {
 }
 
 /**
- * Format a Date as YYYYMMDD
- */
-function formatDate(date: Date): string {
-  const y = date.getFullYear()
-  const m = String(date.getMonth() + 1).padStart(2, '0')
-  const d = String(date.getDate()).padStart(2, '0')
-  return `${y}${m}${d}`
-}
-
-/**
- * Format a Date as HHMMSS
- */
-function formatTime(date: Date): string {
-  const h = String(date.getHours()).padStart(2, '0')
-  const m = String(date.getMinutes()).padStart(2, '0')
-  const s = String(date.getSeconds()).padStart(2, '0')
-  return `${h}${m}${s}`
-}
-
-/**
- * Format integer amount for SRU. No decimals, no thousands separator.
- * Truncated to hela kronor by the engine.
- */
-function formatAmount(amount: number): string {
-  return Math.trunc(amount).toString()
-}
-
-/**
  * Generate the INFO.SRU file content
  */
 function generateInfoSru(declaration: INK2Declaration, now: Date): string {
@@ -104,7 +77,7 @@ function generateInfoSru(declaration: INK2Declaration, now: Date): string {
   lines.push('#DATABESKRIVNING_START')
   lines.push('#PRODUKT SRU')
   lines.push(`#SKAPAD ${formatDate(now)} ${formatTime(now)}`)
-  lines.push(`#PROGRAM ${PROGRAM_NAME} ${PROGRAM_VERSION}`)
+  lines.push(`#PROGRAM ${sanitizeString(getBranding().appName.toLowerCase())} ${PROGRAM_VERSION}`)
   lines.push('#FILNAMN BLANKETTER.SRU')
   lines.push('#DATABESKRIVNING_SLUT')
 
@@ -157,8 +130,8 @@ function generateBlanketterSru(declaration: INK2Declaration, now: Date): string 
   lines.push(`#UPPGIFT 7012 ${declaration.ink2['7012']}`)
 
   // Överskott/underskott
-  if (declaration.ink2['7113'] > 0) {
-    lines.push(`#UPPGIFT 7113 ${formatAmount(declaration.ink2['7113'])}`)
+  if (declaration.ink2['7104'] > 0) {
+    lines.push(`#UPPGIFT 7104 ${formatAmount(declaration.ink2['7104'])}`)
   }
   if (declaration.ink2['7114'] > 0) {
     lines.push(`#UPPGIFT 7114 ${formatAmount(declaration.ink2['7114'])}`)
@@ -175,7 +148,7 @@ function generateBlanketterSru(declaration: INK2Declaration, now: Date): string 
   lines.push(`#UPPGIFT 7011 ${declaration.ink2['7011']}`)
   lines.push(`#UPPGIFT 7012 ${declaration.ink2['7012']}`)
 
-  // All INK2R fields in canonical Skatteverket order — emit non-zero values only
+  // All INK2R fields in canonical Skatteverket order: emit non-zero values only
   const ink2rCodes: INK2RSRUCode[] = [
     ...INK2R_ASSET_CODES,
     ...INK2R_EQUITY_LIABILITY_CODES,
@@ -199,8 +172,17 @@ function generateBlanketterSru(declaration: INK2Declaration, now: Date): string 
   lines.push(`#UPPGIFT 7011 ${declaration.ink2s['7011']}`)
   lines.push(`#UPPGIFT 7012 ${declaration.ink2s['7012']}`)
 
-  // INK2S numeric fields — emit non-zero values only
-  const ink2sNumericFields: (keyof INK2SRutor)[] = ['7650', '7750', '7651', '8020', '8021']
+  // INK2S numeric fields: emit non-zero values only
+  const ink2sNumericFields: (keyof INK2SRutor)[] = [
+    '7650',
+    '7750',
+    '7651',
+    '7653',
+    '7754',
+    '7763',
+    '7670',
+    '7770',
+  ]
   for (const code of ink2sNumericFields) {
     const value = declaration.ink2s[code]
     if (typeof value === 'number' && value !== 0) {
@@ -256,7 +238,7 @@ export function validateBlanketterSru(content: string): {
   if (!hasINK2S) errors.push('Missing INK2S blankett block')
   if (!hasFilSlut) errors.push('Missing #FIL_SLUT terminator')
 
-  // Count BLANKETTSLUT — should be exactly 3
+  // Count BLANKETTSLUT: should be exactly 3
   const blankettslutCount = (content.match(/^#BLANKETTSLUT/gm) || []).length
   if (blankettslutCount !== 3) {
     errors.push(`Expected 3 BLANKETTSLUT, found ${blankettslutCount}`)

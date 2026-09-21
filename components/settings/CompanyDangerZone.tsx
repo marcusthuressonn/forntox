@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { useTranslations } from 'next-intl'
 import { useRouter } from 'next/navigation'
 import { useCompany } from '@/contexts/CompanyContext'
 import { Button } from '@/components/ui/button'
@@ -15,8 +16,20 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { RetentionNotice } from '@/components/ui/retention-notice'
+import {
+  SettingsDangerZone,
+  SettingsRow,
+  SettingsRowEnd,
+  SettingsRowNote,
+} from '@/components/settings/SettingsRows'
 import { Loader2 } from 'lucide-react'
 import { useToast } from '@/components/ui/use-toast'
+import { getBranding } from '@/lib/branding/service'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { CompanyMigrationResetDialog } from '@/components/settings/CompanyMigrationResetDialog'
+import { CompanyMigrationArchiveRow } from '@/components/settings/CompanyMigrationArchiveRow'
+
+const branding = getBranding()
 
 /**
  * Danger zone for the currently-active company. Only visible to owners.
@@ -30,11 +43,14 @@ import { useToast } from '@/components/ui/use-toast'
  * capabilities.bankIdLinked boolean fetched from the user profile.
  */
 export function CompanyDangerZone() {
+  const t = useTranslations('settings_company')
+  const tRetention = useTranslations('retention_notice')
   const router = useRouter()
   const { toast } = useToast()
   const { company, role } = useCompany()
 
   const [showDialog, setShowDialog] = useState(false)
+  const [showResetDialog, setShowResetDialog] = useState(false)
   const [confirmText, setConfirmText] = useState('')
   const [isDeleting, setIsDeleting] = useState(false)
 
@@ -54,10 +70,10 @@ export function CompanyDangerZone() {
 
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(body.error || 'Kunde inte radera företaget')
+        throw new Error(body.error || t('danger_delete_failed_default'))
       }
 
-      toast({ title: 'Företaget raderades', description: company.name })
+      toast({ title: t('danger_deleted_title'), description: company.name })
       // Stay inside settings. If the user had another company, the dashboard
       // layout will resolve it and /settings/account still renders as
       // normal. If this was their last company, the layout falls into the
@@ -66,8 +82,8 @@ export function CompanyDangerZone() {
       router.refresh()
     } catch (err) {
       toast({
-        title: 'Kunde inte radera företaget',
-        description: err instanceof Error ? err.message : 'Försök igen.',
+        title: t('danger_delete_failed_title'),
+        description: err instanceof Error ? getUserErrorMessage(err) : t('danger_try_again'),
         variant: 'destructive',
       })
       setIsDeleting(false)
@@ -76,23 +92,50 @@ export function CompanyDangerZone() {
 
   return (
     <>
-      <section className="space-y-4 border-t border-border/8 pt-8">
-        <h2 className="text-sm font-medium uppercase tracking-wider text-destructive/80">
-          Radera företag
-        </h2>
+      <CompanyMigrationArchiveRow companyId={company.id} />
 
-        <RetentionNotice variant="company" />
-
-        <div className="flex justify-end">
-          <Button
-            variant="destructive"
-            className="w-full sm:w-auto"
-            onClick={() => setShowDialog(true)}
-          >
-            Radera företag
-          </Button>
-        </div>
-      </section>
+      <SettingsDangerZone label={t('danger_heading')}>
+        <SettingsRow label={t('reset_row_label')}>
+          {/* Both destructive rows say up front that a typed confirmation
+              follows. A reader who does not dare press the link cannot find
+              that out any other way, and on a phone the link sits where a
+              stray tap while scrolling lands (issue #2214). */}
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <SettingsRowNote>{t('reset_row_note')}</SettingsRowNote>
+            <SettingsRowNote>{t('danger_confirm_hint')}</SettingsRowNote>
+          </div>
+          <SettingsRowEnd>
+            <button
+              type="button"
+              onClick={() => setShowResetDialog(true)}
+              className="text-sm font-medium text-destructive underline underline-offset-2 transition-colors duration-150 hover:text-destructive/80"
+            >
+              {t('reset_row_action')}
+            </button>
+          </SettingsRowEnd>
+        </SettingsRow>
+        <SettingsRow
+          label={t('danger_button')}
+          borderless
+          // The full BFL retention copy (incl. the backup link) lives behind
+          // the "?": the visible row stays one quiet line.
+          help={<RetentionNotice variant="company" className="border-0 bg-transparent p-0" />}
+        >
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <SettingsRowNote>{tRetention('company_title')}</SettingsRowNote>
+            <SettingsRowNote>{t('danger_confirm_hint')}</SettingsRowNote>
+          </div>
+          <SettingsRowEnd>
+            <button
+              type="button"
+              onClick={() => setShowDialog(true)}
+              className="text-sm font-medium text-destructive underline underline-offset-2 transition-colors duration-150 hover:text-destructive/80"
+            >
+              {t('danger_button')}
+            </button>
+          </SettingsRowEnd>
+        </SettingsRow>
+      </SettingsDangerZone>
 
       <Dialog
         open={showDialog}
@@ -104,15 +147,19 @@ export function CompanyDangerZone() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Radera {company.name}</DialogTitle>
+            {/* data-ph-mask: the title interpolates the company name */}
+            <DialogTitle data-ph-mask="">{t('danger_dialog_title', { companyName: company.name })}</DialogTitle>
             <DialogDescription>
-              Företaget döljs från gnubok. Bokföringen behålls säkert i 7 år enligt BFL.
-              Skriv företagets namn exakt för att bekräfta.
+              {t('danger_dialog_description', { appName: branding.appName.toLowerCase() })}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
-            <Label htmlFor="company-delete-confirm">
-              Skriv <strong>{company.name}</strong> för att bekräfta
+            {/* data-ph-mask: the label interpolates the company name */}
+            <Label data-ph-mask="" htmlFor="company-delete-confirm">
+              {t.rich('danger_confirm_label', {
+                companyName: company.name,
+                strong: (chunks) => <strong>{chunks}</strong>,
+              })}
             </Label>
             <Input
               id="company-delete-confirm"
@@ -120,6 +167,9 @@ export function CompanyDangerZone() {
               onChange={(e) => setConfirmText(e.target.value)}
               placeholder={company.name}
               autoComplete="off"
+              // ph-no-capture: the placeholder is the company name, and
+              // replay masking covers values, not attributes.
+              className="ph-no-capture"
             />
           </div>
           <DialogFooter>
@@ -131,7 +181,7 @@ export function CompanyDangerZone() {
               }}
               disabled={isDeleting}
             >
-              Avbryt
+              {t('danger_cancel')}
             </Button>
             <Button
               variant="destructive"
@@ -141,15 +191,22 @@ export function CompanyDangerZone() {
               {isDeleting ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Raderar...
+                  {t('danger_deleting')}
                 </>
               ) : (
-                'Radera företag'
+                t('danger_button')
               )}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <CompanyMigrationResetDialog
+        companyId={company.id}
+        companyName={company.name}
+        open={showResetDialog}
+        onOpenChange={setShowResetDialog}
+      />
     </>
   )
 }

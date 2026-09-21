@@ -22,12 +22,24 @@ import {
 import { Deadline, DeadlineType, DeadlinePriority } from '@/types'
 import { formatDateISO, DEADLINE_TYPE_LABELS, PRIORITY_LABELS } from '@/lib/calendar/utils'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import CustomerCombobox from '@/components/customers/CustomerCombobox'
 import { Lock } from 'lucide-react'
+
+/**
+ * Only the fields the form actually manages. Both API routes whitelist to
+ * this set; the form must never fabricate values for system fields (source,
+ * status, reminder_offsets, tax_*), or editing a system-generated tax
+ * deadline would depend on the server whitelist alone to avoid data loss.
+ */
+export type DeadlineFormValues = Pick<
+  Deadline,
+  'title' | 'due_date' | 'due_time' | 'deadline_type' | 'priority' | 'customer_id' | 'notes'
+>
 
 interface DeadlineFormProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onSubmit: (data: Omit<Deadline, 'id' | 'user_id' | 'company_id' | 'created_at' | 'updated_at'>) => Promise<void>
+  onSubmit: (data: DeadlineFormValues) => Promise<void>
   onDelete?: (deadline: Partial<Deadline>) => void
   initialData?: Partial<Deadline>
   initialDate?: Date | null
@@ -107,18 +119,6 @@ export function DeadlineForm({
         priority: formData.priority,
         customer_id: formData.customer_id || null,
         notes: formData.notes || null,
-        is_completed: initialData?.is_completed || false,
-        completed_at: initialData?.completed_at || null,
-        is_auto_generated: false,
-        // New tax deadline fields with defaults for user-created deadlines
-        tax_deadline_type: null,
-        tax_period: null,
-        source: 'user',
-        reminder_offsets: [14, 7, 1, 0],
-        status: 'upcoming',
-        status_changed_at: new Date().toISOString(),
-        linked_report_type: null,
-        linked_report_period: null,
       })
     } finally {
       setIsLoading(false)
@@ -220,23 +220,15 @@ export function DeadlineForm({
           {/* Customer */}
           {customers.length > 0 && (
             <div className="space-y-2">
-              <Label>Kund (valfritt)</Label>
-              <Select
-                value={formData.customer_id || 'none'}
-                onValueChange={(v) => { if (v) updateField('customer_id', v === 'none' ? '' : v) }}
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Välj kund..." />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="none">Ingen kund</SelectItem>
-                  {customers.map((customer) => (
-                    <SelectItem key={customer.id} value={customer.id}>
-                      {customer.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <Label htmlFor="deadline-customer">Kund (valfritt)</Label>
+              <CustomerCombobox
+                id="deadline-customer"
+                value={formData.customer_id || ''}
+                customers={customers}
+                onChange={(v) => updateField('customer_id', v)}
+                placeholder="Välj kund..."
+                noneLabel="Ingen kund"
+              />
             </div>
           )}
 

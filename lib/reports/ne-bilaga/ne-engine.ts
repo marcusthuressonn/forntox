@@ -1,10 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { fetchAllRows } from '@/lib/supabase/fetch-all'
-import type {
-  FiscalPeriod,
-  JournalEntry,
-  JournalEntryLine,
-} from '@/types'
+import { generateTrialBalance } from '@/lib/reports/trial-balance'
+import type { FiscalPeriod } from '@/types'
 import type {
   NEDeclaration,
   NEDeclarationRutor,
@@ -175,7 +171,7 @@ export async function generateNEDeclaration(
   // Fetch company settings
   const { data: settings } = await supabase
     .from('company_settings')
-    .select('company_name, trade_name, org_number, entity_type')
+    .select('company_name, org_number, entity_type, address_line1, postal_code, city, email')
     .eq('company_id', companyId)
     .single()
 
@@ -195,43 +191,24 @@ export async function generateNEDeclaration(
     throw new Error('NE declaration is only for enskild firma (sole proprietorship)')
   }
 
-  // Fetch all posted journal entries with lines for this period
-  const { data: entries, error: entriesError } = await supabase
-    .from('journal_entries')
-    .select('*, lines:journal_entry_lines(*)')
-    .eq('company_id', companyId)
-    .eq('fiscal_period_id', fiscalPeriodId)
-    .in('status', ['posted', 'reversed'])
-
-  if (entriesError) {
-    throw new Error(`Failed to fetch journal entries: ${entriesError.message}`)
-  }
-
-  // Fetch chart of accounts for account names
-  const accounts = await fetchAllRows<{ account_number: string; account_name: string }>(({ from, to }) =>
-    supabase
-      .from('chart_of_accounts')
-      .select('account_number, account_name')
-      .eq('company_id', companyId)
-      .range(from, to)
-  )
+  // R1-R11 are an income statement, so read the PRE-CLOSING books. The
+  // resultatavslut zeroes every P&L account against 2019/2099 at year-end, and
+  // NE-bilaga is always filed after bokslut, so including it would report an
+  // empty näringsverksamhet. 'exclude-final' drops only
+  // fiscal_periods.closing_entry_id: avskrivningar and other bokslut entries
+  // also carry source_type 'year_end' and belong on the form.
+  const trialBalance = await generateTrialBalance(supabase, companyId, fiscalPeriodId, {
+    closingEntry: 'exclude-final',
+  })
 
   const accountNameMap = new Map<string, string>()
-  for (const acc of accounts) {
-    accountNameMap.set(acc.account_number, acc.account_name)
-  }
-
-  // Calculate balances per account
   const accountBalances = new Map<string, number>()
-
-  for (const entry of (entries as JournalEntry[]) || []) {
-    const lines = (entry.lines as JournalEntryLine[]) || []
-    for (const line of lines) {
-      const current = accountBalances.get(line.account_number) || 0
-      // Net amount: debit - credit
-      const netAmount = (Number(line.debit_amount) || 0) - (Number(line.credit_amount) || 0)
-      accountBalances.set(line.account_number, current + netAmount)
-    }
+  for (const row of trialBalance.rows) {
+    accountNameMap.set(row.account_number, row.account_name)
+    accountBalances.set(
+      row.account_number,
+      (Number(row.closing_debit) || 0) - (Number(row.closing_credit) || 0),
+    )
   }
 
   // Map account balances to NE rutor
@@ -313,7 +290,7 @@ export async function generateNEDeclaration(
 
   // Add warnings
   if (!(period as FiscalPeriod).is_closed) {
-    warnings.push('Räkenskapsåret är inte stängt — deklarationen kan genereras, men siffrorna kan ändras om fler bokföringar görs.')
+    warnings.push('Räkenskapsåret är inte stängt; deklarationen kan genereras, men siffrorna kan ändras om fler bokföringar görs.')
   }
 
   if (rutor.R11 === 0 && totalRevenue === 0) {
@@ -331,26 +308,13 @@ export async function generateNEDeclaration(
     rutor,
     breakdown,
     companyInfo: {
-      companyName: settings?.trade_name || settings?.company_name || 'Okänt företag',
+      companyName: settings?.company_name || 'Okänt företag',
       orgNumber: settings?.org_number || null,
+      addressLine1: settings?.address_line1 || null,
+      postalCode: settings?.postal_code || null,
+      city: settings?.city || null,
+      email: settings?.email || null,
     },
     warnings,
-  }
-}
-
-/**
- * Get totals for display
- */
-export function getNEDeclarationTotals(declaration: NEDeclaration): {
-  totalRevenue: number
-  totalExpenses: number
-  netResult: number
-} {
-  const { rutor } = declaration
-
-  return {
-    totalRevenue: rutor.R1 + rutor.R2 + rutor.R3 + rutor.R4,
-    totalExpenses: rutor.R5 + rutor.R6 + rutor.R7 + rutor.R8 + rutor.R9 + rutor.R10,
-    netResult: rutor.R11,
   }
 }

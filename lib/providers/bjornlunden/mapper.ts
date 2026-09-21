@@ -1,5 +1,5 @@
 import type {
-  SalesInvoiceDto, SalesInvoiceLineDto, InvoiceStatusCode,
+  SalesInvoiceDto, InvoiceStatusCode,
   LegalMonetaryTotalDto, PaymentStatusDto,
   SupplierInvoiceDto,
   CustomerDto,
@@ -9,15 +9,56 @@ import type {
   CompanyInformationDto,
   AmountType, PartyDto,
 } from '../dto';
+import { creditNoteTypeCode } from '../dto';
+import { readNumber, resolveVatTriple } from '../amounts';
+
+/**
+ * BL's invoice list carries only gross amounts (`amountInLocalCurrency`) and
+ * no line items. Those grosses used to be reported as `lineExtensionAmount`,
+ * i.e. as the amount EXCLUDING VAT, so the migration derived 0 kr of VAT for
+ * every BL invoice while still labelling it 25 % moms.
+ *
+ * BL's list payload is not documented to carry a VAT total; the candidates
+ * below cover the spellings its endpoints use elsewhere. When none matches,
+ * the VAT stays unknown and the migration reports it, instead of the mapper
+ * asserting zero. Hydrating the detail endpoint (provider-data-fetcher) is
+ * what actually supplies line items for BL.
+ */
+const BL_VAT_KEYS = [
+  'vatAmountInLocalCurrency',
+  'vatAmount',
+  'vat',
+  'totalVat',
+] as const;
 
 function amount(value: number | undefined | null, currency: string = 'SEK'): AmountType {
   return { value: value ?? 0, currencyCode: currency };
 }
 
+/**
+ * Derive an invoice lifecycle status from BL's fields.
+ *
+ * Sandbox-verified: `status` is an ARRAY of numeric codes. Documented for
+ * customer invoices (supplier invoices observed to follow the same scheme):
+ * 0 Unpaid, 1 Overdue, 2 Fully paid, 3 Partially paid, 4 Overpaid,
+ * 5 Deleted, 6 Customer loss, 7 Marked for collection, 8 Sent for collection.
+ * Codes ≥40 are ROT/RUT, factoring ("Invoier") and e-invoice transport noise:
+ * ignored here. The `paid`/`preliminary` booleans are the primary signals;
+ * the codes refine terminal states the booleans can't express.
+ */
 function deriveBLInvoiceStatus(raw: Record<string, unknown>): InvoiceStatusCode {
+  const codes = Array.isArray(raw['status'])
+    ? (raw['status'] as unknown[]).map(Number).filter(Number.isFinite)
+    : [];
+  // Terminal states win over payment flags: a deleted (makulerad) or
+  // written-off (kundförlust) invoice must not be imported as open/paid.
+  if (codes.includes(5) || codes.includes(6)) return 'cancelled';
   if (raw['paid'] === true) return 'paid';
   if (raw['preliminary'] === true) return 'draft';
-  const status = raw['status'] != null ? String(raw['status']).toLowerCase() : undefined;
+  if (codes.includes(2) || codes.includes(4)) return 'paid';
+  if (codes.includes(1) || codes.includes(7) || codes.includes(8)) return 'overdue';
+  // Defensive: handle a plain string status should BL ever send one
+  const status = typeof raw['status'] === 'string' ? raw['status'].toLowerCase() : undefined;
   if (status === 'cancelled') return 'cancelled';
   if (status === 'credited') return 'credited';
   if (status === 'sent') return 'sent';
@@ -42,8 +83,15 @@ export function mapBLToSalesInvoice(raw: Record<string, unknown>): SalesInvoiceD
     identifications: raw['customerId'] ? [{ id: String(raw['customerId']), schemeId: 'BL:CUSTOMER_ID' }] : [],
   };
 
+  const vat = resolveVatTriple({
+    gross: totalAmount,
+    vat: readNumber(raw, BL_VAT_KEYS),
+  });
+
   const legalMonetaryTotal: LegalMonetaryTotalDto = {
-    lineExtensionAmount: amount(totalAmount, currency),
+    // `amountInLocalCurrency` is the gross. Reporting it as the net is what
+    // made every BL invoice look like a 0 kr VAT sale.
+    lineExtensionAmount: vat.net !== undefined ? amount(vat.net, currency) : undefined,
     taxInclusiveAmount: amount(totalAmount, currency),
     payableAmount: amount(totalAmount, currency),
   };
@@ -53,16 +101,25 @@ export function mapBLToSalesInvoice(raw: Record<string, unknown>): SalesInvoiceD
     balance: amount(balance, currency),
   };
 
+  const invoiceTypeCode = creditNoteTypeCode(false, totalAmount);
+  const blStatus = deriveBLInvoiceStatus(raw);
+
   return {
     id: String(raw['entityId'] ?? raw['invoiceNumber'] ?? ''),
     invoiceNumber: String(raw['invoiceNumber'] ?? ''),
     issueDate: (raw['invoiceDate'] as string) ?? '',
     dueDate: raw['dueDate'] as string | undefined,
+    // 381 for a kreditfaktura: the one signal the importer reads (dto.ts).
+    // The sandbox-verified field list above carries no credit flag; a credit
+    // invoice arrives with a negative amount (9 such rows in production were
+    // imported as paid invoices, #2789), so the amount is the signal.
+    invoiceTypeCode,
     currencyCode: currency,
-    status: deriveBLInvoiceStatus(raw),
+    status: invoiceTypeCode && blStatus !== 'cancelled' && blStatus !== 'draft' ? 'credited' : blStatus,
     supplier: { name: '', identifications: [] },
     customer,
     lines: [], // BL doesn't include line items in list responses
+    taxTotal: vat.vat !== undefined ? { taxAmount: amount(vat.vat, currency) } : undefined,
     legalMonetaryTotal,
     paymentStatus,
     _raw: raw,
@@ -87,8 +144,15 @@ export function mapBLToSupplierInvoice(raw: Record<string, unknown>): SupplierIn
     identifications: raw['supplierId'] ? [{ id: String(raw['supplierId']), schemeId: 'BL:SUPPLIER_ID' }] : [],
   };
 
+  const vat = resolveVatTriple({
+    gross: totalAmount,
+    vat: readNumber(raw, BL_VAT_KEYS),
+  });
+
   const legalMonetaryTotal: LegalMonetaryTotalDto = {
-    lineExtensionAmount: amount(totalAmount, currency),
+    // `amountInLocalCurrency` is the gross. Reporting it as the net is what
+    // made every BL invoice look like a 0 kr VAT sale.
+    lineExtensionAmount: vat.net !== undefined ? amount(vat.net, currency) : undefined,
     taxInclusiveAmount: amount(totalAmount, currency),
     payableAmount: amount(totalAmount, currency),
   };
@@ -108,6 +172,7 @@ export function mapBLToSupplierInvoice(raw: Record<string, unknown>): SupplierIn
     supplier,
     buyer: { name: '', identifications: [] },
     lines: [], // BL doesn't include line items in list responses
+    taxTotal: vat.vat !== undefined ? { taxAmount: amount(vat.vat, currency) } : undefined,
     legalMonetaryTotal,
     paymentStatus,
     _raw: raw,
@@ -238,20 +303,32 @@ export function mapBLToJournal(raw: Record<string, unknown>): JournalDto {
   };
 }
 
+/** BL's own account `type` values (sandbox-verified) → our AccountType. */
+const BL_ACCOUNT_TYPE_MAP: Record<string, AccountType> = {
+  asset: 'asset',
+  liability: 'liability',
+  income: 'revenue',
+  cost: 'expense',
+};
+
 /**
  * Map BL Account to AccountingAccountDto.
  *
  * BL fields: entityId, id (account number), name, vatCode, sruCode, closed, type
- * Type derived from BAS plan number ranges.
+ * BL sends an explicit `type` (asset|liability|income|cost): prefer it, since
+ * it also covers off-plan accounts like 0099 "Konvertering"; fall back to BAS
+ * number ranges when absent.
  */
 export function mapBLToAccountingAccount(raw: Record<string, unknown>): AccountingAccountDto {
   const num = Number(raw['id']);
 
-  let type: AccountType | undefined;
-  if (num >= 1000 && num < 2000) type = 'asset';
-  else if (num >= 2000 && num < 3000) type = 'liability';
-  else if (num >= 3000 && num < 4000) type = 'revenue';
-  else if (num >= 4000 && num < 9000) type = 'expense';
+  let type: AccountType | undefined = BL_ACCOUNT_TYPE_MAP[String(raw['type'] ?? '').toLowerCase()];
+  if (!type) {
+    if (num >= 1000 && num < 2000) type = 'asset';
+    else if (num >= 2000 && num < 3000) type = 'liability';
+    else if (num >= 3000 && num < 4000) type = 'revenue';
+    else if (num >= 4000 && num < 9000) type = 'expense';
+  }
 
   return {
     accountNumber: String(raw['id'] ?? ''),

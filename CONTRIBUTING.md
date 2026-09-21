@@ -1,6 +1,8 @@
-# Contributing to gnubok
+# Contributing to Accounted
 
-Thank you for your interest in contributing to gnubok. This guide covers the development workflow, coding standards, and submission process.
+Thank you for your interest in contributing to Accounted. This guide covers the development workflow, coding standards, and submission process.
+
+Everyone interacting in the project is expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Getting Started
 
@@ -62,7 +64,7 @@ If you forget, you can amend: `git commit --amend -s`.
 
 ## Extension Development
 
-See `CLAUDE.md` for the full extension architecture. Quick start:
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [docs/EXTENSIONS.md](docs/EXTENSIONS.md) for the full extension architecture. Quick start:
 
 ```bash
 npx tsx scripts/create-extension.ts --name my-ext --sector general --category operations --description "..."
@@ -74,6 +76,10 @@ Constraints:
 - Extensions cannot use dynamic imports (Next.js bundling requirement)
 - Core must build and run with zero extensions enabled
 - Never import from `@/extensions/` in core code
+
+## Community Registry
+
+The registry at [gnubok.se/community/registry](https://www.gnubok.se/community/registry) (skills, MCP servers, workflows and apps built on Accounted) is sourced from the [`registry/`](registry/) directory in this repo. To list something you built, add an MDX entry there by PR; see [registry/README.md](registry/README.md) for the format and run `npm run validate:registry` for the local check. No code changes needed.
 
 ## What Not to Do
 

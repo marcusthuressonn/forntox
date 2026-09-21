@@ -40,7 +40,7 @@ Total rate unchanged since 2009. Calculated on full gross salary + taxable benef
 | Born 1937 or earlier | 0% |
 | Turned 66+ at year start (67+ from 2026) | 10.21% (only ålderspensionsavgift) |
 | Standard (all others) | 31.42% |
-| Temporary youth 19-23 (Apr 2026 - Sep 2027) | 20.81% on salary up to 25,000 SEK/month |
+| Temporary youth (Apr 2026 to Sep 2027) | 20.81% on salary up to 25,000 SEK/month. Eligible: vid årets ingång fyllt 18, inte 23 (i.e. age 18-22 at Jan 1; born 2003-2007 in 2026, 2004-2008 in 2027). NOT during-year age: Skatteverket rejects 23-year-olds at year start. Source: Prop. 2025/26:66 |
 
 No avgifter required if total annual compensation from one employer < 1,000 SEK.
 
@@ -91,7 +91,7 @@ Karensavdrag = 20% of one week's sjuklön (80% of weekly pay). Day 2-14: 80% of 
 ### Standard monthly journal entries
 
 1. Gross salary: Debit 7210 / Credit 2710 (tax) + Credit 1930 (net pay)
-2. Employer avgifter: Debit 7510 / Credit 2730
+2. Employer avgifter: Debit 7510 / Credit 2731 (Avräkning lagstadgade sociala avgifter; this codebase's convention, cleared by the skattekonto AGI draw. 2730 is the group account: a legitimate simplification, but never mix the two within one company, see issue #1870. The accrual account is 2940, not 2731.)
 3. Vacation accrual: Debit 7290 / Credit 2920
 4. Avgifter on accrual: Debit 7519 / Credit 2940
 5. Pension premiums: Debit 7410 / Credit 2440/2740

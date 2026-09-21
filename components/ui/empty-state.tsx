@@ -2,25 +2,26 @@
 
 import * as React from 'react'
 import Link from 'next/link'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import {
-  Receipt,
   Users,
-  ArrowLeftRight,
-  Camera,
-  Building2,
-  FileText,
-  Calendar,
   Plus,
+  TrendingUp,
   type LucideIcon,
 } from 'lucide-react'
 import { SupportLink } from '@/components/ui/support-link'
 
 interface EmptyStateProps {
   icon?: LucideIcon
-  title: string
-  description: string
+  /**
+   * Usually static i18n strings. The empty state is data-ph-unmask chrome in
+   * session replays, so a title or description carrying user data (e.g. an
+   * interpolated search term) must wrap that part in a data-ph-mask element.
+   */
+  title: React.ReactNode
+  description: React.ReactNode
   actionLabel?: string
   actionHref?: string
   onAction?: () => void
@@ -32,7 +33,7 @@ interface EmptyStateProps {
 }
 
 /**
- * EmptyState - Visar ett vänligt meddelande när det inte finns någon data
+ * EmptyState: friendly placeholder shown when there is no data.
  */
 export function EmptyState({
   icon: Icon,
@@ -47,22 +48,24 @@ export function EmptyState({
   className,
   children,
 }: EmptyStateProps) {
+  const t = useTranslations('empty')
   return (
-    <div className={cn('flex flex-col items-center justify-center py-12 px-4 text-center', className)}>
+    // data-ph-unmask: empty states are static i18n chrome in session replays.
+    <div data-ph-unmask="" className={cn('flex flex-col items-center justify-center py-12 px-4 text-center', className)}>
       {Icon && (
         <div className="mb-6">
-          <div className="p-5 rounded-full bg-muted">
+          <div className="p-4 rounded-full bg-muted">
             <Icon className="h-8 w-8 text-muted-foreground" />
           </div>
         </div>
       )}
-      <h3 className="text-lg font-medium mb-2">{title}</h3>
+      <h3 className="text-lg mb-2">{title}</h3>
       <p className="text-sm text-muted-foreground max-w-sm mb-6 text-balance">{description}</p>
 
       {supportHint && (
         <div className="mb-6">
-          <SupportLink variant="muted" subject="Behöver hjälp att komma igång">
-            Behöver du hjälp? Kontakta support
+          <SupportLink variant="muted" subject={t('support_hint_subject')}>
+            {t('support_hint_label')}
           </SupportLink>
         </div>
       )}
@@ -95,91 +98,40 @@ export function EmptyState({
   )
 }
 
-// Förkonfigurerade tomma tillstånd för vanliga sidor
-
-export function EmptyInvoices() {
-  return (
-    <EmptyState
-      icon={Receipt}
-      title="Inga fakturor ännu"
-      description="Skapa din första faktura på under 60 sekunder. Vi fyller i dina uppgifter automatiskt."
-      actionLabel="Skapa faktura"
-      actionHref="/invoices/new"
-    />
-  )
-}
+// Preset empty states for common pages
 
 export function EmptyCustomers({ onAction }: { onAction?: () => void } = {}) {
+  const t = useTranslations('empty')
   return (
     <EmptyState
       icon={Users}
-      title="Inga kunder ännu"
-      description="Lägg till dina kunder för att enkelt skapa fakturor och hålla koll på betalningar."
-      actionLabel="Lägg till kund"
+      title={t('preset_customers_title')}
+      description={t('preset_customers_description')}
+      actionLabel={t('preset_customers_action')}
       actionHref={onAction ? undefined : '/customers/new'}
       onAction={onAction}
     />
   )
 }
 
-export function EmptyTransactions() {
+/**
+ * Byrå cockpit: no client companies yet. A preset, not a bare <EmptyState
+ * icon={TrendingUp} />, because the only caller is a Server Component: a
+ * lucide icon is a forwardRef object that cannot cross the RSC boundary as a
+ * prop, while a reference to this client component can. The copy lives in the
+ * byra namespace, where the byrå surfaces already keep it.
+ */
+export function EmptyByraClients() {
+  // Named tByra, not t: this is the only preset here that reads from a
+  // namespace other than `empty`, and i18n/__tests__/message-keys.test.ts maps
+  // one variable name to one namespace per file. Reusing `t` would silently
+  // re-point every other preset's key in this file at `byra`.
+  const tByra = useTranslations('byra')
   return (
     <EmptyState
-      icon={ArrowLeftRight}
-      title="Inga transaktioner"
-      description="Importera kontoutdrag från din bank för att automatiskt bokföra och få koll på ekonomin."
-      actionLabel="Importera transaktioner"
-      actionHref="/import"
-      supportHint
-    />
-  )
-}
-
-export function EmptyReceipts() {
-  return (
-    <EmptyState
-      icon={Camera}
-      title="Inga kvitton"
-      description="Ta en bild på ett kvitto för automatisk avläsning och bokföring. Vi sköter resten!"
-      actionLabel="Skanna kvitto"
-      actionHref="/receipts/scan"
-    />
-  )
-}
-
-export function EmptyDeadlines() {
-  return (
-    <EmptyState
-      icon={Calendar}
-      title="Inga kommande deadlines"
-      description="Bra jobbat! Du har inga omedelbara deadlines att ta hand om."
-    />
-  )
-}
-
-export function NoBankConnected() {
-  return (
-    <EmptyState
-      icon={Building2}
-      title="Inga transaktioner importerade"
-      description="Importera kontoutdrag från din bank för att automatiskt bokföra och få bättre koll på ekonomin."
-      actionLabel="Importera transaktioner"
-      actionHref="/import"
-      supportHint
-    />
-  )
-}
-
-export function EmptyReports() {
-  return (
-    <EmptyState
-      icon={FileText}
-      title="Inga rapporter tillgängliga"
-      description="Rapporter genereras automatiskt när du har tillräckligt med data. Börja med att skapa fakturor eller importera transaktioner."
-      actionLabel="Skapa faktura"
-      actionHref="/invoices/new"
-      secondaryActionLabel="Importera transaktioner"
-      secondaryActionHref="/import"
+      icon={TrendingUp}
+      title={tByra('kpi_empty_title')}
+      description={tByra('kpi_empty_description')}
     />
   )
 }

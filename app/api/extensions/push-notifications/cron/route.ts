@@ -1,46 +1,54 @@
-import { createClient } from '@supabase/supabase-js'
+import { createServiceRoleClient } from '@/lib/supabase/service-client'
 import { NextResponse } from 'next/server'
 import { loadExtensions } from '@/lib/extensions/loader'
+import { extensionRegistry } from '@/lib/extensions/registry'
 import {
   sendTaxDeadlineNotifications,
   sendInvoiceNotifications,
   sendMissingUnderlagNotifications,
 } from '@/extensions/general/push-notifications/notification-scheduler'
+import { withCronContext } from '@/lib/api/with-cron-context'
+import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 
 /**
- * GET /api/extensions/push-notifications/cron
- * Daily cron job to send push notifications
- * Runs at 09:00 every day
+ * GET /api/extensions/push-notifications/cron: daily 09:00 UTC.
+ * Sends due tax, invoice and missing-underlag push notifications.
  *
- * Vercel Cron: "0 9 * * *"
+ * NOT scheduled: this path is absent from vercel.json's crons (and therefore
+ * from the Docker crontabs generated from it). Adding it there is a product
+ * decision, not a code change.
  */
-export async function GET(request: Request) {
-  // Ensure extensions are loaded so event handlers are registered
+export const GET = withCronContext('cron.push_notifications', async (_request, ctx) => {
+  // Load the registry so it reflects extensions.config.json.
   loadExtensions()
 
-  // Verify cron secret for security
-  const authHeader = request.headers.get('authorization')
-  const cronSecret = process.env.CRON_SECRET
-
-  if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  // Physical routes under app/api/extensions/<id>/ compile into EVERY build,
+  // including the core-with-zero-extensions one: the registry (generated from
+  // extensions.config.json) is what actually switches an extension on. Mirror
+  // the ext/[...path] dispatcher: a disabled extension must not expose a live
+  // send/query surface, and a scheduled-but-disabled cron must fail visibly
+  // (503) instead of quietly doing the work anyway.
+  if (!extensionRegistry.get('push-notifications')) {
+    ctx.log.warn('push-notifications extension is not enabled; cron refused')
+    return NextResponse.json(
+      { error: 'Push notifications extension is not enabled', code: 'EXTENSION_DISABLED' },
+      { status: 503 }
+    )
   }
 
-  // Create a service role client for accessing all user data
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
   const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
 
   if (!supabaseUrl || !supabaseServiceKey) {
-    return NextResponse.json(
-      { error: 'Missing Supabase configuration' },
-      { status: 500 }
-    )
+    return errorResponseFromCode('INTERNAL_ERROR', ctx.log, {
+      requestId: ctx.requestId,
+      details: { reason: 'Missing Supabase configuration' },
+    })
   }
 
-  const supabase = createClient(supabaseUrl, supabaseServiceKey)
+  const supabase = createServiceRoleClient(supabaseUrl, supabaseServiceKey)
 
   try {
-    // Send all notification types in parallel
     const [taxResult, invoiceResult, underlagResult] = await Promise.all([
       sendTaxDeadlineNotifications(supabase),
       sendInvoiceNotifications(supabase),
@@ -50,18 +58,13 @@ export async function GET(request: Request) {
     const totalSent = taxResult.sent + invoiceResult.sent + underlagResult.sent
     const totalSkipped = taxResult.skipped + invoiceResult.skipped + underlagResult.skipped
 
-    console.log(
-      `Push notification cron completed: ${totalSent} sent, ${totalSkipped} skipped`
-    )
-    console.log(
-      `  Tax: ${taxResult.sent} sent, ${taxResult.skipped} skipped`
-    )
-    console.log(
-      `  Invoice: ${invoiceResult.sent} sent, ${invoiceResult.skipped} skipped`
-    )
-    console.log(
-      `  Missing underlag: ${underlagResult.sent} sent, ${underlagResult.skipped} skipped`
-    )
+    ctx.log.info('push notification cron summary', {
+      totalSent,
+      totalSkipped,
+      taxSent: taxResult.sent,
+      invoiceSent: invoiceResult.sent,
+      underlagSent: underlagResult.sent,
+    })
 
     return NextResponse.json({
       success: true,
@@ -73,11 +76,8 @@ export async function GET(request: Request) {
         missingUnderlag: underlagResult,
       },
     })
-  } catch (error) {
-    console.error('Error in push notification cron:', error)
-    return NextResponse.json(
-      { error: 'Failed to send push notifications' },
-      { status: 500 }
-    )
+  } catch (err) {
+    ctx.log.error('push notification cron failed', err as Error)
+    return errorResponse(err, ctx.log, { requestId: ctx.requestId })
   }
-}
+})

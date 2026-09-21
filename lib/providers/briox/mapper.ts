@@ -8,16 +8,49 @@ import type {
   CompanyInformationDto,
   AmountType, PartyDto,
 } from '../dto';
+import { creditNoteTypeCode } from '../dto';
+import { readNumber, resolveVatTriple, lineVatFromPercent } from '../amounts';
 
 function amount(value: number | undefined | null, currency: string = 'SEK'): AmountType {
   return { value: value ?? 0, currencyCode: currency };
 }
 
-function deriveInvoiceStatus(raw: Record<string, unknown>): InvoiceStatusCode {
+/** Briox often serializes numbers as strings ("250.00"): coerce defensively. */
+function num(value: unknown): number | undefined {
+  if (value == null || value === '') return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * Briox exposes the ex-VAT amount as `net_amount`, which the list payload has
+ * been observed to omit. It used to fall back to the gross total, making the
+ * derived VAT 0 on any invoice missing the field. The VAT total itself is
+ * spelled inconsistently across Briox's endpoints, so several candidates are
+ * tried; none matching leaves the VAT unknown rather than zero.
+ */
+const BRIOX_NET_KEYS = ['net_amount'] as const;
+const BRIOX_VAT_KEYS = ['vat_amount', 'total_vat', 'vat'] as const;
+
+/**
+ * Single source of truth for "is this invoice fully settled?", used by BOTH
+ * deriveInvoiceStatus and the paymentStatus.paid flag so they can never
+ * diverge (mirrors the Fortnox mapper). An ABSENT balance is treated as NOT
+ * paid: only an explicit paid status/flag, or a present non-positive balance
+ * on a positive-total invoice, counts as paid.
+ */
+function isFullyPaid(raw: Record<string, unknown>): boolean {
+  if (raw['status'] === 'paid' || raw['fully_paid'] === true) return true;
+  const total = num(raw['total_amount']);
+  const balance = num(raw['balance']);
+  return total != null && total > 0 && balance != null && balance <= 0;
+}
+
+function deriveInvoiceStatus(raw: Record<string, unknown>, isCreditNote = false): InvoiceStatusCode {
   const status = raw['status'] as string | undefined;
   if (status === 'cancelled') return 'cancelled';
-  if (status === 'credited') return 'credited';
-  if (status === 'paid' || raw['fully_paid'] === true) return 'paid';
+  if (isCreditNote || status === 'credited') return 'credited';
+  if (isFullyPaid(raw)) return 'paid';
   if (status === 'booked' || raw['booked'] === true) return 'booked';
   if (status === 'sent' || raw['sent'] === true) return 'sent';
   if (status === 'overdue') return 'overdue';
@@ -49,31 +82,64 @@ function buildParty(name: string, orgNumber?: string, raw?: Record<string, unkno
 
 export function mapBrioxToSalesInvoice(raw: Record<string, unknown>): SalesInvoiceDto {
   const currency = (raw['currency_code'] as string) ?? 'SEK';
-  const total = raw['total_amount'] as number ?? 0;
-  const balance = raw['balance'] as number ?? 0;
+  const total = num(raw['total_amount']) ?? 0;
+  // Default an ABSENT balance to the full total (= fully unpaid), never 0, so
+  // a missing balance never silently reads as paid. When paid, force balance
+  // to 0 so the DTO is internally consistent (paid ⇒ nothing outstanding).
+  const paid = isFullyPaid(raw);
+  const balance = paid ? 0 : (num(raw['balance']) ?? total);
+  // 381 for a kreditfaktura: the one signal the importer reads (dto.ts).
+  // No Briox credit flag could be verified for this mapper (its API reference
+  // is not public and no Briox-migrated invoice in production had a negative
+  // total on 2026-09-20), so the negative total is the whole signal.
+  // `status: 'credited'` is deliberately NOT one: beside positive amounts it
+  // reads as "this invoice has been credited" (as Bokio's `credited` and
+  // WINT's `CreditStatus` do), and typing that 381 would reverse the sign of
+  // the original receivable. The amount is the one reading that cannot be
+  // wrong in that direction.
+  const invoiceTypeCode = creditNoteTypeCode(false, total);
 
   const rows = (raw['rows'] as Record<string, unknown>[] | undefined) ?? [];
-  const lines: SalesInvoiceLineDto[] = rows.map((row, idx) => ({
-    id: String(row['id'] ?? idx + 1),
-    description: row['description'] as string | undefined,
-    quantity: row['quantity'] as number | undefined,
-    unitCode: row['unit'] as string | undefined,
-    unitPrice: row['price'] != null ? amount(row['price'] as number, currency) : undefined,
-    lineExtensionAmount: amount(row['total'] as number ?? 0, currency),
-    taxPercent: row['vat_rate'] as number | undefined,
-    accountNumber: row['account_number'] != null ? String(row['account_number']) : undefined,
-    articleNumber: row['article_number'] as string | undefined,
-    itemName: row['description'] as string | undefined,
-  }));
+  // Line-level amounts arrive from the same string-serializing API as the
+  // header amounts: coerce ALL numerics through num(), never blind casts.
+  const lines: SalesInvoiceLineDto[] = rows.map((row, idx) => {
+    const lineNet = num(row['total']);
+    const taxPercent = num(row['vat_rate']);
+    const lineVat = lineNet !== undefined ? lineVatFromPercent(lineNet, taxPercent) : undefined;
+
+    return {
+      id: String(row['id'] ?? idx + 1),
+      description: row['description'] as string | undefined,
+      quantity: num(row['quantity']),
+      unitCode: row['unit'] as string | undefined,
+      unitPrice: row['price'] != null ? amount(num(row['price']), currency) : undefined,
+      lineExtensionAmount: amount(lineNet, currency),
+      taxPercent,
+      // Briox states the rate per row but not the money; the migration needs
+      // the money, because the booking engine sums per-line VAT to post 2611.
+      taxAmount: lineVat !== undefined ? amount(lineVat, currency) : undefined,
+      accountNumber: row['account_number'] != null ? String(row['account_number']) : undefined,
+      articleNumber: row['article_number'] as string | undefined,
+      itemName: row['description'] as string | undefined,
+    };
+  });
+
+  const vat = resolveVatTriple({
+    gross: total,
+    net: readNumber(raw, BRIOX_NET_KEYS),
+    vat: readNumber(raw, BRIOX_VAT_KEYS),
+  });
 
   const legalMonetaryTotal: LegalMonetaryTotalDto = {
-    lineExtensionAmount: amount(raw['net_amount'] as number ?? total, currency),
+    // Undefined when `net_amount` is absent: falling back to the gross records
+    // the whole invoice as its own net, and 0 kr of VAT alongside it.
+    lineExtensionAmount: vat.net !== undefined ? amount(vat.net, currency) : undefined,
     taxInclusiveAmount: amount(total, currency),
     payableAmount: amount(total, currency),
   };
 
   const paymentStatus: PaymentStatusDto = {
-    paid: balance === 0 && total > 0,
+    paid,
     balance: amount(balance, currency),
   };
 
@@ -82,14 +148,16 @@ export function mapBrioxToSalesInvoice(raw: Record<string, unknown>): SalesInvoi
     invoiceNumber: String(raw['invoice_number'] ?? raw['id'] ?? ''),
     issueDate: (raw['invoice_date'] as string) ?? '',
     dueDate: raw['due_date'] as string | undefined,
+    invoiceTypeCode,
     currencyCode: currency,
-    status: deriveInvoiceStatus(raw),
+    status: deriveInvoiceStatus(raw, invoiceTypeCode !== undefined),
     supplier: buildParty(''),
     customer: buildParty(
       (raw['customer_name'] ?? '') as string,
       raw['customer_org_number'] as string | undefined,
     ),
     lines,
+    taxTotal: vat.vat !== undefined ? { taxAmount: amount(vat.vat, currency) } : undefined,
     legalMonetaryTotal,
     paymentStatus,
     paymentTerms: raw['payment_terms'] as string | undefined,
@@ -103,27 +171,40 @@ export function mapBrioxToSalesInvoice(raw: Record<string, unknown>): SalesInvoi
 
 export function mapBrioxToSupplierInvoice(raw: Record<string, unknown>): SupplierInvoiceDto {
   const currency = (raw['currency_code'] as string) ?? 'SEK';
-  const total = raw['total_amount'] as number ?? 0;
-  const balance = raw['balance'] as number ?? 0;
+  const total = num(raw['total_amount']) ?? 0;
+  // Same absent-balance hardening as the sales path: missing balance reads as
+  // fully unpaid, paid forces balance to 0.
+  const paid = isFullyPaid(raw);
+  const balance = paid ? 0 : (num(raw['balance']) ?? total);
 
   const rows = (raw['rows'] as Record<string, unknown>[] | undefined) ?? [];
+  // Same string-coercion hardening as the sales path (Briox serializes
+  // numbers as strings): route every numeric line field through num().
   const lines: SupplierInvoiceLineDto[] = rows.map((row, idx) => ({
     id: String(row['id'] ?? idx + 1),
     description: row['description'] as string | undefined,
-    quantity: row['quantity'] as number | undefined,
-    unitPrice: row['price'] != null ? amount(row['price'] as number, currency) : undefined,
-    lineExtensionAmount: amount(row['total'] as number ?? 0, currency),
+    quantity: num(row['quantity']),
+    unitPrice: row['price'] != null ? amount(num(row['price']), currency) : undefined,
+    lineExtensionAmount: amount(num(row['total']), currency),
     accountNumber: row['account_number'] != null ? String(row['account_number']) : undefined,
   }));
 
+  const vat = resolveVatTriple({
+    gross: total,
+    net: readNumber(raw, BRIOX_NET_KEYS),
+    vat: readNumber(raw, BRIOX_VAT_KEYS),
+  });
+
   const legalMonetaryTotal: LegalMonetaryTotalDto = {
-    lineExtensionAmount: amount(raw['net_amount'] as number ?? total, currency),
+    // Undefined when `net_amount` is absent: falling back to the gross records
+    // the whole invoice as its own net, and 0 kr of VAT alongside it.
+    lineExtensionAmount: vat.net !== undefined ? amount(vat.net, currency) : undefined,
     taxInclusiveAmount: amount(total, currency),
     payableAmount: amount(total, currency),
   };
 
   const paymentStatus: PaymentStatusDto = {
-    paid: balance === 0 && total > 0,
+    paid,
     balance: amount(balance, currency),
   };
 
@@ -140,6 +221,7 @@ export function mapBrioxToSupplierInvoice(raw: Record<string, unknown>): Supplie
     ),
     buyer: buildParty(''),
     lines,
+    taxTotal: vat.vat !== undefined ? { taxAmount: amount(vat.vat, currency) } : undefined,
     legalMonetaryTotal,
     paymentStatus,
     ocrNumber: raw['ocr'] as string | undefined,

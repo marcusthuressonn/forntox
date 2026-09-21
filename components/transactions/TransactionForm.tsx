@@ -1,36 +1,48 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useMemo } from 'react'
 import { useForm, Controller } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import { format } from 'date-fns'
+import { isSaneDateString } from '@/lib/utils'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Loader2 } from 'lucide-react'
-import type { CreateTransactionInput, Currency } from '@/types'
-
-const schema = z.object({
-  date: z.string().min(1, 'Datum krävs'),
-  description: z.string().min(1, 'Beskrivning krävs'),
-  amount: z.number().refine((n) => n !== 0, 'Belopp måste anges'),
-  currency: z.enum(['SEK', 'EUR', 'USD', 'GBP', 'NOK', 'DKK']),
-  notes: z.string().optional(),
-})
-
-type FormData = z.infer<typeof schema>
+import { CURRENCIES, type CreateTransactionInput, type Currency } from '@/types'
 
 interface TransactionFormProps {
   onSubmit: (data: CreateTransactionInput) => Promise<void>
   isLoading: boolean
 }
 
-const currencies: Currency[] = ['SEK', 'EUR', 'USD', 'GBP', 'NOK', 'DKK']
+const currencies: readonly Currency[] = CURRENCIES
 
 export default function TransactionForm({ onSubmit, isLoading }: TransactionFormProps) {
+  const t = useTranslations('tx_form')
+  const schema = useMemo(
+    () =>
+      z.object({
+        date: z
+          .string()
+          .min(1, t('date_required'))
+          // Single source of truth for the date rule, shared with the server
+          // CreateTransactionSchema: rejects the 6-digit-year corruption a
+          // native date input can emit ('202403-02-05') plus impossible /
+          // out-of-range dates.
+          .refine((s) => !s || isSaneDateString(s), t('date_invalid')),
+        description: z.string().min(1, t('description_required')),
+        amount: z.number().refine((n) => n !== 0, t('amount_required')),
+        currency: z.enum(CURRENCIES),
+        notes: z.string().optional(),
+      }),
+    [t]
+  )
+  type FormData = z.infer<typeof schema>
   const {
     register,
     handleSubmit,
@@ -67,14 +79,14 @@ export default function TransactionForm({ onSubmit, isLoading }: TransactionForm
     <form onSubmit={handleSubmit(onFormSubmit)} className="space-y-4">
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="space-y-2">
-          <Label htmlFor="date">Datum *</Label>
-          <Input id="date" type="date" {...register('date')} />
+          <Label htmlFor="date">{t('date_label')}</Label>
+          <Input id="date" type="date" min="1900-01-01" max="2100-12-31" {...register('date')} />
           {errors.date && (
             <p className="text-sm text-destructive">{errors.date.message}</p>
           )}
         </div>
         <div className="space-y-2">
-          <Label htmlFor="currency">Valuta</Label>
+          <Label htmlFor="currency">{t('currency_label')}</Label>
           <Controller
             name="currency"
             control={control}
@@ -97,10 +109,10 @@ export default function TransactionForm({ onSubmit, isLoading }: TransactionForm
       </div>
 
       <div className="space-y-2">
-        <Label htmlFor="description">Beskrivning *</Label>
+        <Label htmlFor="description">{t('description_label')}</Label>
         <Input
           id="description"
-          placeholder="T.ex. Adobe Creative Cloud"
+          placeholder={t('description_placeholder')}
           {...register('description')}
         />
         {errors.description && (
@@ -109,27 +121,27 @@ export default function TransactionForm({ onSubmit, isLoading }: TransactionForm
       </div>
 
       <div className="space-y-2">
-        <Label htmlFor="amount">Belopp * (negativt för utgift)</Label>
+        <Label htmlFor="amount">{t('amount_label')}</Label>
         <Input
           id="amount"
           type="number"
           step="0.01"
-          placeholder="-500"
+          placeholder={t('amount_placeholder')}
           {...register('amount', { valueAsNumber: true })}
         />
         {errors.amount && (
           <p className="text-sm text-destructive">{errors.amount.message}</p>
         )}
         <p className="text-xs text-muted-foreground">
-          Ange positivt belopp för intäkter, negativt för kostnader
+          {t('amount_help')}
         </p>
       </div>
 
       <div className="space-y-2">
-        <Label htmlFor="notes">Anteckningar</Label>
+        <Label htmlFor="notes">{t('notes_label')}</Label>
         <Textarea
           id="notes"
-          placeholder="Valfria anteckningar..."
+          placeholder={t('notes_placeholder')}
           {...register('notes')}
         />
       </div>
@@ -138,10 +150,10 @@ export default function TransactionForm({ onSubmit, isLoading }: TransactionForm
         {isLoading ? (
           <>
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            Sparar...
+            {t('saving')}
           </>
         ) : (
-          'Spara transaktion'
+          t('save')
         )}
       </Button>
     </form>

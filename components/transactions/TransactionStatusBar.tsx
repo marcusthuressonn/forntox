@@ -1,129 +1,92 @@
 'use client'
 
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
-import Link from 'next/link'
-import { Upload, Wand, Plus, CheckSquare, FileText, Lock } from 'lucide-react'
+import { useRouter } from 'next/navigation'
+import { useTranslations } from 'next-intl'
+import { Upload, Plus, RefreshCw } from 'lucide-react'
+import { SplitButton, type SplitButtonOption } from '@/components/ui/split-button'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
-import type { ViewMode } from './transaction-types'
+import { useUiState } from '@/lib/hooks/use-ui-state'
+import { resolveInitialMode } from '@/lib/ui-state/client'
+import { useBankSync } from '@/components/transactions/BankSyncNowButton'
+import { useAgeFormatter } from '@/components/transactions/BankSyncStatusChip'
 
 interface TransactionStatusBarProps {
-  uncategorizedCount: number
-  invoiceMatchCount: number
-  mode: ViewMode
-  onModeChange: (mode: ViewMode) => void
-  onOpenSwipeView: () => void
   onOpenCreateDialog: () => void
-  isLoadingSuggestions: boolean
-  isBatchMode: boolean
-  onToggleBatchMode: () => void
 }
 
+/**
+ * Page header (concept scene 10): title + one Importera split button
+ * holding the ways transactions arrive (bank sync, import guide for CSV/SIE,
+ * manual entry for cash/outlays).
+ */
 export default function TransactionStatusBar({
-  uncategorizedCount,
-  invoiceMatchCount,
-  mode,
-  onModeChange,
-  onOpenSwipeView,
   onOpenCreateDialog,
-  isLoadingSuggestions,
-  isBatchMode,
-  onToggleBatchMode,
 }: TransactionStatusBarProps) {
   const { canWrite } = useCanWrite()
+  const t = useTranslations('transactions')
+  const router = useRouter()
+  const { uiState, loaded } = useUiState()
+  const { connections, hasBankSync, syncAll, lastSyncedAt, isBusy } = useBankSync()
+  const formatAge = useAgeFormatter()
+
+  // "Synka bank nu" (concept: first menu row) only renders once a bank is
+  // actually connected and the plan includes PSD2 sync; the footer
+  // BankSyncNowButton stays the gated conversion surface for free users.
+  const showSync = hasBankSync && (connections?.length ?? 0) > 0
+
+  const options: SplitButtonOption[] = [
+    ...(showSync
+      ? [
+          {
+            key: 'synka',
+            label: t('create_synka'),
+            icon: RefreshCw,
+            busy: isBusy,
+            busyLabel: t('bank_sync_button_syncing'),
+            description: lastSyncedAt
+              ? t('create_synka_desc_last', { age: formatAge(lastSyncedAt) })
+              : t('create_synka_desc'),
+            onSelect: () => {
+              void syncAll()
+            },
+          } satisfies SplitButtonOption,
+        ]
+      : []),
+    {
+      key: 'importera',
+      label: t('action_import'),
+      icon: Upload,
+      description: t('create_import_desc'),
+      // Straight to the bank-file step: the option's own description says
+      // "CSV- eller SIE-fil från banken", so the chooser in between is a stop
+      // that asks what the user already answered.
+      onSelect: () => router.push('/import?mode=bank'),
+    },
+    {
+      key: 'manuell',
+      label: t('action_new_transaction'),
+      icon: Plus,
+      description: t('create_manual_desc'),
+      disabled: !canWrite,
+      disabledTitle: t('viewer_disabled_tooltip'),
+      onSelect: () => onOpenCreateDialog(),
+    },
+  ]
+
   return (
-    <div className="space-y-4">
-      {/* Header with title + actions */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">Transaktioner</h1>
-          {uncategorizedCount > 0 && mode === 'inbox' && (
-            <p className="text-muted-foreground mt-1">
-              <span className="text-foreground font-semibold">{uncategorizedCount}</span> att bokföra
-              {invoiceMatchCount > 0 && (
-                <span className="ml-2">
-                  · <FileText className="inline h-3.5 w-3.5 text-primary" />{' '}
-                  <span className="text-foreground font-semibold">{invoiceMatchCount} fakturamatchningar</span>
-                </span>
-              )}
-            </p>
-          )}
-          {mode === 'history' && (
-            <p className="text-muted-foreground">Alla dina transaktioner</p>
-          )}
-        </div>
-
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" asChild>
-            <Link href="/import">
-              <Upload className="mr-2 h-4 w-4" />
-              Importera
-            </Link>
-          </Button>
-          {mode === 'inbox' && uncategorizedCount > 0 && (
-            <>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={onOpenSwipeView}
-                disabled={isLoadingSuggestions}
-              >
-                <Wand className="mr-2 h-4 w-4" />
-                {isLoadingSuggestions ? 'Laddar...' : 'Gå igenom alla'}
-              </Button>
-              <Button
-                variant={isBatchMode ? 'default' : 'outline'}
-                size="sm"
-                onClick={onToggleBatchMode}
-              >
-                <CheckSquare className="mr-2 h-4 w-4" />
-                {isBatchMode ? 'Avsluta' : 'Välj flera'}
-              </Button>
-            </>
-          )}
-          <Button
-            size="sm"
-            onClick={onOpenCreateDialog}
-            disabled={!canWrite}
-            title={!canWrite ? 'Du har endast läsbehörighet i detta företag' : undefined}
-          >
-            {canWrite ? (
-              <Plus className="mr-2 h-4 w-4" />
-            ) : (
-              <Lock className="mr-2 h-4 w-4" />
-            )}
-            Ny transaktion
-          </Button>
-        </div>
-      </div>
-
-      {/* Mode toggle - segmented control style */}
-      <div className="inline-flex rounded-lg border bg-muted p-1">
-        <Button
-          variant={mode === 'inbox' ? 'default' : 'ghost'}
-          size="sm"
-          className="h-8 rounded-md"
-          onClick={() => onModeChange('inbox')}
-        >
-          Att bokföra
-          {uncategorizedCount > 0 && (
-            <Badge
-              variant={mode === 'inbox' ? 'secondary' : 'outline'}
-              className="ml-2 text-xs"
-            >
-              {uncategorizedCount}
-            </Badge>
-          )}
-        </Button>
-        <Button
-          variant={mode === 'history' ? 'default' : 'ghost'}
-          size="sm"
-          className="h-8 rounded-md"
-          onClick={() => onModeChange('history')}
-        >
-          Alla transaktioner
-        </Button>
-      </div>
+    <div className="page-header flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <h1 className="page-header-title font-display text-2xl leading-8 tracking-tight">{t('page_title')}</h1>
+      <SplitButton
+        key={`${loaded ? 'loaded' : 'initial'}-${showSync ? 'sync' : 'nosync'}`}
+        persistKey="transactions"
+        initialModeKey={resolveInitialMode(
+          uiState,
+          'transactions',
+          options.map((o) => o.key),
+          'importera',
+        )}
+        options={options}
+      />
     </div>
   )
 }

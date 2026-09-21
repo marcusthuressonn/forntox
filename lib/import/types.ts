@@ -5,6 +5,9 @@
  * accounting data exchange between systems).
  */
 
+import type { ChartPlan } from './chart-plan'
+import type { ImportNotice } from './notices'
+
 // SIE file types
 export type SIEType = 1 | 2 | 3 | 4
 
@@ -29,7 +32,7 @@ export interface SIEHeader {
   flagga: number | null            // #FLAGGA (0 = not imported, 1 = already imported)
   program: string | null           // #PROGRAM
   programVersion: string | null
-  generatedDate: string | null     // #GEN — "YYYY-MM-DD"
+  generatedDate: string | null     // #GEN: "YYYY-MM-DD"
   format: string | null            // #FORMAT (PC8 = CP437)
 
   // Company info
@@ -84,19 +87,60 @@ export interface SIETransactionLine {
   quantity?: number
   signature?: string
   objectId?: string
+  /** Object list ({dimNo "code" …}) as SIE dim number → object code. */
+  dimensions?: Record<string, string>
+}
+
+/**
+ * Dimension declaration from #DIM or #UNDERDIM
+ */
+export interface SIEDimension {
+  sieDimNo: number
+  name: string
+  /** Set when declared via #UNDERDIM: the parent dimension number. */
+  parentSieDimNo?: number
+}
+
+/**
+ * Dimension value from #OBJEKT
+ */
+export interface SIEDimensionValue {
+  sieDimNo: number
+  code: string
+  name: string
+}
+
+/**
+ * Correction history carried by a #VER (SIE 4B #BTRANS / #RTRANS).
+ *
+ * `struck` = #BTRANS rows: lines removed in the source system after
+ * posting (how the voucher looked before the correction).
+ * `added` = #RTRANS rows: lines added by a correction. Per spec each #RTRANS
+ * is immediately followed by an identical #TRANS, so these lines are ALSO
+ * present in `lines`; they are listed here only to mark them as corrections.
+ *
+ * Never part of the final voucher state: `lines` (#TRANS only) is what gets
+ * booked, this is audit trail for the rättelselogg.
+ */
+export interface SIEVoucherCorrections {
+  struck: SIETransactionLine[]
+  added: SIETransactionLine[]
 }
 
 /**
  * Voucher/Journal entry from #VER tag
  */
 export interface SIEVoucher {
-  series: string                   // Voucher series (A, B, etc.)
-  number: number                   // Voucher number
+  series: string                   // Voucher series (A, B, etc.). Empty in SIE4I files.
+  number: number                   // Voucher number; placeholder 0 when numberOmitted
+  numberOmitted?: boolean          // SIE4I: receiver assigns; never a source key
   date: Date
   description: string
   registrationDate?: Date
   signature?: string
   lines: SIETransactionLine[]
+  /** Set only when the #VER carried #BTRANS or #RTRANS rows. */
+  corrections?: SIEVoucherCorrections
 }
 
 /**
@@ -107,6 +151,10 @@ export interface ParseIssue {
   line: number
   message: string
   tag?: string
+  /** Machine-readable scope for records omitted by the tolerant preview parser. */
+  code?: 'invalid_amount'
+  account?: string
+  yearIndex?: number
 }
 
 /**
@@ -126,6 +174,10 @@ export interface ParsedSIEFile {
 
   // Transactions (SIE4 only)
   vouchers: SIEVoucher[]
+
+  // Dimension registry records (#DIM / #UNDERDIM / #OBJEKT)
+  dimensions: SIEDimension[]
+  dimensionValues: SIEDimensionValue[]
 
   // Parse issues
   issues: ParseIssue[]
@@ -160,14 +212,26 @@ export interface AccountMapping {
   confidence: number               // 0-1
   matchType: AccountMatchType
   isOverride: boolean              // User manually set this
-}
-
-/**
- * Account mapping context for the mapper
- */
-export interface MappingContext {
-  sourceAccounts: SIEAccount[]
-  existingMappings?: Map<string, AccountMapping>
+  defaultVatTreatment?: import('@/lib/vat/account-vat-treatment').AccountVatTreatment | null
+  defaultVatRate?: number | null
+  vatTreatmentSuggested?: boolean
+  vatTreatmentReviewed?: boolean
+  requiresVatTreatmentReview?: boolean
+  /**
+   * The source system's own momskod for this account, verbatim (e.g. "MP1"),
+   * shown in the mapping step so the user can check the translation against
+   * the chart they know. Set whenever the provider reported one, translated
+   * or not.
+   */
+  providerVatCode?: string | null
+  /**
+   * providerVatCode translated to a treatment, or null when the code has no
+   * equivalent. A fact about the source account, not the row's current
+   * value: enrichAccountMappingsWithVat derives the suggestion from it every
+   * time the row returns to an identity mapping, so a remap and back does
+   * not lose it.
+   */
+  providerVatTreatment?: import('@/lib/vat/account-vat-treatment').AccountVatTreatment | null
 }
 
 /**
@@ -214,29 +278,6 @@ export interface SIEAccountMappingRecord {
 }
 
 /**
- * Options for executing an import
- */
-export interface ImportOptions {
-  // The parsed SIE data
-  parsed: ParsedSIEFile
-
-  // Account mappings to use
-  mappings: AccountMapping[]
-
-  // Whether to create a new fiscal period
-  createFiscalPeriod: boolean
-
-  // Whether to import opening balances as a journal entry
-  importOpeningBalances: boolean
-
-  // Whether to import transactions (SIE4 only)
-  importTransactions: boolean
-
-  // Voucher series to use for imported entries
-  voucherSeries?: string
-}
-
-/**
  * Structured import details for UI display.
  * Provides machine-readable data so the UI can render proper explanations
  * instead of parsing warning strings.
@@ -252,6 +293,14 @@ export interface ImportResultDetails {
     singleLine: number
     empty: number
     total: number
+    /**
+     * The source accounts behind `unmapped`, with how many vouchers each one
+     * excluded. Lets the result step name the accounts instead of leaving
+     * the user to diff the general ledger against the source system
+     * (issue #2212). Absent when `unmapped` is 0 and on results recorded
+     * before this field existed.
+     */
+    unmappedAccounts?: Array<{ account: string; vouchers: number }>
   }
 
   /** Opening balance imbalance info */
@@ -269,6 +318,30 @@ export interface ImportResultDetails {
     created: boolean
     accountsAdjusted: number
   }
+
+  /**
+   * Why the file's #IB was not booked as its own IB voucher. `prior_activity`:
+   * the company already had posted entries, so this period's opening balance
+   * derives from the prior period's closing balance instead (a second IB
+   * voucher would double-count one year of activity). Informational, not a
+   * warning: it is the correct outcome for every year after the first in a
+   * multi-year migration.
+   */
+  openingBalanceSkipped?: 'prior_activity'
+
+  /**
+   * Non-latest fiscal years whose P&L doesn't net to zero — their result
+   * was never transferred to equity (omföring av årets resultat saknas).
+   * Each corrupts every later derived opening balance by exactly pl_net,
+   * which surfaces as a balansräkning differens. Structurally identical to
+   * UntransferredResult in @/types.
+   */
+  untransferredResults?: Array<{
+    fiscal_period_id: string
+    period_name: string
+    /** Class 3-8 net (credit-positive = profit), rounded to öre. */
+    pl_net: number
+  }>
 
   /** Number of batches that needed retries (0 = clean run) */
   retriedBatches: number
@@ -289,19 +362,80 @@ export interface ImportResult {
   openingBalanceEntryId: string | null
   journalEntriesCreated: number
   journalEntryIds: string[]
+  /** Full entries remain addressable by import_batch_id when the preview is capped. */
+  journalEntryIdsTruncated?: boolean
+
+  // Accounts the import itself inserted into chart_of_accounts (the mapped
+  // target accounts that did not exist yet). Accounts created from the
+  // preview's "Skapa saknade konton" button are not counted: they exist
+  // before the import runs. Optional: results produced before this field
+  // existed lack it.
+  accountsCreated?: number
+
+  // Chart-of-accounts names updated from the file's #KONTO. Informational
+  // (the source system's names replace BAS defaults), never a warning; the
+  // per-account list lives in the import documentation (BFNAR 2013:2
+  // behandlingshistorik). Optional for the same reason as accountsCreated.
+  accountsRenamed?: number
 
   // Issues
   errors: string[]
   warnings: string[]
+  /**
+   * Structured twins of `warnings` with a severity tier (info | notice |
+   * action) and an i18n code; the UI renders these and falls back to the
+   * strings only when absent. See lib/import/notices.ts.
+   */
+  notices?: ImportNotice[]
 
   // Structured details for UI (populated alongside warnings for backwards compat)
   details?: ImportResultDetails
+
+  // If this import replaced a prior completed import for the same fiscal year
+  // (Fortnox re-sync flow), the prior import's id and the count of journal
+  // entries that were deleted as a result.
+  replacedPriorImport?: { importId: string; deletedEntries: number } | null
+
+  // If a prior-year backfill triggered IB resync on the immediately-following
+  // fiscal period (storno + recreate of its opening_balance entry), the
+  // details of what happened: populated only when the resync ran.
+  nextPeriodIBResync?: {
+    nextPeriodId: string
+    nextPeriodName: string
+    stornoEntryId: string
+    newOpeningBalanceEntryId: string
+  } | null
+
+  // If the next period's IB needed resync but we couldn't do it (locked,
+  // closed, or no existing IB), the human-readable reason.
+  nextPeriodIBResyncSkipped?: { reason: string; nextPeriodName: string } | null
+  // Durable imports leave adjacent-year balances unchanged and request review.
+  nextPeriodOpeningBalanceReview?: {
+    nextPeriodId: string
+    nextPeriodName: string
+    openingBalanceEntryId: string
+    importId: string
+    reviewToken: string
+    reason: 'import' | 'undo'
+  } | null
+
+  // Populated when the file carried dimension data (#DIM/#OBJEKT/object
+  // lists): what landed in the registry and whether the import flipped
+  // company_settings.dimensions_enabled on (with a UI notice).
+  dimensionsImported?: {
+    dimensions: number
+    values: number
+    taggedLines: number
+    toggleEnabled: boolean
+  } | null
 }
 
 /**
  * Preview data shown to user before import
  */
 export interface ImportPreview {
+  /** Unused source definitions retained in the archive, not created as ledger accounts. */
+  archivedOnlyAccounts?: SIEAccount[]
   // Company info from file
   companyName: string | null
   orgNumber: string | null
@@ -336,9 +470,61 @@ export interface ImportPreview {
   // Source-system accounts excluded from import (e.g. Fortnox 0099)
   excludedSystemAccounts: { number: string; name: string }[]
 
+  // Distinct voucher series used by the file's #VER records. Lets the
+  // wizard default the IB-voucher series to one that does not collide
+  // with the file's own numbering (issue #1882). Optional: previews built
+  // before this field existed lack it; consumers must treat absence as [].
+  voucherSeriesInFile?: string[]
+
+  // What the import does to the company's chart of accounts: the file's
+  // accounts are added unconditionally (a chart follows the company across
+  // fiscal years), so the preview must say how many are new to THIS company
+  // rather than how many matched the BAS reference. Counted per distinct
+  // mapped target account (planChartChanges in chart-plan.ts). Optional:
+  // previews built before this field existed lack it.
+  chart?: ChartPlan
+
+  // How the file's räkenskapsår relates to the company's existing fiscal
+  // periods, from the same precheck the import runs (precheckFiscalPeriod).
+  // Absent when the file carries no #RAR 0 dates.
+  fiscalYear?: FiscalYearPrecheck
+
   // Issues to review
   issues: ParseIssue[]
 }
+
+/**
+ * Verdict from precheckFiscalPeriod: how the SIE file's fiscal year relates
+ * to the company's existing fiscal periods.
+ */
+export type FiscalYearPrecheck =
+  | {
+      // A period already contains the file's date range; it is reused.
+      verdict: 'match'
+      periodId: string
+    }
+  | {
+      // No period covers the range; the import creates one. When an empty
+      // onboarding-seeded period overlaps it, that period is replaced.
+      verdict: 'create'
+      replacesEmptyPeriodId: string | null
+    }
+  | {
+      // An overlapping period carries real content, or the containing period
+      // is closed or locked; the import will refuse.
+      verdict: 'conflict'
+      existingPeriod: { id: string; name: string; periodStart: string; periodEnd: string }
+      // The Swedish refusal text the import raises, verbatim.
+      message: string
+    }
+  | {
+      // The file's own #RAR dates break a BFL 3 kap. shape rule (over 18
+      // months, mid-month start on a non-first year, or an end that is not
+      // the last day of its month); the import will refuse.
+      verdict: 'invalid'
+      // The Swedish refusal text the import raises, verbatim.
+      message: string
+    }
 
 /**
  * Structured systemdokumentation per BFNAR 2013:2 Chapter 9.
@@ -364,6 +550,12 @@ export interface MigrationDocumentation {
     manual: number
     unmapped: number
   }
+
+  // Chart-of-accounts renames applied from the file's #KONTO records
+  // (behandlingshistorik per BFNAR 2013:2, who/when is carried by
+  // importedBy/importedAt on this record). Absent when nothing was renamed
+  // and on imports recorded before this field existed.
+  accountRenames?: Array<{ accountNumber: string; from: string; to: string }>
 
   // Voucher statistics
   vouchers: {
@@ -400,17 +592,3 @@ export interface MigrationDocumentation {
  * Wizard step state
  */
 export type ImportWizardStep = 'upload' | 'preview' | 'mapping' | 'review' | 'result'
-
-/**
- * Full wizard state
- */
-export interface ImportWizardState {
-  step: ImportWizardStep
-  file: File | null
-  parsed: ParsedSIEFile | null
-  mappings: AccountMapping[]
-  preview: ImportPreview | null
-  importResult: ImportResult | null
-  isLoading: boolean
-  error: string | null
-}

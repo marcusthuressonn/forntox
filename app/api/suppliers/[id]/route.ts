@@ -1,166 +1,169 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { roundOre } from '@/lib/money'
 import { validateBody } from '@/lib/api/validate'
 import { UpdateSupplierSchema } from '@/lib/api/schemas'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
-export async function GET(
-  _request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const supabase = await createClient()
-  const { id } = await params
+export const GET = withRouteContext(
+  'supplier.get',
+  async (_request, ctx, { params }: { params: Promise<{ id: string }> }) => {
+    const { id } = await params
+    const { supabase, companyId, log, requestId } = ctx
+    const opLog = log.child({ supplierId: id })
 
-  const { data: { user } } = await supabase.auth.getUser()
+    const { data: supplier, error } = await supabase
+      .from('suppliers')
+      .select('*')
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .single()
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  // Fetch supplier
-  const { data: supplier, error } = await supabase
-    .from('suppliers')
-    .select('*')
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .single()
-
-  if (error || !supplier) {
-    return NextResponse.json({ error: 'Supplier not found' }, { status: 404 })
-  }
-
-  // Fetch stats: total outstanding & total paid
-  const { data: invoices } = await supabase
-    .from('supplier_invoices')
-    .select('status, total, remaining_amount, paid_amount')
-    .eq('supplier_id', id)
-    .eq('company_id', companyId)
-
-  const stats = {
-    total_outstanding: 0,
-    total_paid: 0,
-    invoice_count: 0,
-  }
-
-  if (invoices) {
-    stats.invoice_count = invoices.length
-    for (const inv of invoices) {
-      if (inv.status !== 'paid' && inv.status !== 'credited') {
-        stats.total_outstanding += inv.remaining_amount || 0
-      }
-      stats.total_paid += inv.paid_amount || 0
+    if (error || !supplier) {
+      return errorResponseFromCode('SUPPLIER_NOT_FOUND', opLog, { requestId })
     }
-  }
 
-  return NextResponse.json({ data: { ...supplier, stats } })
-}
+    const { data: invoices } = await supabase
+      .from('supplier_invoices')
+      .select('status, total, remaining_amount, paid_amount, currency')
+      .eq('supplier_id', id)
+      .eq('company_id', companyId)
 
-export async function PUT(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const supabase = await createClient()
-  const { id } = await params
+    // Amounts are in each invoice's own currency, so a single sum across a
+    // mixed-currency supplier would be meaningless: group per currency instead
+    // (nearly every supplier has exactly one).
+    const perCurrency = new Map<string, { total_outstanding: number; total_paid: number }>()
+    if (invoices) {
+      for (const inv of invoices) {
+        const currency = inv.currency || 'SEK'
+        const row = perCurrency.get(currency) ?? { total_outstanding: 0, total_paid: 0 }
+        if (inv.status !== 'paid' && inv.status !== 'credited') {
+          row.total_outstanding += inv.remaining_amount || 0
+        }
+        row.total_paid += inv.paid_amount || 0
+        perCurrency.set(currency, row)
+      }
+    }
 
-  const { data: { user } } = await supabase.auth.getUser()
+    const stats = {
+      invoice_count: invoices?.length ?? 0,
+      by_currency: [...perCurrency.entries()]
+        .map(([currency, row]) => ({
+          currency,
+          total_outstanding: roundOre(row.total_outstanding),
+          total_paid: roundOre(row.total_paid),
+        }))
+        .sort((a, b) => a.currency.localeCompare(b.currency)),
+    }
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+    return NextResponse.json({ data: { ...supplier, stats } })
+  },
+)
 
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
+export const PUT = withRouteContext(
+  'supplier.update',
+  async (request, ctx, { params }: { params: Promise<{ id: string }> }) => {
+    const { id } = await params
+    const { supabase, companyId, log, requestId } = ctx
+    const opLog = log.child({ supplierId: id })
 
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  const result = await validateBody(request, UpdateSupplierSchema)
-  if (!result.success) return result.response
-  const body = result.data
-
-  const { data, error } = await supabase
-    .from('suppliers')
-    .update({
-      name: body.name,
-      supplier_type: body.supplier_type,
-      email: body.email,
-      phone: body.phone,
-      address_line1: body.address_line1,
-      address_line2: body.address_line2,
-      postal_code: body.postal_code,
-      city: body.city,
-      country: body.country,
-      org_number: body.org_number,
-      vat_number: body.vat_number,
-      bankgiro: body.bankgiro,
-      plusgiro: body.plusgiro,
-      bank_account: body.bank_account,
-      iban: body.iban,
-      bic: body.bic,
-      default_expense_account: body.default_expense_account,
-      default_payment_terms: body.default_payment_terms,
-      default_currency: body.default_currency,
-      notes: body.notes,
+    const result = await validateBody(request, UpdateSupplierSchema, {
+      log: opLog,
+      operation: 'supplier.update',
     })
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .select()
-    .single()
+    if (!result.success) return result.response
+    const body = result.data
 
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
-  }
+    const { data, error } = await supabase
+      .from('suppliers')
+      .update({
+        name: body.name,
+        supplier_type: body.supplier_type,
+        email: body.email,
+        phone: body.phone,
+        address_line1: body.address_line1,
+        address_line2: body.address_line2,
+        postal_code: body.postal_code,
+        city: body.city,
+        country: body.country,
+        org_number: body.org_number,
+        vat_number: body.vat_number,
+        bankgiro: body.bankgiro,
+        plusgiro: body.plusgiro,
+        bank_account: body.bank_account,
+        iban: body.iban,
+        bic: body.bic,
+        clearing_number: body.clearing_number,
+        account_number: body.account_number,
+        default_expense_account: body.default_expense_account,
+        default_payment_terms: body.default_payment_terms,
+        default_currency: body.default_currency,
+        notes: body.notes,
+      })
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .select()
+      .single()
 
-  return NextResponse.json({ data })
-}
+    if (error) {
+      if (error.code === '23505') {
+        return errorResponseFromCode('SUPPLIER_DUPLICATE_ORG_NUMBER', opLog, {
+          requestId,
+          details: { orgNumber: body.org_number },
+        })
+      }
+      opLog.error('supplier update failed', error)
+      return errorResponseFromCode('SUPPLIER_UPDATE_FAILED', opLog, {
+        requestId,
+        details: { reason: getUserErrorMessage(error) },
+      })
+    }
 
-export async function DELETE(
-  _request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const supabase = await createClient()
-  const { id } = await params
+    return NextResponse.json({ data })
+  },
+  { requireWrite: true },
+)
 
-  const { data: { user } } = await supabase.auth.getUser()
+export const DELETE = withRouteContext(
+  'supplier.delete',
+  async (_request, ctx, { params }: { params: Promise<{ id: string }> }) => {
+    const { id } = await params
+    const { supabase, companyId, log, requestId } = ctx
+    const opLog = log.child({ supplierId: id })
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+    const { count } = await supabase
+      .from('supplier_invoices')
+      .select('id', { count: 'exact', head: true })
+      .eq('supplier_id', id)
+      .eq('company_id', companyId)
 
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
+    if (count && count > 0) {
+      return errorResponseFromCode('SUPPLIER_DELETE_FAILED', opLog, {
+        requestId,
+        details: { reason: 'has_invoices', invoiceCount: count },
+      })
+    }
 
-  const companyId = await requireCompanyId(supabase, user.id)
+    const { error, count: deleteCount } = await supabase
+      .from('suppliers')
+      .delete({ count: 'exact' })
+      .eq('id', id)
+      .eq('company_id', companyId)
 
-  // Check for linked invoices
-  const { count } = await supabase
-    .from('supplier_invoices')
-    .select('id', { count: 'exact', head: true })
-    .eq('supplier_id', id)
-    .eq('company_id', companyId)
+    if (error) {
+      opLog.error('supplier delete failed', error)
+      return errorResponseFromCode('SUPPLIER_DELETE_FAILED', opLog, {
+        requestId,
+        details: { reason: getUserErrorMessage(error) },
+      })
+    }
 
-  if (count && count > 0) {
-    return NextResponse.json(
-      { error: 'Kan inte ta bort leverantör med kopplade fakturor' },
-      { status: 400 }
-    )
-  }
+    if (deleteCount === 0) {
+      return errorResponseFromCode('SUPPLIER_NOT_FOUND', opLog, { requestId })
+    }
 
-  const { error, count: deleteCount } = await supabase
-    .from('suppliers')
-    .delete({ count: 'exact' })
-    .eq('id', id)
-    .eq('company_id', companyId)
-
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
-  }
-
-  if (deleteCount === 0) {
-    return NextResponse.json({ error: 'Supplier not found' }, { status: 404 })
-  }
-
-  return NextResponse.json({ success: true })
-}
+    return NextResponse.json({ success: true })
+  },
+  { requireWrite: true },
+)

@@ -1,29 +1,34 @@
-import { VISMA_AUTH_URL, VISMA_TOKEN_URL, VISMA_REVOKE_URL } from './config';
+import { VISMA_AUTH_URL, VISMA_TOKEN_URL } from './config';
 import type { OAuthConfig, TokenResponse } from '../types';
 import {
   fetchWithTimeout,
   OAUTH_TIMEOUT_MS,
-  OAUTH_REVOKE_TIMEOUT_MS,
 } from '@/lib/http/fetch-with-timeout';
 
 const DEFAULT_SCOPES = [
   'ea:api',
   'offline_access',
-  'ea:sales_readonly',
-  'ea:accounting_readonly',
-  'ea:purchase_readonly',
+  'ea:sales',
+  'ea:accounting',
+  'ea:purchase',
 ];
 
 const EACCOUNTING_ACR_VALUE = 'service:44643EB1-3F76-4C1C-A672-402AE8085934';
 
+const ALLOWED_PROMPT_VALUES = new Set(['none', 'login', 'consent', 'select_account']);
+
 export function buildVismaAuthUrl(
   config: OAuthConfig,
-  options?: { scopes?: string[]; state?: string; acrValues?: string },
+  options?: { scopes?: string[]; state?: string; acrValues?: string; prompt?: string },
 ): string {
+  const promptCandidate = options?.prompt ?? 'select_account';
+  const prompt = ALLOWED_PROMPT_VALUES.has(promptCandidate) ? promptCandidate : 'select_account';
+
   const params = new URLSearchParams({
     client_id: config.clientId,
     redirect_uri: config.redirectUri,
     response_type: 'code',
+    prompt,
     acr_values: options?.acrValues ?? EACCOUNTING_ACR_VALUE,
   });
 
@@ -99,25 +104,3 @@ export async function refreshVismaToken(
   return response.json() as Promise<TokenResponse>;
 }
 
-export async function revokeVismaToken(
-  config: OAuthConfig,
-  refreshToken: string,
-): Promise<boolean> {
-  const response = await fetchWithTimeout(
-    VISMA_REVOKE_URL,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: basicAuthHeader(config),
-      },
-      body: new URLSearchParams({
-        token: refreshToken,
-        token_type_hint: 'refresh_token',
-      }).toString(),
-    },
-    { timeoutMs: OAUTH_REVOKE_TIMEOUT_MS, description: 'Visma token revoke' },
-  );
-
-  return response.ok;
-}

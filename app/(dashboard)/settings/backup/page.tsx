@@ -1,22 +1,24 @@
-import { BackupDownloadForm } from '@/components/settings/BackupDownloadForm'
+import { redirect } from 'next/navigation'
 
-export default function BackupSettingsPage() {
-  return (
-    <div className="space-y-8">
-      <section className="space-y-2">
-        <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-          Säkerhetsbackup
-        </h2>
-        <p className="text-sm text-muted-foreground max-w-prose">
-          Ladda ner en egen kopia av all räkenskapsinformation — SIE-filer, kvitton,
-          underlag och behandlingshistorik — i en enda ZIP-fil. Säkerhetsbackupen är din
-          egen kopia för trygghet och portabilitet. gnubok arkiverar all
-          räkenskapsinformation i minst 7 år enligt BFL 7 kap. 2 §, så din backup ersätter
-          inte vårt lagkrav — den kompletterar det.
-        </p>
-      </section>
-
-      <BackupDownloadForm />
-    </div>
-  )
+// Säkerhetskopia + Google Drive-molnsynkronisering ligger numera under
+// /import (Importera/Exportera). Den här sidan finns kvar endast som en
+// permanent omdirigering så att gamla bokmärken och cloud-backup-extensionens
+// `settingsPanel.path` fortfarande tar användaren till rätt plats.
+//
+// Query-parametrar följer med: Googles OAuth-callback landar här med
+// `?cloud_backup=connected_first` (m.fl.) och kortet på /import läser dem
+// för att visa rätt toast och börja polla efter första synken.
+export default async function BackupSettingsPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>
+}) {
+  const params = await searchParams
+  const qs = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (typeof value === 'string') qs.set(key, value)
+  }
+  // Set last so an incoming ?view=... can never override the intended view.
+  qs.set('view', 'export')
+  redirect(`/import?${qs.toString()}#cloud-backup`)
 }

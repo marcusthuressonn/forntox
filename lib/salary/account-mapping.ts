@@ -1,9 +1,26 @@
 import type { SalaryLineItemType } from '@/types'
 
 /**
- * Salary account mapping — maps line item types and calculation results
+ * Salary account mapping: maps line item types and calculation results
  * to BAS accounts per Swedish chart of accounts standards.
  */
+
+/**
+ * Kostnadsersättning (travel-expenses.md, "Utlägg vs kostnadsersättning"):
+ * paid out with the salary but outside bruttolön. No skatteavdrag, no
+ * arbetsgivaravgifter, no semesterunderlag, not in the AGI gross (FK011).
+ * The calculation engine adds these to the net payout only; the booking
+ * debits their mapped account on top of the gross reconciliation.
+ */
+export const TAX_FREE_REIMBURSEMENT_TYPES: readonly SalaryLineItemType[] = [
+  'expense_reimbursement',
+  'traktamente_taxfree',
+  'mileage_taxfree',
+]
+
+export function isTaxFreeReimbursementType(itemType: string): boolean {
+  return (TAX_FREE_REIMBURSEMENT_TYPES as readonly string[]).includes(itemType)
+}
 
 /** Default BAS account for each salary line item type */
 const LINE_ITEM_ACCOUNTS: Record<SalaryLineItemType, string> = {
@@ -11,16 +28,25 @@ const LINE_ITEM_ACCOUNTS: Record<SalaryLineItemType, string> = {
   monthly_salary: '7210',
   hourly_salary: '7210',
   overtime: '7210',
+  overtime_50: '7210',
+  overtime_100: '7210',
+  // OB-tillägg: bookat på samma lönekonto som grundlönen; differentieras via
+  // rad-text på verifikatet och lönespecifikationen.
+  ob_weekday_evening: '7210',
+  ob_weekend: '7210',
+  ob_night: '7210',
+  ob_holiday: '7210',
   bonus: '7210',
   commission: '7210',
   // Gross deductions
   gross_deduction_pension: '7218',
   gross_deduction_other: '7210',
-  // Benefits (förmånsvärden — not a cash payment, just tax base)
+  // Benefits (förmånsvärden: not a cash payment, just tax base)
   benefit_car: '7385',
   benefit_housing: '7381',
   benefit_meals: '7382',
   benefit_wellness: '7699',
+  benefit_bike: '7388',
   benefit_other: '7389',
   // Absence
   sick_karens: '7281',
@@ -28,17 +54,34 @@ const LINE_ITEM_ACCOUNTS: Record<SalaryLineItemType, string> = {
   sick_day15_plus: '7281',
   vab: '7210',
   parental_leave: '7210',
+  unpaid_leave: '7210',
   vacation: '7285',
+  semesterersattning: '7285',
   // Travel
   traktamente_taxfree: '7321',
   traktamente_taxable: '7322',
   mileage_taxfree: '7331',
   mileage_taxable: '7332',
-  // Net deductions
-  net_deduction_advance: '7210',
-  net_deduction_union: '7210',
+  // Utlägg repaid with the salary (#2331): the cost and moms were booked when
+  // the claim was registered against 2820, so the payslip line relieves that
+  // liability, never a 7xxx cost. The line normally carries the claim's own
+  // liability account in account_number; this is the fallback.
+  expense_reimbursement: '2820',
+  // Net deductions (nettolöneavdrag): withheld from the payout and owed to a
+  // third party, so the default account is the credit-side settlement account,
+  // not a 7xxx salary expense. Advance repayments credit the receivable (1613),
+  // union fees credit 2794, everything unmapped lands on 2799 Övriga
+  // löneavdrag. There is a single benefit-payment item type, so its default
+  // credits 7385 Kostnader för fri bil, the dominant co-payment case;
+  // co-payments for other benefit kinds must set account_number on the line
+  // (7381/7382/7388/7389/7699).
+  net_deduction_advance: '1613',
+  net_deduction_union: '2794',
   net_deduction_benefit_payment: '7385',
-  net_deduction_other: '7210',
+  net_deduction_other: '2799',
+  // Öresavrundning: net payout rounded up to whole kronor; the 0-99 öre diff
+  // debits the standard rounding account (same account the invoice flows use).
+  oresavrundning: '3740',
   // Other
   correction: '7210',
   other: '7210',
@@ -59,6 +102,7 @@ export function getLineItemAccount(
     if (baseAccount === '7281') return '7282'
     if (baseAccount === '7285') return '7286'
   }
+
   // Board member uses 7240
   if (employmentType === 'board_member') {
     const baseAccount = LINE_ITEM_ACCOUNTS[itemType]
@@ -85,6 +129,9 @@ export const SALARY_ACCOUNTS = {
   // Employer contributions
   AVGIFTER_EXPENSE: '7510',   // Lagstadgade sociala avgifter (debit)
   AVGIFTER_LIABILITY: '2731', // Avräkning sociala avgifter (credit)
+  // Whole-krona remainder: 2731 holds what Skatteverket actually draws
+  // (hela kronor, öretal bortfaller), the öre difference lands here.
+  ORESUTJAMNING: '3740',      // Öres- och kronutjämning (credit)
 
   // Vacation accrual
   VACATION_ACCRUAL_EXPENSE: '7290',   // Förändring semesterlöneskuld (debit)

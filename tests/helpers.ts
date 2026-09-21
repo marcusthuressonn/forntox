@@ -1,5 +1,5 @@
 /**
- * Shared test helpers — mock factories and fixture builders
+ * Shared test helpers: mock factories and fixture builders
  */
 import { vi } from 'vitest'
 import type {
@@ -9,17 +9,13 @@ import type {
   JournalEntry,
   JournalEntryLine,
   DocumentAttachment,
-  TaxCode,
   Invoice,
-  InvoicePayment,
   Customer,
   Supplier,
   SupplierInvoice,
   CompanySettings,
   InvoiceInboxItem,
   CategorizationTemplate,
-  Company,
-  CompanyMember,
 } from '@/types'
 import type { SIEVoucher, SIETransactionLine } from '@/lib/import/types'
 
@@ -60,7 +56,7 @@ export function createMockSupabase() {
     const handler: ProxyHandler<object> = {
       get(_target, prop) {
         if (prop === 'then') {
-          // Make the chain thenable — resolves to pendingResult
+          // Make the chain thenable: resolves to pendingResult
           return (resolve: (v: unknown) => void) => resolve(pendingResult)
         }
         // Return a function that returns a new chain
@@ -79,6 +75,10 @@ export function createMockSupabase() {
         error: null,
       }),
       remove: vi.fn().mockResolvedValue({ data: [], error: null }),
+      createSignedUrl: vi.fn().mockResolvedValue({
+        data: { signedUrl: 'https://example.com/signed' },
+        error: null,
+      }),
       getPublicUrl: vi.fn().mockReturnValue({
         data: { publicUrl: 'https://example.com/file.jpg' },
       }),
@@ -100,36 +100,6 @@ export function createMockSupabase() {
 
 let _counter = 0
 const nextId = () => `test-${++_counter}`
-
-export function makeCompany(overrides: Partial<Company> = {}): Company {
-  const { team_id = null, ...rest } = overrides
-  return {
-    id: 'company-1',
-    name: 'Test Company',
-    org_number: null,
-    entity_type: 'enskild_firma',
-    created_by: 'user-1',
-    team_id,
-    archived_at: null,
-    created_at: '2024-01-01T00:00:00Z',
-    updated_at: '2024-01-01T00:00:00Z',
-    ...rest,
-  }
-}
-
-export function makeCompanyMember(overrides: Partial<CompanyMember> = {}): CompanyMember {
-  return {
-    id: 'member-1',
-    company_id: 'company-1',
-    user_id: 'user-1',
-    role: 'owner',
-    invited_by: null,
-    joined_at: '2024-01-01T00:00:00Z',
-    created_at: '2024-01-01T00:00:00Z',
-    updated_at: '2024-01-01T00:00:00Z',
-    ...overrides,
-  }
-}
 
 export function makeReceipt(overrides: Partial<Receipt> = {}): Receipt {
   return {
@@ -171,9 +141,12 @@ export function makeTransaction(overrides: Partial<Transaction> = {}): Transacti
     user_id: 'user-1',
     company_id: 'company-1',
     bank_connection_id: null,
+    cash_account_id: null,
     external_id: null,
     date: '2024-06-15',
     description: 'ICA MAXI STOCKHOLM',
+    original_description: 'ICA MAXI STOCKHOLM',
+    title_edited_at: null,
     amount: -299.0,
     currency: 'SEK',
     amount_sek: null,
@@ -188,10 +161,17 @@ export function makeTransaction(overrides: Partial<Transaction> = {}): Transacti
     journal_entry_id: null,
     mcc_code: null,
     merchant_name: 'ICA Maxi',
+    transaction_method: null,
+    bank_transaction_code: null,
+    proprietary_bank_transaction_code: null,
     reconciliation_method: null,
+    is_ignored: false,
     receipt_id: null,
+    document_id: null,
     import_source: null,
     reference: null,
+    counterparty_iban: null,
+    counterparty_account: null,
     notes: null,
     created_at: '2024-06-15T14:30:00Z',
     updated_at: '2024-06-15T14:30:00Z',
@@ -243,6 +223,8 @@ export function makeJournalEntry(overrides: Partial<JournalEntry> = {}): Journal
     attachment_urls: null,
     notes: null,
     commit_method: null,
+    committed_actor_type: null,
+    committed_actor_label: null,
     rubric_version: null,
     created_at: '2024-06-15T14:30:00Z',
     updated_at: '2024-06-15T14:30:00Z',
@@ -302,28 +284,6 @@ export function makeDocumentAttachment(
   }
 }
 
-export function makeTaxCode(overrides: Partial<TaxCode> = {}): TaxCode {
-  return {
-    id: nextId(),
-    user_id: null,
-    code: 'MP1',
-    description: 'Utgående moms 25%',
-    rate: 25,
-    moms_basis_boxes: ['05'],
-    moms_tax_boxes: ['10'],
-    moms_input_boxes: [],
-    is_output_vat: true,
-    is_reverse_charge: false,
-    is_eu: false,
-    is_export: false,
-    is_oss: false,
-    is_system: true,
-    created_at: '2024-01-01T00:00:00Z',
-    updated_at: '2024-01-01T00:00:00Z',
-    ...overrides,
-  }
-}
-
 export function makeInvoice(overrides: Partial<Invoice> = {}): Invoice {
   return {
     id: nextId(),
@@ -344,6 +304,7 @@ export function makeInvoice(overrides: Partial<Invoice> = {}): Invoice {
     vat_amount_sek: null,
     total: 12500,
     total_sek: null,
+    ore_rounding: null,
     vat_treatment: 'standard_25',
     vat_rate: 25,
     moms_ruta: '10',
@@ -363,27 +324,6 @@ export function makeInvoice(overrides: Partial<Invoice> = {}): Invoice {
   }
 }
 
-export function makeInvoicePayment(
-  overrides: Partial<InvoicePayment> = {}
-): InvoicePayment {
-  return {
-    id: nextId(),
-    user_id: 'user-1',
-    company_id: 'company-1',
-    invoice_id: 'invoice-1',
-    payment_date: '2024-07-01',
-    amount: 12500,
-    currency: 'SEK',
-    exchange_rate: null,
-    exchange_rate_difference: 0,
-    journal_entry_id: null,
-    transaction_id: null,
-    notes: null,
-    created_at: '2024-07-01T00:00:00Z',
-    ...overrides,
-  }
-}
-
 export function makeCustomer(overrides: Partial<Customer> = {}): Customer {
   return {
     id: nextId(),
@@ -391,6 +331,7 @@ export function makeCustomer(overrides: Partial<Customer> = {}): Customer {
     company_id: 'company-1',
     name: 'Test AB',
     customer_type: 'swedish_business',
+    customer_number: null,
     email: 'kontakt@test.se',
     phone: null,
     address_line1: 'Storgatan 1',
@@ -402,6 +343,11 @@ export function makeCustomer(overrides: Partial<Customer> = {}): Customer {
     vat_number: 'SE556677889901',
     vat_number_validated: true,
     vat_number_validated_at: '2024-01-01T00:00:00Z',
+    personal_number: null,
+    contact_person: null,
+    invoice_email_cc_addresses: null,
+    invoice_email_bcc_addresses: null,
+    language: 'sv',
     default_payment_terms: 30,
     notes: null,
     created_at: '2024-01-01T00:00:00Z',
@@ -431,6 +377,8 @@ export function makeSupplier(overrides: Partial<Supplier> = {}): Supplier {
     bank_account: null,
     iban: null,
     bic: null,
+    clearing_number: null,
+    account_number: null,
     default_expense_account: '6200',
     default_payment_terms: 30,
     default_currency: 'SEK',
@@ -456,6 +404,7 @@ export function makeSupplierInvoice(
     received_date: '2024-06-02',
     delivery_date: null,
     status: 'registered',
+    approved_at: null,
     currency: 'SEK',
     exchange_rate: null,
     exchange_rate_date: null,
@@ -465,6 +414,7 @@ export function makeSupplierInvoice(
     vat_amount_sek: null,
     total: 10000,
     total_sek: null,
+    ore_rounding: null,
     vat_treatment: 'standard_25',
     reverse_charge: false,
     payment_reference: null,
@@ -477,6 +427,8 @@ export function makeSupplierInvoice(
     payment_journal_entry_id: null,
     transaction_id: null,
     document_id: null,
+    paid_with_private_funds: false,
+    bank_entered_at: null,
     notes: null,
     created_at: '2024-06-02T00:00:00Z',
     updated_at: '2024-06-02T00:00:00Z',
@@ -493,7 +445,7 @@ export function makeCompanySettings(
     company_id: 'company-1',
     entity_type: 'enskild_firma',
     company_name: 'Test Firma',
-    trade_name: null,
+    default_our_reference: null,
     org_number: '199001011234',
     address_line1: 'Testgatan 1',
     address_line2: null,
@@ -505,9 +457,28 @@ export function makeCompanySettings(
     website: null,
     pays_salaries: false,
     f_skatt: true,
+    // A coherent momsregistrerad company: registered implies a number on file
+    // (ML 17 kap. 24 §). Tests exercising the missing-number state override
+    // vat_number to null explicitly.
     vat_registered: true,
-    vat_number: null,
+    vat_number: 'SE556012579001',
     moms_period: 'quarterly',
+    periodisk_sammanstallning_period: 'quarterly',
+    vat_taxable_base_over_40m: false,
+    vat_has_eu_trade: false,
+    vat_filing_method: 'electronic',
+    periodisk_sammanstallning_enabled: false,
+    periodisk_sammanstallning_filing_method: 'electronic',
+    kontrolluppgifter_enabled: false,
+    rot_rut_enabled: false,
+    oss_enabled: false,
+    ioss_enabled: false,
+    intrastat_enabled: false,
+    punktskatt_enabled: false,
+    fyllnadsinbetalning_enabled: false,
+    tax_contact_name: null,
+    tax_contact_phone: null,
+    tax_contact_email: null,
     fiscal_year_start_month: 1,
     preliminary_tax_monthly: null,
     bank_name: null,
@@ -515,23 +486,85 @@ export function makeCompanySettings(
     account_number: null,
     bankgiro: null,
     plusgiro: null,
+    swish: null,
     iban: null,
     bic: null,
     accounting_method: 'accrual',
     invoice_prefix: 'F',
     next_invoice_number: 1,
+    next_arrival_number: 1,
     next_delivery_note_number: 1,
+    next_quote_number: 1,
     invoice_default_days: 30,
     invoice_default_notes: null,
     bookkeeping_locked_through: null,
     auto_lock_period_days: null,
     default_voucher_series: 'A',
+    default_voucher_series_per_source_type: {
+      manual: 'A',
+      invoice_created: 'A',
+      invoice_paid: 'A',
+      invoice_cash_payment: 'A',
+      credit_note: 'A',
+      supplier_invoice_registered: 'A',
+      supplier_invoice_paid: 'A',
+      supplier_invoice_cash_payment: 'A',
+      supplier_invoice_privately_paid: 'A',
+      supplier_credit_note: 'A',
+      salary_payment: 'A',
+      bank_transaction: 'A',
+      reminder_fee: 'A',
+      opening_balance: 'A',
+      year_end: 'A',
+      currency_revaluation: 'A',
+      inbox_item: 'A',
+      import: 'A',
+      system: 'A',
+      storno: 'A',
+      correction: 'A',
+    },
+    voucher_series_labels: {},
+    last_supplier_payment_account: null,
     ore_rounding: true,
     invoice_show_ocr: true,
     invoice_show_bankgiro: true,
     invoice_show_plusgiro: true,
+    invoice_show_swish: true,
+    invoice_show_logo: true,
+    invoice_show_company_name: true,
+    invoice_company_name_position: 'header',
     invoice_late_fee_text: null,
     invoice_credit_terms_text: null,
+    invoice_primary_color: '#1a1a1a',
+    invoice_accent_color: '#666666',
+    invoice_font_family: 'Helvetica',
+    invoice_custom_font_path: null,
+    invoice_custom_font_name: null,
+    invoice_header_text: null,
+    invoice_footer_text: null,
+    invoice_email_texts: null,
+    invoice_payment_links_enabled: false,
+    send_invoice_reminders: true,
+    reminder_text_overrides: null,
+    reminder_days_level_1: 15,
+    reminder_days_level_2: 30,
+    reminder_days_level_3: 45,
+    reminder_fee_enabled: true,
+    reminder_fee_amount: 60,
+    reminder_interest_rate_override: null,
+    dimensions_enabled: false,
+    mileage_enabled: false,
+    sales_orders_enabled: false,
+    quotes_enabled: true,
+    proforma_enabled: true,
+    recurring_invoices_enabled: true,
+    self_billing_enabled: true,
+    data_analysis_opt_in: false,
+    preferred_payment_format: 'pain001',
+    salary_pay_day: 25,
+    salary_default_bank: null,
+    salary_net_rounding: false,
+    salary_deviation_period: 'same_month',
     logo_url: null,
     onboarding_step: 6,
     onboarding_complete: true,
@@ -550,7 +583,7 @@ export function makeInvoiceInboxItem(
     id: nextId(),
     user_id: 'user-1',
     company_id: 'company-1',
-    status: 'pending',
+    status: 'received',
     source: 'upload',
     email_from: null,
     email_subject: null,
@@ -560,19 +593,12 @@ export function makeInvoiceInboxItem(
     resend_attachment_id: null,
     document_id: null,
     extracted_data: null,
-    confidence: null,
     matched_supplier_id: null,
     created_supplier_invoice_id: null,
-    error_message: null,
-    document_type: 'supplier_invoice',
-    linked_receipt_id: null,
-    raw_email_payload: null,
-    suggested_template_id: null,
-    suggested_template_confidence: null,
     matched_transaction_id: null,
-    match_confidence: null,
-    match_method: null,
-    match_reasoning: null,
+    created_journal_entry_id: null,
+    error_message: null,
+    raw_email_payload: null,
     correlation_id: null,
     created_at: '2024-06-15T14:30:00Z',
     updated_at: '2024-06-15T14:30:00Z',
@@ -593,6 +619,8 @@ export function createMockRequest(
     method?: string
     body?: unknown
     searchParams?: Record<string, string>
+    /** Extra request headers, e.g. `cookie` for routes that read one. */
+    headers?: Record<string, string>
   }
 ): Request {
   const fullUrl = new URL(url, 'http://localhost:3000')
@@ -603,7 +631,7 @@ export function createMockRequest(
   }
   return new Request(fullUrl.toString(), {
     method: options?.method || 'GET',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
     ...(options?.body ? { body: JSON.stringify(options.body) } : {}),
   })
 }
@@ -655,11 +683,28 @@ export function createQueuedMockSupabase() {
     }
   }
 
+  /**
+   * Every chained builder call, in order: { table, method, args }. The proxy
+   * otherwise swallows its arguments, so filters and update payloads were
+   * invisible to assertions. Recording is passive: it changes nothing about
+   * what a chain resolves to.
+   */
+  const calls: { table: string; method: string; args: unknown[] }[] = []
+
+  /** Args of the first `method` call made against `table`, or undefined. */
+  const findCall = (table: string, method: string): unknown[] | undefined =>
+    calls.find((c) => c.table === table && c.method === method)?.args
+
+  /** Args of every `method` call made against `table`. */
+  const findCalls = (table: string, method: string): unknown[][] =>
+    calls.filter((c) => c.table === table && c.method === method).map((c) => c.args)
+
   const reset = () => {
     queue.length = 0
+    calls.length = 0
   }
 
-  const buildChain = (): unknown => {
+  const buildChain = (table: string): unknown => {
     // Capture the result at chain creation (when from/rpc is called)
     const result = queue.shift() || { data: null, error: null, count: null }
 
@@ -668,24 +713,33 @@ export function createQueuedMockSupabase() {
         if (prop === 'then') {
           return (resolve: (v: unknown) => void) => resolve(result)
         }
-        return (..._args: unknown[]) => buildChain2(result)
+        return (...args: unknown[]) => {
+          calls.push({ table, method: String(prop), args })
+          return buildChain2(table, result)
+        }
       },
     }
     return new Proxy({}, handler)
   }
 
   // Inner chain methods reuse the same result
-  const buildChain2 = (result: {
-    data: unknown
-    error: unknown
-    count?: number | null
-  }): unknown => {
+  const buildChain2 = (
+    table: string,
+    result: {
+      data: unknown
+      error: unknown
+      count?: number | null
+    },
+  ): unknown => {
     const handler: ProxyHandler<object> = {
       get(_target, prop) {
         if (prop === 'then') {
           return (resolve: (v: unknown) => void) => resolve(result)
         }
-        return (..._args: unknown[]) => buildChain2(result)
+        return (...args: unknown[]) => {
+          calls.push({ table, method: String(prop), args })
+          return buildChain2(table, result)
+        }
       },
     }
     return new Proxy({}, handler)
@@ -699,6 +753,10 @@ export function createQueuedMockSupabase() {
         error: null,
       }),
       remove: vi.fn().mockResolvedValue({ data: [], error: null }),
+      createSignedUrl: vi.fn().mockResolvedValue({
+        data: { signedUrl: 'https://example.com/signed' },
+        error: null,
+      }),
       getPublicUrl: vi.fn().mockReturnValue({
         data: { publicUrl: 'https://example.com/file.jpg' },
       }),
@@ -706,15 +764,15 @@ export function createQueuedMockSupabase() {
   }
 
   const supabase = {
-    from: vi.fn().mockImplementation(() => buildChain()),
-    rpc: vi.fn().mockImplementation(() => buildChain()),
+    from: vi.fn().mockImplementation((table: string) => buildChain(table)),
+    rpc: vi.fn().mockImplementation((fn: string) => buildChain(`rpc:${fn}`)),
     storage: storageMock,
     auth: {
       getUser: vi.fn(),
     },
   }
 
-  return { supabase, enqueue, enqueueMany, reset }
+  return { supabase, enqueue, enqueueMany, reset, calls, findCall, findCalls }
 }
 
 export function makeCategorizationTemplate(
@@ -737,6 +795,9 @@ export function makeCategorizationTemplate(
     source: 'user_approved',
     line_pattern: null,
     is_active: true,
+    mode: 'propose',
+    corrections: 0,
+    paused_at: null,
     created_at: '2024-01-01T00:00:00Z',
     updated_at: '2024-06-15T00:00:00Z',
     ...overrides,

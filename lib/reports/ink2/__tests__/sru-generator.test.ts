@@ -19,11 +19,11 @@ function makeDeclaration(overrides?: Partial<INK2Declaration>): INK2Declaration 
     '7350': 0, '7351': 0, '7352': 0, '7353': 0, '7354': 0,
     '7360': 0, '7361': 0, '7362': 0, '7363': 0, '7364': 0,
     '7365': 30000, '7366': 0, '7367': 0, '7369': 70000, '7368': 0, '7370': 0,
-    '7410': 500000, '7411': 0, '7412': 0, '7413': 0,
+    '7410': 500000, '7411': 0, '7510': 0, '7412': 0, '7413': 0,
     '7511': 0, '7512': 0, '7513': 100000, '7514': 80000, '7515': 10000, '7516': 0, '7517': 5000,
-    '7414': 0, '7415': 0, '7423': 0, '7416': 0, '7417': 0,
+    '7414': 0, '7518': 0, '7415': 0, '7519': 0, '7423': 0, '7530': 0, '7416': 0, '7520': 0, '7417': 0,
     '7521': 0, '7522': 3000,
-    '7524': 0, '7419': 0, '7420': 0, '7525': 0, '7421': 0, '7422': 0,
+    '7524': 0, '7419': 0, '7420': 0, '7525': 0, '7421': 0, '7526': 0, '7422': 0, '7527': 0,
     '7528': 0,
     '7450': 302000, '7550': 0,
   } as INK2Declaration['ink2r']
@@ -39,7 +39,7 @@ function makeDeclaration(overrides?: Partial<INK2Declaration>): INK2Declaration 
     ink2: {
       '7011': '20250101',
       '7012': '20251231',
-      '7113': 302000,
+      '7104': 302000,
       '7114': 0,
     },
     ink2r: defaultInk2r,
@@ -49,15 +49,18 @@ function makeDeclaration(overrides?: Partial<INK2Declaration>): INK2Declaration 
       '7650': 302000,
       '7750': 0,
       '7651': 0,
-      '8020': 302000,
-      '8021': 0,
+      '7653': 0,
+      '7754': 0,
+      '7763': 0,
+      '7670': 302000,
+      '7770': 0,
     },
     breakdown: {} as INK2Declaration['breakdown'],
     totals: {
       totalAssets: 175000,
       totalEquityLiabilities: 175000,
       operatingResult: 305000,
-      resultAfterFinancial: 302000,
+      aretsResultat: 302000,
     },
     companyInfo: {
       companyName: 'Test AB',
@@ -242,10 +245,41 @@ describe('INK2 SRU Generator', () => {
 
       const ink2sBlock = extractBlock(submission.blanketterSru, 'INK2S')
       expect(ink2sBlock).toContain('#UPPGIFT 7650 302000')
-      expect(ink2sBlock).toContain('#UPPGIFT 8020 302000')
-      // 7750 and 8021 are 0, should not appear
+      expect(ink2sBlock).toContain('#UPPGIFT 7670 302000')
+      // 7750 and 7770 are 0, should not appear
       expect(ink2sBlock).not.toContain('#UPPGIFT 7750')
-      expect(ink2sBlock).not.toContain('#UPPGIFT 8021')
+      expect(ink2sBlock).not.toContain('#UPPGIFT 7770')
+    })
+
+    it('includes saved non-deductible and non-taxable adjustments in INK2S', () => {
+      const base = makeDeclaration()
+      const declaration = makeDeclaration({
+        ink2s: {
+          ...base.ink2s,
+          '7653': 5_244,
+          '7754': 1_000,
+        },
+      })
+      const submission = generateSRUSubmission(declaration)
+      const ink2sBlock = extractBlock(submission.blanketterSru, 'INK2S')
+
+      expect(ink2sBlock).toContain('#UPPGIFT 7653 5244')
+      expect(ink2sBlock).toContain('#UPPGIFT 7754 1000')
+    })
+
+    it('files the prior-year deficit on 7763 (INK2S 4.14 a) and omits it at zero', () => {
+      const base = makeDeclaration()
+      expect(extractBlock(generateSRUSubmission(base).blanketterSru, 'INK2S')).not.toContain('#UPPGIFT 7763')
+
+      const submission = generateSRUSubmission(makeDeclaration({
+        ink2: { ...base.ink2, '7104': 202000 },
+        ink2s: { ...base.ink2s, '7763': 100000, '7670': 202000 },
+      }))
+      const ink2sBlock = extractBlock(submission.blanketterSru, 'INK2S')
+      expect(ink2sBlock).toContain('#UPPGIFT 7763 100000')
+      expect(ink2sBlock).toContain('#UPPGIFT 7670 202000')
+      // Field order follows the form: 4.14 a before 4.15.
+      expect(ink2sBlock.indexOf('#UPPGIFT 7763')).toBeLessThan(ink2sBlock.indexOf('#UPPGIFT 7670'))
     })
 
     it('INK2 block includes överskott', () => {
@@ -253,7 +287,7 @@ describe('INK2 SRU Generator', () => {
       const submission = generateSRUSubmission(declaration)
 
       const ink2Block = extractBlock(submission.blanketterSru, 'INK2-')
-      expect(ink2Block).toContain('#UPPGIFT 7113 302000')
+      expect(ink2Block).toContain('#UPPGIFT 7104 302000')
       // 7114 (underskott) is 0, should not appear
       expect(ink2Block).not.toContain('#UPPGIFT 7114')
     })

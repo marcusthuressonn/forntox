@@ -1,165 +1,233 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
-import { Label } from '@/components/ui/label'
-import { Card, CardContent } from '@/components/ui/card'
-import { KPIHeroCards } from '@/components/kpi/KPIHeroCards'
-import { KPITrendChart } from '@/components/kpi/KPITrendChart'
+import { useState, useEffect, useCallback, useId } from 'react'
+import { useLocale, useTranslations } from 'next-intl'
+import { Settings2 } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
+import { PageHeader } from '@/components/ui/page-header'
+import { HelpPopover } from '@/components/ui/help-popover'
+import { AttnLine } from '@/components/ui/attn-line'
+import { useToast } from '@/components/ui/use-toast'
+import { FyPicker } from '@/components/common/FyPicker'
+import { KPIPanes, KPIBreakdown } from '@/components/kpi/KPIStory'
+import { KPIMonthsTable } from '@/components/kpi/KPIMonthsTable'
 import { KPISettingsDialog } from '@/components/kpi/KPISettingsDialog'
-import { getDefaultPreferences } from '@/lib/reports/kpi-definitions'
-import type { FiscalPeriod, KPIReport, KPIPreferences } from '@/types'
+import { saveKPIPreferences } from '@/components/kpi/save-preferences'
+import { loadKPIPreferences } from '@/components/kpi/load-preferences'
+import { failureDescription, type ActionFailure } from '@/lib/browser/action-failure'
+import type { ErrorLocale } from '@/lib/errors/get-error-message'
+import type { KPIReport, KPIPreferences } from '@/types'
 
+/**
+ * Nyckeltal in the founder-picked "Instrumentbrädan" layout: a grid of
+ * bordered instrument panes (monthly result bars + the preference-driven
+ * KPIs) with the cost story as quiet rows below. Plain SVG bars: no
+ * charting bundle on this page anymore.
+ */
 export default function KpiPage() {
-  const [periods, setPeriods] = useState<FiscalPeriod[]>([])
-  const [selectedPeriod, setSelectedPeriod] = useState('')
+  const t = useTranslations('kpi')
+  const locale = useLocale() as ErrorLocale
+  const { toast } = useToast()
+  const [selectedPeriod, setSelectedPeriod] = useState<string>('')
   const [report, setReport] = useState<KPIReport | null>(null)
-  const [preferences, setPreferences] = useState<KPIPreferences>(getDefaultPreferences())
-  const [isLoadingInit, setIsLoadingInit] = useState(true)
+  // null = the stored layout is not known: still loading, or the read failed
+  // (prefsError). It never holds a fabricated value.
+  const [preferences, setPreferences] = useState<KPIPreferences | null>(null)
+  const [prefsError, setPrefsError] = useState<ActionFailure | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
   const [isLoadingReport, setIsLoadingReport] = useState(false)
   const [isSavingPrefs, setIsSavingPrefs] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const prefsStatusId = useId()
 
+  // A page that could not read the stored layout must not render one, and above
+  // all must not let the user save over it. The previous version fell back to
+  // getDefaultPreferences() on any failed read, silently: the grid presented
+  // the defaults as though they were the user's, the settings dialog seeded
+  // its draft from them, and the next save PUT a complete defaults-based
+  // object over the stored row (the route merges key by key, so a payload
+  // carrying every key replaces the row outright). A transient read failure
+  // became permanent loss of the user's layout.
+  //
+  // So the unknown stays unknown: preferences stays null, the preference-driven
+  // panes do not render, "Anpassa" is disabled, and one AttnLine says the
+  // layout could not be read. An expired session (401/403) is the only case
+  // where the reason changes what the user must do, so there the status-map
+  // sentence replaces the retry; everything else is transient and the retry is
+  // the whole answer.
   useEffect(() => {
-    async function init() {
-      try {
-        const [periodsRes, prefsRes] = await Promise.all([
-          fetch('/api/bookkeeping/fiscal-periods'),
-          fetch('/api/kpi/preferences'),
-        ])
-        const { data: periodsData } = await periodsRes.json()
-        const { data: prefsData } = await prefsRes.json()
-
-        const today = new Date().toISOString().split('T')[0]
-        const activePeriods = (periodsData || []).filter((p: FiscalPeriod) => p.period_start <= today)
-        setPeriods(activePeriods)
-        if (prefsData) setPreferences(prefsData)
-        if (activePeriods.length > 0) {
-          setSelectedPeriod(activePeriods[0].id)
-        }
-      } catch {
-        setError('Kunde inte hämta data')
-      } finally {
-        setIsLoadingInit(false)
+    let cancelled = false
+    ;(async () => {
+      setPrefsError(null)
+      const result = await loadKPIPreferences({ locale })
+      if (cancelled) return
+      if (result.ok) {
+        setPreferences(result.preferences)
+      } else {
+        setPreferences(null)
+        setPrefsError(result)
       }
-    }
-    init()
-  }, [])
+    })()
+    return () => { cancelled = true }
+  }, [reloadKey, locale])
 
   const fetchReport = useCallback(async (periodId: string) => {
     setIsLoadingReport(true)
     setError(null)
     try {
       const res = await fetch(`/api/reports/kpi?period_id=${periodId}`)
-      if (!res.ok) throw new Error('Kunde inte hämta nyckeltal')
+      if (!res.ok) throw new Error(t('fetch_failed'))
       const { data } = await res.json()
       setReport(data)
     } catch {
-      setError('Kunde inte hämta nyckeltal')
+      setError(t('fetch_failed'))
     } finally {
       setIsLoadingReport(false)
     }
-  }, [])
+  }, [t])
 
   useEffect(() => {
     if (!selectedPeriod) return
     let cancelled = false
-
     fetchReport(selectedPeriod).then(() => {
       if (cancelled) setReport(null)
     })
     return () => { cancelled = true }
   }, [selectedPeriod, fetchReport])
 
-  async function handleSavePreferences(prefs: KPIPreferences) {
+  /**
+   * Resolves true only when the row was written. The dialog keeps itself open on
+   * false, so the draft the user assembled survives a failed save.
+   *
+   * The previous version swallowed both the `!res.ok` throw and every thrown
+   * fetch behind "Silently fail: user can retry": the dialog closed, this grid
+   * went on rendering the layout the user had just picked, and the next page
+   * load read the untouched row back and reverted it. Exactly one toast per
+   * outcome, since TOAST_LIMIT is 1.
+   */
+  async function handleSavePreferences(prefs: KPIPreferences): Promise<boolean> {
+    let result
     setIsSavingPrefs(true)
     try {
-      const res = await fetch('/api/kpi/preferences', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(prefs),
-      })
-      if (!res.ok) throw new Error()
-      const { data } = await res.json()
-      setPreferences(data)
-
-      // Re-fetch report if account overrides changed (calculations may differ)
-      if (selectedPeriod) {
-        await fetchReport(selectedPeriod)
-      }
-    } catch {
-      // Silently fail — user can retry
+      result = await saveKPIPreferences({ preferences: prefs, locale })
     } finally {
+      // The busy state covers the save and nothing else. The report refetch
+      // below is unbounded and has its own skeleton, and holding `saving` open
+      // across it would keep the dialog locked on a request that is not the save.
       setIsSavingPrefs(false)
     }
+
+    if (!result.ok) {
+      toast({
+        title: t('save_failed_title'),
+        description: failureDescription(result, {
+          // A timeout on a write is genuinely ambiguous: the row may have been
+          // written. Say that instead of claiming the save failed.
+          timeout: t('save_timeout'),
+          network: t('save_network'),
+        }),
+        variant: 'destructive',
+      })
+      return false
+    }
+
+    setPreferences(result.preferences)
+    // Not awaited: the layout is stored, so the dialog closes now. A failing
+    // refetch reports itself through the `error` surface below.
+    if (selectedPeriod) void fetchReport(selectedPeriod)
+    return true
   }
 
-  if (isLoadingInit) {
-    return (
-      <div className="space-y-6">
-        <div>
-          <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">Nyckeltal</h1>
-          <p className="text-muted-foreground">Översikt av företagets ekonomiska hälsa</p>
-        </div>
-        <LoadingSkeleton />
-      </div>
-    )
-  }
+  const isLoadingPrefs = preferences === null && prefsError === null
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">Nyckeltal</h1>
-          <p className="text-muted-foreground">Översikt av företagets ekonomiska hälsa</p>
-        </div>
-        <KPISettingsDialog
-          preferences={preferences}
-          onSave={handleSavePreferences}
-          saving={isSavingPrefs}
+    <div className="space-y-8">
+      {/* Header and read-status share one flow child so the always-mounted
+          live region adds no vertical rhythm while it is empty. */}
+      <div>
+        <PageHeader
+          title={t('title')}
+          help={
+            <HelpPopover>
+              <p>{t('help_text')}</p>
+            </HelpPopover>
+          }
+          action={
+            <div className="flex items-center gap-2">
+              {preferences ? (
+                <KPISettingsDialog
+                  preferences={preferences}
+                  onSave={handleSavePreferences}
+                  saving={isSavingPrefs}
+                />
+              ) : (
+                // The dialog seeds its draft from `preferences` and saves the
+                // complete draft, so while the stored layout is unknown the
+                // control that opens it must not exist: a save from here would
+                // overwrite the row with a layout the user never chose.
+                <Button
+                  variant="outline"
+                  className="gap-1.5"
+                  disabled
+                  aria-describedby={prefsError ? prefsStatusId : undefined}
+                >
+                  <Settings2 className="h-3.5 w-3.5" />
+                  {t('customize')}
+                </Button>
+              )}
+              <FyPicker
+                value={selectedPeriod || null}
+                onChange={(id) => setSelectedPeriod(id || '')}
+                includeAllOption={false}
+                hideFuturePeriods
+              />
+            </div>
+          }
         />
+
+        {/* Live region always mounted so a failed read is announced when it
+            appears, not merely inserted. Inline, never a toast: TOAST_LIMIT is
+            1 and a toast here could evict a save failure's toast. */}
+        <div id={prefsStatusId} role="status" aria-live="polite">
+          {prefsError && (
+            <AttnLine
+              className="mt-3"
+              action={
+                prefsError.reason === 'server' &&
+                (prefsError.status === 401 || prefsError.status === 403)
+                  ? undefined
+                  : { label: t('load_retry'), onClick: () => setReloadKey((k) => k + 1) }
+              }
+            >
+              {failureDescription(prefsError, {
+                timeout: t('load_timeout'),
+                network: t('load_network'),
+              })}
+            </AttnLine>
+          )}
+        </div>
       </div>
 
-      {/* Period selector */}
-      {periods.length > 0 && (
-        <div>
-          <Label>Räkenskapsår</Label>
-          <select
-            value={selectedPeriod}
-            onChange={(e) => setSelectedPeriod(e.target.value)}
-            className="w-full mt-1 max-w-xs rounded-md border border-input bg-background px-3 py-2 text-sm"
-          >
-            {periods.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name} ({p.period_start} — {p.period_end})
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
-
       {error && (
-        <Card>
-          <CardContent className="py-8 text-center text-muted-foreground">
-            <p>{error}</p>
-          </CardContent>
-        </Card>
+        <p className="py-8 text-center text-sm text-muted-foreground">{error}</p>
       )}
 
-      {isLoadingReport && <LoadingSkeleton />}
-
-      {!isLoadingReport && !error && report && (
-        <>
-          <KPIHeroCards report={report} preferences={preferences} />
-          {report.months.length > 0 && <KPITrendChart months={report.months} />}
-        </>
+      {(isLoadingReport || (!error && report !== null && isLoadingPrefs)) && (
+        <LoadingSkeleton />
       )}
 
-      {!isLoadingReport && !error && !report && periods.length === 0 && (
-        <Card>
-          <CardContent className="py-12 text-center text-muted-foreground">
-            <p>Inget räkenskapsår hittades. Skapa ett räkenskapsår för att se nyckeltal.</p>
-          </CardContent>
-        </Card>
+      {!isLoadingReport && !error && report && !isLoadingPrefs && (
+        <div className="stagger-enter space-y-10">
+          {/* The panes are the preference-driven surface: with the layout
+              unknown they stay off rather than render defaults as if they
+              were the user's. The cost story below reads only the report. */}
+          {preferences && <KPIPanes report={report} preferences={preferences} />}
+          {/* Same rule as the panes: a layout flag is only honoured once the
+              stored layout is known. */}
+          {preferences?.showMonthlyTable && <KPIMonthsTable report={report} />}
+          <KPIBreakdown report={report} />
+        </div>
       )}
     </div>
   )
@@ -167,24 +235,10 @@ export default function KpiPage() {
 
 function LoadingSkeleton() {
   return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {[1, 2, 3, 4].map((i) => (
-          <Card key={i}>
-            <CardContent className="p-5 space-y-2">
-              <div className="h-3 bg-muted rounded w-20 animate-pulse" />
-              <div className="h-7 bg-muted rounded w-28 animate-pulse" />
-              <div className="h-3 bg-muted rounded w-16 animate-pulse" />
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-      <Card>
-        <CardContent className="p-5 space-y-3">
-          <div className="h-4 bg-muted rounded w-40 animate-pulse" />
-          <div className="h-56 bg-muted rounded animate-pulse" />
-        </CardContent>
-      </Card>
+    <div className="grid gap-4 sm:grid-cols-2">
+      {[1, 2, 3, 4].map((i) => (
+        <Skeleton key={i} className="h-40 w-full rounded-lg" />
+      ))}
     </div>
   )
 }

@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { useTranslations } from 'next-intl'
 import { Settings2, ChevronDown, ChevronRight, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -18,16 +19,27 @@ import type { KPIPreferences } from '@/types'
 
 interface KPISettingsDialogProps {
   preferences: KPIPreferences
-  onSave: (prefs: KPIPreferences) => void
+  /**
+   * Resolves true when the layout was actually stored. The dialog awaits it, so
+   * `saving` gets a chance to render, and stays open on false so the draft is
+   * still there to retry with.
+   */
+  onSave: (prefs: KPIPreferences) => Promise<boolean>
   saving: boolean
 }
 
 export function KPISettingsDialog({ preferences, onSave, saving }: KPISettingsDialogProps) {
+  const t = useTranslations('kpi')
+  const tCommon = useTranslations('common')
   const [draft, setDraft] = useState<KPIPreferences>(preferences)
   const [expandedKpi, setExpandedKpi] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
 
   function handleOpen(isOpen: boolean) {
+    // Esc and click-outside must not discard a draft that is mid-save: the save
+    // could still fail, and the draft is the only copy of what the user picked.
+    // Bounded wait, the request carries a 15s deadline.
+    if (!isOpen && saving) return
     if (isOpen) setDraft(preferences)
     setOpen(isOpen)
   }
@@ -68,24 +80,37 @@ export function KPISettingsDialog({ preferences, onSave, saving }: KPISettingsDi
     setDraft(getDefaultPreferences())
   }
 
-  function handleSave() {
-    onSave(draft)
-    setOpen(false)
+  /**
+   * Await the save and close only if it landed.
+   *
+   * Closing first made the parent's `saving` state unrenderable and, worse, made
+   * a failed save look identical to a successful one: the dialog vanished, the
+   * grid showed the draft, and the layout was gone on the next page load. On
+   * failure the parent shows the one toast that says why and this dialog stays
+   * open with the draft intact.
+   */
+  async function handleSave() {
+    // Closes the double-click race before React has re-rendered the disabled
+    // button; a second PUT would race the first over the same row.
+    if (saving) return
+    const saved = await onSave(draft)
+    if (saved) setOpen(false)
   }
 
   return (
     <Dialog open={open} onOpenChange={handleOpen}>
       <DialogTrigger asChild>
-        <Button variant="outline" size="sm" className="gap-1.5">
+        {/* Same height as the year picker beside it (founder review 2026-09-07). */}
+        <Button variant="outline" className="gap-1.5">
           <Settings2 className="h-3.5 w-3.5" />
-          Anpassa
+          {t('customize')}
         </Button>
       </DialogTrigger>
       <DialogContent className="max-w-md max-h-[85vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Anpassa nyckeltal</DialogTitle>
+          <DialogTitle>{t('settings_title')}</DialogTitle>
           <DialogDescription>
-            Välj vilka nyckeltal som visas och justera beräkningarna.
+            {t('settings_subtitle')}
           </DialogDescription>
         </DialogHeader>
 
@@ -103,7 +128,7 @@ export function KPISettingsDialog({ preferences, onSave, saving }: KPISettingsDi
             return (
               <div
                 key={def.id}
-                className="rounded-lg border border-border/60 p-3"
+                className="rounded-lg border border-border p-3"
               >
                 <div className="flex items-center justify-between">
                   <button
@@ -120,10 +145,10 @@ export function KPISettingsDialog({ preferences, onSave, saving }: KPISettingsDi
                     )}
                     <div className="min-w-0">
                       <p className="text-sm font-medium truncate">
-                        {def.label}
+                        {t(`def_${def.id}_label`)}
                         {hasOverride && (
                           <span className="ml-1.5 text-xs text-muted-foreground font-normal">
-                            (anpassad)
+                            {t('settings_custom_suffix')}
                           </span>
                         )}
                       </p>
@@ -136,27 +161,27 @@ export function KPISettingsDialog({ preferences, onSave, saving }: KPISettingsDi
                 </div>
 
                 {isExpanded && (
-                  <div className="mt-3 ml-5.5 space-y-2.5 text-xs text-muted-foreground">
-                    <p>{def.description}</p>
+                  <div className="mt-3 ml-5.5 space-y-2 text-xs text-muted-foreground">
+                    <p>{t(`def_${def.id}_description`)}</p>
                     <div>
                       <p className="font-medium text-foreground/80 mb-0.5">
-                        Formel
+                        {t('settings_formula_label')}
                       </p>
-                      <p className="font-mono text-[11px] bg-muted/50 rounded px-2 py-1">
-                        {def.formula}
+                      <p className="font-mono text-[11px] bg-muted/50 rounded-sm px-2 py-1">
+                        {t(`def_${def.id}_formula`)}
                       </p>
                     </div>
                     <div>
                       <p className="font-medium text-foreground/80 mb-0.5">
-                        Konton
+                        {t('settings_accounts_label')}
                       </p>
-                      <p>{def.accountDescription}</p>
+                      <p>{t(`def_${def.id}_accounts`)}</p>
                     </div>
 
                     {def.customizableAccounts && (
                       <div className="pt-1">
                         <label className="font-medium text-foreground/80 block mb-1">
-                          Anpassa konton
+                          {t('settings_customize_accounts')}
                         </label>
                         <input
                           type="text"
@@ -165,11 +190,10 @@ export function KPISettingsDialog({ preferences, onSave, saving }: KPISettingsDi
                             setAccountOverride(def.id, e.target.value)
                           }
                           placeholder={def.defaultAccounts.join(', ')}
-                          className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-mono tabular-nums placeholder:text-muted-foreground/50"
+                          className="w-full rounded-lg border border-input bg-background px-2.5 py-1.5 text-xs font-mono tabular-nums placeholder:text-muted-foreground/50"
                         />
                         <p className="mt-1 text-[10px] text-muted-foreground/70">
-                          Ange kontonummer separerade med komma (t.ex.{' '}
-                          {def.defaultAccounts.slice(0, 3).join(', ')})
+                          {t('settings_account_hint', { example: def.defaultAccounts.slice(0, 3).join(', ') })}
                         </p>
                         {hasOverride && (
                           <button
@@ -177,7 +201,7 @@ export function KPISettingsDialog({ preferences, onSave, saving }: KPISettingsDi
                             onClick={() => clearAccountOverride(def.id)}
                             className="mt-1 text-[10px] text-primary hover:underline"
                           >
-                            Återställ till standard
+                            {t('settings_reset_field')}
                           </button>
                         )}
                       </div>
@@ -187,6 +211,25 @@ export function KPISettingsDialog({ preferences, onSave, saving }: KPISettingsDi
               </div>
             )
           })}
+          {/* The month table is a layout flag, not a metric: its own row
+              after the KPI list, no expand panel, no account override. */}
+          <div className="rounded-lg border border-border p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium truncate">{t('settings_monthly_table_label')}</p>
+                <p className="text-xs text-muted-foreground">
+                  {t('settings_monthly_table_description')}
+                </p>
+              </div>
+              <Switch
+                checked={draft.showMonthlyTable}
+                onCheckedChange={(checked) =>
+                  setDraft((prev) => ({ ...prev, showMonthlyTable: checked }))
+                }
+                aria-label={t('settings_monthly_table_label')}
+              />
+            </div>
+          </div>
         </div>
 
         <div className="flex items-center justify-between pt-2 border-t mt-2">
@@ -196,16 +239,16 @@ export function KPISettingsDialog({ preferences, onSave, saving }: KPISettingsDi
             className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
           >
             <RotateCcw className="h-3 w-3" />
-            Återställ allt
+            {t('settings_reset_all')}
           </button>
           <div className="flex gap-2">
             <DialogClose asChild>
-              <Button variant="outline" size="sm">
-                Avbryt
+              <Button variant="outline" size="sm" disabled={saving}>
+                {tCommon('cancel')}
               </Button>
             </DialogClose>
             <Button size="sm" onClick={handleSave} disabled={saving}>
-              {saving ? 'Sparar...' : 'Spara'}
+              {saving ? tCommon('saving') : tCommon('save')}
             </Button>
           </div>
         </div>

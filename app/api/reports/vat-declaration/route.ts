@@ -1,128 +1,109 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import {
   calculateVatDeclaration,
   formatPeriodLabel,
 } from '@/lib/reports/vat-declaration'
-import { requireCompanyId } from '@/lib/company/context'
-import type { VatPeriodType, AccountingMethod } from '@/types'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import type { VatPeriodType } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 /**
  * GET /api/reports/vat-declaration
  *
- * Calculate VAT declaration (momsdeklaration) for a given period.
- *
  * Query parameters:
- * - periodType: 'monthly' | 'quarterly' | 'yearly'
- * - year: number (e.g., 2025)
- * - period: number (1-12 for monthly, 1-4 for quarterly, 1 for yearly)
- *
- * Returns:
- * - VAT rutor (boxes) according to Swedish tax authority format
- * - Period information
- * - Breakdown by source (invoices, transactions, receipts)
+ *   periodType: 'monthly' | 'quarterly' | 'yearly'
+ *   year:       number (e.g., 2025)
+ *   period:     number (1-12 for monthly, 1-4 for quarterly, 1 for yearly)
  */
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
+export const GET = withRouteContext(
+  'report.vat_declaration',
+  async (request, ctx) => {
+    const { supabase, companyId, log, requestId } = ctx
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+    const { searchParams } = new URL(request.url)
+    const periodType = searchParams.get('periodType') as VatPeriodType | null
+    const yearStr = searchParams.get('year')
+    const periodStr = searchParams.get('period')
+    // For yearly (helårsmoms) the period is the räkenskapsår, not the calendar
+    // year; the client passes the selected fiscal period so an extended year is
+    // covered in full. Ignored for monthly/quarterly (calendar periods).
+    const fiscalPeriodId = searchParams.get('fiscal_period_id') ?? undefined
 
-  const companyId = await requireCompanyId(supabase, user.id)
+    if (!periodType || !yearStr || !periodStr) {
+      return errorResponseFromCode('VAT_REPORT_MISSING_PARAMS', log, { requestId })
+    }
 
-  const { searchParams } = new URL(request.url)
-  const periodType = searchParams.get('periodType') as VatPeriodType | null
-  const yearStr = searchParams.get('year')
-  const periodStr = searchParams.get('period')
+    if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
+      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD_TYPE', log, {
+        requestId,
+        details: { received: periodType },
+      })
+    }
 
-  // Validate required parameters
-  if (!periodType || !yearStr || !periodStr) {
-    return NextResponse.json(
-      { error: 'Missing required parameters: periodType, year, period' },
-      { status: 400 }
-    )
-  }
+    const year = parseInt(yearStr, 10)
+    const period = parseInt(periodStr, 10)
 
-  // Validate periodType
-  if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
-    return NextResponse.json(
-      { error: 'Invalid periodType. Must be: monthly, quarterly, or yearly' },
-      { status: 400 }
-    )
-  }
+    if (isNaN(year) || year < 2000 || year > 2100) {
+      return errorResponseFromCode('VAT_REPORT_INVALID_YEAR', log, {
+        requestId,
+        details: { received: yearStr },
+      })
+    }
 
-  const year = parseInt(yearStr, 10)
-  const period = parseInt(periodStr, 10)
+    if (isNaN(period)) {
+      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
+        requestId,
+        details: { received: periodStr },
+      })
+    }
 
-  // Validate year
-  if (isNaN(year) || year < 2000 || year > 2100) {
-    return NextResponse.json(
-      { error: 'Invalid year. Must be between 2000 and 2100' },
-      { status: 400 }
-    )
-  }
+    if (periodType === 'monthly' && (period < 1 || period > 12)) {
+      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
+        requestId,
+        details: { periodType, received: period, allowed: '1-12' },
+      })
+    }
+    if (periodType === 'quarterly' && (period < 1 || period > 4)) {
+      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
+        requestId,
+        details: { periodType, received: period, allowed: '1-4' },
+      })
+    }
+    if (periodType === 'yearly' && period !== 1) {
+      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
+        requestId,
+        details: { periodType, received: period, allowed: '1' },
+      })
+    }
 
-  // Validate period based on type
-  if (isNaN(period)) {
-    return NextResponse.json(
-      { error: 'Invalid period' },
-      { status: 400 }
-    )
-  }
+    try {
+      // No accounting-method argument: the method is baked into journal entry
+      // timing (see the invariant note on calculateVatDeclaration), so no
+      // company_settings round trip is needed here.
+      const declaration = await calculateVatDeclaration(
+        supabase, companyId!, periodType, year, period,
+        { fiscalPeriodId },
+      )
 
-  if (periodType === 'monthly' && (period < 1 || period > 12)) {
-    return NextResponse.json(
-      { error: 'Invalid period for monthly. Must be 1-12' },
-      { status: 400 }
-    )
-  }
-
-  if (periodType === 'quarterly' && (period < 1 || period > 4)) {
-    return NextResponse.json(
-      { error: 'Invalid period for quarterly. Must be 1-4' },
-      { status: 400 }
-    )
-  }
-
-  if (periodType === 'yearly' && period !== 1) {
-    return NextResponse.json(
-      { error: 'Invalid period for yearly. Must be 1' },
-      { status: 400 }
-    )
-  }
-
-  // Fetch accounting method
-  const { data: settings } = await supabase
-    .from('company_settings')
-    .select('accounting_method')
-    .eq('company_id', companyId)
-    .single()
-
-  const accountingMethod = (settings?.accounting_method as AccountingMethod) || 'accrual'
-
-  try {
-    const declaration = await calculateVatDeclaration(
-      supabase,
-      companyId,
-      periodType,
-      year,
-      period,
-      accountingMethod
-    )
-
-    return NextResponse.json({
-      data: {
-        ...declaration,
-        periodLabel: formatPeriodLabel(periodType, year, period),
-      },
-    })
-  } catch (err) {
-    console.error('Error calculating VAT declaration:', err)
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Failed to calculate VAT declaration' },
-      { status: 500 }
-    )
-  }
-}
+      return NextResponse.json({
+        data: {
+          ...declaration,
+          // For yearly the authoritative span is declaration.period.start/end
+          // (the räkenskapsår). The label stays a coarse "Helår {year}".
+          periodLabel: formatPeriodLabel(periodType, year, period),
+        },
+      })
+    } catch (err) {
+      log.error('vat declaration calculation failed', err as Error, {
+        periodType,
+        year,
+        period,
+      })
+      return errorResponseFromCode('VAT_REPORT_GENERATION_FAILED', log, {
+        requestId,
+        details: { reason: err instanceof Error ? getUserErrorMessage(err) : 'unknown' },
+      })
+    }
+  },
+)

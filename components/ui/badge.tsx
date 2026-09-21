@@ -2,8 +2,9 @@ import * as React from "react"
 import { cva, type VariantProps } from "class-variance-authority"
 import { cn } from "@/lib/utils"
 
+// Chips are pills (concept .chip): 99px radius, 11.5px, quiet padding.
 const badgeVariants = cva(
-  "inline-flex items-center rounded-md border px-2.5 py-0.5 text-xs font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2",
+  "inline-flex items-center rounded-full border px-2.5 py-[3px] text-[11.5px] font-medium leading-none transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2",
   {
     variants: {
       variant: {
@@ -17,8 +18,10 @@ const badgeVariants = cva(
           "border-border text-foreground bg-transparent",
         success:
           "border-transparent bg-success/10 text-success",
+        // No amber fill: status colors are data, not chrome (convention 12).
+        // The exception reads through the ochre text on a hairline chip.
         warning:
-          "border-transparent bg-warning/15 text-warning-foreground",
+          "border-border bg-transparent text-attn",
       },
     },
     defaultVariants: {
@@ -32,8 +35,10 @@ export interface BadgeProps
     VariantProps<typeof badgeVariants> {}
 
 function Badge({ className, variant, ...props }: BadgeProps) {
+  // data-ph-unmask: status chips are static i18n chrome in session replays;
+  // a badge carrying user data adds data-ph-mask at the call site.
   return (
-    <div className={cn(badgeVariants({ variant }), className)} {...props} />
+    <div data-ph-unmask="" className={cn(badgeVariants({ variant }), className)} {...props} />
   )
 }
 

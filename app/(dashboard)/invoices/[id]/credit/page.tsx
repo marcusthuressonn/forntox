@@ -2,41 +2,48 @@
 
 import { useState, useEffect, use } from 'react'
 import { useRouter } from 'next/navigation'
+import { useTranslations } from 'next-intl'
 import { createClient } from '@/lib/supabase/client'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
-import { Separator } from '@/components/ui/separator'
+import { DetailSection, DefRow } from '@/components/ui/detail-section'
+import { TH_CLASS, TD_CLASS } from '@/components/ui/dry-table'
+import { AttnLine } from '@/components/ui/attn-line'
+import { HelpPopover } from '@/components/ui/help-popover'
 import { useToast } from '@/components/ui/use-toast'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
 import { getVatTreatmentLabel } from '@/lib/invoices/vat-rules'
-import { Loader2, ArrowLeft, AlertTriangle, Lock } from 'lucide-react'
+import { Loader2, ArrowLeft, Lock } from 'lucide-react'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
-import type { Invoice, InvoiceItem, Customer } from '@/types'
-
-interface InvoiceWithRelations extends Invoice {
-  customer: Customer
-  items: InvoiceItem[]
-}
+import SendInvoiceDialog from '@/components/invoices/SendInvoiceDialog'
+import { useCompany, useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
+import { getCreditNoteSendMode } from '@/lib/invoices/credit-note-send-mode'
+import { creditConfirmNumber } from '@/lib/invoices/display'
+import type { InvoiceItem } from '@/types'
+import type { InvoiceWithRelations } from '@/components/invoices/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { InvoiceEditorSkeleton } from '@/components/common/DetailPageSkeleton'
 
 export default function CreateCreditNotePage({ params }: { params: Promise<{ id: string }> }) {
   const { canWrite } = useCanWrite()
+  const { isSandbox } = useCompany()
+  const canEmail = useCapability(CAPABILITY.email_send)
   const { id } = use(params)
   const router = useRouter()
   const { toast } = useToast()
   const supabase = createClient()
+  const t = useTranslations('invoice_credit')
 
   const [invoice, setInvoice] = useState<InvoiceWithRelations | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [reason, setReason] = useState('')
   const [confirmText, setConfirmText] = useState('')
-
-  useEffect(() => {
-    fetchInvoice()
-  }, [id])
+  const [createdCreditNote, setCreatedCreditNote] = useState<InvoiceWithRelations | null>(null)
+  const [showSendPrompt, setShowSendPrompt] = useState(false)
 
   async function fetchInvoice() {
     setIsLoading(true)
@@ -53,8 +60,8 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
 
     if (error || !data) {
       toast({
-        title: 'Kunde inte ladda faktura',
-        description: 'Fakturan hittades inte.',
+        title: t('load_failed_title'),
+        description: t('load_failed_description'),
         variant: 'destructive',
       })
       router.push('/invoices')
@@ -64,8 +71,8 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
     // Check if invoice can be credited
     if (!['sent', 'paid', 'overdue'].includes(data.status)) {
       toast({
-        title: 'Kan inte krediteras',
-        description: 'Endast skickade, betalda eller förfallna fakturor kan krediteras',
+        title: t('cannot_credit_title'),
+        description: t('cannot_credit_description'),
         variant: 'destructive',
       })
       router.push(`/invoices/${id}`)
@@ -74,8 +81,8 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
 
     if (data.status === 'credited') {
       toast({
-        title: 'Redan krediterad',
-        description: 'Denna faktura har redan krediterats',
+        title: t('already_credited_title'),
+        description: t('already_credited_description'),
         variant: 'destructive',
       })
       router.push(`/invoices/${id}`)
@@ -88,9 +95,13 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
     }
 
     setInvoice(data as InvoiceWithRelations)
-    setReason(`Krediterar faktura ${data.invoice_number}`)
+    setReason(t('reason_default', { number: creditConfirmNumber(data) ?? '' }))
     setIsLoading(false)
   }
+
+  useEffect(() => {
+    fetchInvoice()
+  }, [id])
 
   async function handleSubmit() {
     if (!invoice) return
@@ -108,22 +119,36 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
       })
 
       if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to create credit note')
+        // Map the parsed body plus the status, never `new Error(data.error)`:
+        // the route answers thrown errors with the canonical envelope
+        // `{ error: { code, message } }`, and the Error constructor would
+        // stringify that object to "[object Object]", discarding the route's
+        // own Swedish reason.
+        const body = await response.json().catch(() => null)
+        toast({
+          title: t('create_failed_title'),
+          description: getUserErrorMessage(body, { statusCode: response.status }),
+          variant: 'destructive',
+        })
+        setIsSubmitting(false)
+        return
       }
 
-      const { data: creditNote } = await response.json()
+      const { data: creditNote } = await response.json() as { data: InvoiceWithRelations }
 
       toast({
-        title: 'Kreditfaktura skapad',
-        description: `Kreditfaktura ${creditNote.invoice_number} har skapats`,
+        title: t('created_toast_title'),
+        description: creditNote.invoice_number
+          ? t('created_toast_description', { number: creditNote.invoice_number })
+          : undefined,
       })
 
-      router.push(`/invoices/${creditNote.id}`)
+      setCreatedCreditNote(creditNote)
+      setShowSendPrompt(true)
     } catch (error) {
       toast({
-        title: 'Kunde inte skapa kreditfaktura',
-        description: error instanceof Error ? error.message : 'Försök igen.',
+        title: t('create_failed_title'),
+        description: error instanceof Error ? getUserErrorMessage(error) : t('try_again'),
         variant: 'destructive',
       })
     }
@@ -132,11 +157,7 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
   }
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <Loader2 className="h-8 w-8 animate-spin text-primary" />
-      </div>
-    )
+    return <InvoiceEditorSkeleton />
   }
 
   if (!invoice) {
@@ -144,204 +165,224 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
   }
 
   const customer = invoice.customer
+  const sendMode = getCreditNoteSendMode({
+    customerHasEmail: !!createdCreditNote?.customer.email,
+    isSandbox,
+    canEmail,
+  })
+
+  function handleSendPromptOpenChange(open: boolean) {
+    setShowSendPrompt(open)
+    if (!open && createdCreditNote) {
+      router.push(`/invoices/${createdCreditNote.id}`)
+    }
+  }
+
+  // Self-billed invoices have invoice_number null by design; the confirm
+  // number falls back to the counterparty's external number, the one the
+  // user actually sees on the invoice (issue #1820).
+  const confirmNumber = creditConfirmNumber(invoice)
+  const confirmMismatch = Boolean(confirmText) && confirmText !== confirmNumber
 
   return (
-    <div className="space-y-6 max-w-3xl mx-auto">
-      {/* Header */}
-      <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => router.back()}>
-          <ArrowLeft className="h-5 w-5" />
-        </Button>
-        <div>
-          <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">Skapa kreditfaktura</h1>
-          <p className="text-muted-foreground">
-            Krediterar faktura {invoice.invoice_number}
-          </p>
+    <div className="space-y-8 stagger-enter">
+      {createdCreditNote && (
+        <SendInvoiceDialog
+          open={showSendPrompt}
+          onOpenChange={handleSendPromptOpenChange}
+          invoice={createdCreditNote}
+          mode={sendMode}
+          onSuccess={() => undefined}
+        />
+      )}
+
+      {/* Back link on its own quiet row, same as the invoice document */}
+      <button
+        type="button"
+        onClick={() => router.back()}
+        className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
+      >
+        <ArrowLeft className="h-4 w-4" />
+        {t('back')}
+      </button>
+
+      {/* Header: serif title with the explanation behind "?", the credited
+          invoice as the kicker, and the one attention sentence under it. */}
+      <div>
+        <div className="flex items-center gap-2">
+          <h1 className="font-display text-2xl leading-8 tracking-tight">{t('title')}</h1>
+          <HelpPopover>{t('warning_description')}</HelpPopover>
         </div>
+        {/* data-ph-mask: the kicker carries the invoice number */}
+        <p data-ph-mask="" className="mt-1 text-sm text-muted-foreground">
+          {t('subtitle', { number: confirmNumber ?? '' })}
+        </p>
+        <AttnLine className="mt-3">{t('warning_title')}</AttnLine>
       </div>
 
-      {/* Warning */}
-      <Card className="border-destructive/50 bg-destructive/5">
-        <CardContent className="flex items-start gap-4 pt-6">
-          <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
-          <div>
-            <p className="font-medium text-destructive">Oåterkallelig åtgärd</p>
-            <p className="text-sm text-muted-foreground mt-1">
-              En kreditfaktura makulerar den ursprungliga fakturan helt.
-              Alla belopp blir negativa, en bokföringsverifikation skapas, och den ursprungliga fakturan markeras som krediterad.
-              Denna åtgärd kan inte ångras.
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+      {/* Original invoice: read-only context as plain rows */}
+      <DetailSection kicker={t('original_card_title')}>
+        <DefRow label={t('invoice_number_label')}>
+          <span className="tabular-nums">{confirmNumber}</span>
+        </DefRow>
+        <DefRow label={t('date_label')}>
+          <span className="tabular-nums">{formatDate(invoice.invoice_date)}</span>
+        </DefRow>
+        <DefRow label={t('customer_label')}>{customer.name}</DefRow>
+        <DefRow label={t('vat_treatment_label')}>{getVatTreatmentLabel(invoice.vat_treatment)}</DefRow>
+      </DetailSection>
 
-      {/* Original invoice info */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Ursprunglig faktura</CardTitle>
-          <CardDescription>
-            Kreditfakturan baseras på denna faktura
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div>
-              <span className="text-muted-foreground">Fakturanummer:</span>
-              <span className="ml-2 font-medium">{invoice.invoice_number}</span>
-            </div>
-            <div>
-              <span className="text-muted-foreground">Datum:</span>
-              <span className="ml-2">{formatDate(invoice.invoice_date)}</span>
-            </div>
-            <div>
-              <span className="text-muted-foreground">Kund:</span>
-              <span className="ml-2">{customer.name}</span>
-            </div>
-            <div>
-              <span className="text-muted-foreground">Momsbehandling:</span>
-              <span className="ml-2">{getVatTreatmentLabel(invoice.vat_treatment)}</span>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Credit note preview */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Kreditfaktura förhandsgranskning</CardTitle>
-          <CardDescription>
-            Kreditfakturanummer: KR-{invoice.invoice_number}
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            {/* Header */}
-            <div className="grid grid-cols-12 gap-4 text-sm font-medium text-muted-foreground border-b pb-2">
-              <div className="col-span-5">Beskrivning</div>
-              <div className="col-span-2 text-right">Antal</div>
-              <div className="col-span-1 text-center">Enhet</div>
-              <div className="col-span-2 text-right">à-pris</div>
-              <div className="col-span-2 text-right">Summa</div>
-            </div>
-
-            {/* Items (negated) */}
+      {/* Credit note preview: the invoice lines negated, as the list-page
+          table idiom straight on the panel, totals as a right-aligned block. */}
+      <DetailSection
+        kicker={t('preview_card_title')}
+        aside={
+          // data-ph-mask: the credit note number derives from the invoice number
+          <span data-ph-mask="" className="text-[11px] tabular-nums text-muted-foreground">
+            {t('preview_card_description', { number: confirmNumber ?? '' })}
+          </span>
+        }
+      >
+        <table className="hidden w-full border-collapse text-[13px] sm:table">
+          <thead>
+            <tr>
+              <th className={cn(TH_CLASS, 'pl-0')}>{t('th_description')}</th>
+              <th className={cn(TH_CLASS, 'text-right')}>{t('th_quantity')}</th>
+              <th className={TH_CLASS}>{t('th_unit')}</th>
+              <th className={cn(TH_CLASS, 'text-right')}>{t('th_unit_price')}</th>
+              <th className={cn(TH_CLASS, 'pr-0 text-right')}>{t('th_amount')}</th>
+            </tr>
+          </thead>
+          <tbody>
             {invoice.items.map((item) => (
-              <div key={item.id} className="grid grid-cols-12 gap-4 text-sm">
-                <div className="col-span-5">{item.description}</div>
-                <div className="col-span-2 text-right text-destructive">
+              <tr key={item.id}>
+                <td className={cn(TD_CLASS, 'pl-0')}>{item.description}</td>
+                <td className={cn(TD_CLASS, 'text-right tabular-nums text-destructive')}>
                   -{Math.abs(item.quantity)}
-                </div>
-                <div className="col-span-1 text-center">{item.unit}</div>
-                <div className="col-span-2 text-right">
+                </td>
+                <td className={cn(TD_CLASS, 'text-muted-foreground')}>{item.unit}</td>
+                <td className={cn(TD_CLASS, 'text-right tabular-nums')}>
                   {formatCurrency(item.unit_price, invoice.currency)}
-                </div>
-                <div className="col-span-2 text-right font-medium text-destructive">
+                </td>
+                <td className={cn(TD_CLASS, 'pr-0 text-right tabular-nums text-destructive')}>
                   {formatCurrency(-Math.abs(item.line_total), invoice.currency)}
-                </div>
-              </div>
+                </td>
+              </tr>
             ))}
+          </tbody>
+        </table>
 
-            <Separator />
-
-            {/* Totals (negated) */}
-            <div className="space-y-2">
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Delsumma</span>
-                <span className="text-destructive">
-                  {formatCurrency(-Math.abs(invoice.subtotal), invoice.currency)}
-                </span>
+        {/* Mobile: one flat row per line, no numeric columns to cram. */}
+        <div className="divide-y divide-border text-sm sm:hidden">
+          {invoice.items.map((item) => (
+            <div key={item.id} className="flex items-start justify-between gap-4 py-3">
+              <div className="min-w-0">
+                <p>{item.description}</p>
+                <p className="text-xs text-muted-foreground tabular-nums">
+                  -{Math.abs(item.quantity)} {item.unit} × {formatCurrency(item.unit_price, invoice.currency)}
+                </p>
               </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Moms ({invoice.vat_rate}%)</span>
-                <span className="text-destructive">
-                  {formatCurrency(-Math.abs(invoice.vat_amount), invoice.currency)}
-                </span>
-              </div>
-              <Separator />
-              <div className="flex justify-between font-bold text-lg">
-                <span>Totalt</span>
-                <span className="text-destructive">
-                  {formatCurrency(-Math.abs(invoice.total), invoice.currency)}
-                </span>
-              </div>
-              {invoice.currency !== 'SEK' && invoice.total_sek && (
-                <div className="flex justify-between text-sm text-muted-foreground">
-                  <span>I SEK (kurs {invoice.exchange_rate})</span>
-                  <span className="text-destructive">
-                    {formatCurrency(-Math.abs(invoice.total_sek))}
-                  </span>
-                </div>
-              )}
+              <span className="shrink-0 tabular-nums text-destructive">
+                {formatCurrency(-Math.abs(item.line_total), invoice.currency)}
+              </span>
             </div>
+          ))}
+        </div>
+
+        <div className="ml-auto mt-4 w-full max-w-xs space-y-1 text-sm tabular-nums">
+          <div className="flex justify-between gap-4">
+            <span className="text-muted-foreground">{t('subtotal')}</span>
+            <span className="text-destructive">
+              {formatCurrency(-Math.abs(invoice.subtotal), invoice.currency)}
+            </span>
           </div>
-        </CardContent>
-      </Card>
-
-      {/* Reason */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Anledning</CardTitle>
-          <CardDescription>
-            Ange anledning till kreditering (visas på kreditfakturan)
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2">
-            <Label htmlFor="reason">Anledning</Label>
-            <Textarea
-              id="reason"
-              value={reason}
-              onChange={(e) => setReason(e.target.value)}
-              placeholder="T.ex. Felaktig fakturering, returnerade varor..."
-              rows={3}
-            />
+          <div className="flex justify-between gap-4">
+            <span className="text-muted-foreground">{t('vat_at_rate', { rate: invoice.vat_rate })}</span>
+            <span className="text-destructive">
+              {formatCurrency(-Math.abs(invoice.vat_amount), invoice.currency)}
+            </span>
           </div>
-        </CardContent>
-      </Card>
+          <div className="flex items-baseline justify-between gap-4 border-t border-border pt-2">
+            <span>{t('total')}</span>
+            <span className="font-display text-xl text-destructive">
+              {formatCurrency(-Math.abs(invoice.total), invoice.currency)}
+            </span>
+          </div>
+          {invoice.currency !== 'SEK' && invoice.total_sek && (
+            <div className="flex justify-between gap-4 text-muted-foreground">
+              <span>{t('in_sek', { rate: invoice.exchange_rate ?? 1 })}</span>
+              <span className="text-destructive">{formatCurrency(-Math.abs(invoice.total_sek))}</span>
+            </div>
+          )}
+        </div>
+      </DetailSection>
 
-      {/* Confirmation */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Bekräfta</CardTitle>
-          <CardDescription>
-            Skriv fakturanumret <span className="font-mono font-semibold text-foreground">{invoice.invoice_number}</span> för att bekräfta
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Input
-            value={confirmText}
-            onChange={(e) => setConfirmText(e.target.value)}
-            placeholder={invoice.invoice_number}
-            className={cn(
-              confirmText && confirmText !== invoice.invoice_number && 'border-destructive'
-            )}
-          />
-        </CardContent>
-      </Card>
+      {/* Reason: shown on the credit note (the note lives behind the "?") */}
+      <DetailSection
+        kicker={t('reason_card_title')}
+        help={<HelpPopover>{t('reason_card_description')}</HelpPopover>}
+      >
+        <Label htmlFor="reason" className="sr-only">{t('reason_label')}</Label>
+        <Textarea
+          id="reason"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder={t('reason_placeholder')}
+          rows={3}
+        />
+      </DetailSection>
 
-      {/* Actions */}
-      <div className="flex justify-end gap-4">
+      {/* Confirmation: type the invoice number to arm the action */}
+      <DetailSection kicker={t('confirm_card_title')}>
+        <Label htmlFor="confirm-invoice-number" className="block text-sm font-normal leading-5 text-muted-foreground">
+          {t('confirm_card_description_1')}
+          {/* data-ph-mask: the invoice number is user data */}
+          <span data-ph-mask="" className="font-mono font-semibold text-foreground">{confirmNumber}</span>
+          {t('confirm_card_description_2')}
+        </Label>
+        <Input
+          id="confirm-invoice-number"
+          value={confirmText}
+          onChange={(e) => setConfirmText(e.target.value)}
+          placeholder={confirmNumber ?? ''}
+          disabled={!confirmNumber}
+          className={cn(
+            // ph-no-capture: the placeholder carries the invoice number, and
+            // replay masking covers input values, not attributes.
+            'ph-no-capture mt-3 max-w-xs',
+            confirmMismatch && 'border-destructive'
+          )}
+        />
+      </DetailSection>
+
+      {/* Actions: one footer row right after the confirm step, so the flow
+          reads top to bottom and ends on the button it arms. */}
+      <div className="flex flex-wrap justify-end gap-2">
         <Button variant="outline" onClick={() => router.back()}>
-          Avbryt
+          {t('cancel')}
         </Button>
         <Button
-          variant="destructive"
           onClick={handleSubmit}
-          disabled={isSubmitting || confirmText !== invoice.invoice_number || !canWrite}
-          title={!canWrite ? 'Du har endast läsbehörighet i detta företag' : undefined}
+          disabled={
+            isSubmitting ||
+            !confirmNumber ||
+            confirmText !== confirmNumber ||
+            !canWrite
+          }
+          title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
         >
           {isSubmitting ? (
             <>
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Skapar...
+              {t('creating')}
             </>
           ) : !canWrite ? (
             <>
               <Lock className="mr-2 h-4 w-4" />
-              Skapa kreditfaktura
+              {t('create_credit_note')}
             </>
           ) : (
-            'Skapa kreditfaktura'
+            t('create_credit_note')
           )}
         </Button>
       </div>

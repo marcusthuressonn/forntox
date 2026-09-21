@@ -1,6 +1,12 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { generateTrialBalance } from './trial-balance'
-import type { BalanceSheetReport, BalanceSheetSection, TrialBalanceRow } from '@/types'
+import { findUntransferredResults, buildImbalanceDiagnosis } from './imbalance-diagnosis'
+import type {
+  BalanceImbalanceDiagnosis,
+  BalanceSheetReport,
+  BalanceSheetSection,
+  TrialBalanceRow,
+} from '@/types'
 
 /**
  * Generate Balance Sheet (Balansräkning)
@@ -12,9 +18,15 @@ import type { BalanceSheetReport, BalanceSheetSection, TrialBalanceRow } from '@
 export async function generateBalanceSheet(
   supabase: SupabaseClient,
   companyId: string,
-  fiscalPeriodId: string
+  fiscalPeriodId: string,
+  options?: { fromDate?: string; toDate?: string }
 ): Promise<BalanceSheetReport> {
-  const { rows } = await generateTrialBalance(supabase, companyId, fiscalPeriodId)
+  const { rows } = await generateTrialBalance(supabase, companyId, fiscalPeriodId, {
+    // Balance sheet: 2099 must carry årets resultat, so the resultatavslut stays in.
+    closingEntry: 'include',
+    fromDate: options?.fromDate,
+    toDate: options?.toDate,
+  })
 
   // Filter to balance sheet accounts (class 1-2)
   const balanceRows = rows.filter(
@@ -57,11 +69,17 @@ export async function generateBalanceSheet(
     'credit' // Equity/liabilities have credit normal balance
   )
 
-  // Calculate period result from income/expense accounts (class 3-8)
-  // Before year-end closing, this result lives on class 3-8 accounts and must
-  // be included in equity for the balance sheet to balance.
+  // Calculate the period result from every row OUTSIDE the balance-sheet
+  // classes (1-2), not just class 3-8. Invariant: synthetic result =
+  // everything outside the balance-sheet classes, so a resultatavslut that
+  // was posted to 2099 but whose counter-line landed on a class 0/9 or
+  // class-less account self-cancels here instead of double-counting the
+  // result (2099 already carries it inside the class 2 sections). The
+  // negated range is deliberate: it keeps null/undefined account_class rows
+  // in the result. A genuinely untransferred prior-year result still yields
+  // a real differens and the imbalance diagnosis below.
   const incomeExpenseRows = rows.filter(
-    (r) => r.account_class >= 3 && r.account_class <= 8
+    (r) => !(r.account_class >= 1 && r.account_class <= 2)
   )
   const periodResult = Math.round(
     incomeExpenseRows.reduce(
@@ -85,15 +103,41 @@ export async function generateBalanceSheet(
     })
   }
 
-  const totalAssets = assetSections.reduce((sum, s) => sum + s.subtotal, 0)
-  const totalEquityLiabilities = equityLiabilitySections.reduce((sum, s) => sum + s.subtotal, 0)
+  const totalAssets =
+    Math.round(assetSections.reduce((sum, s) => sum + s.subtotal, 0) * 100) / 100
+  const totalEquityLiabilities =
+    Math.round(equityLiabilitySections.reduce((sum, s) => sum + s.subtotal, 0) * 100) / 100
+
+  // Explain a broken balance instead of leaving a bare differens. The usual
+  // cause after multi-year migrations is a prior year whose result was never
+  // transferred to equity (see imbalance-diagnosis.ts). Only runs on the
+  // unbalanced path and must never break the report itself.
+  let imbalanceDiagnosis: BalanceImbalanceDiagnosis | undefined
+  const differens = Math.round((totalAssets - totalEquityLiabilities) * 100) / 100
+  if (Math.abs(differens) >= 0.01) {
+    try {
+      const { data: period } = await supabase
+        .from('fiscal_periods')
+        .select('period_start')
+        .eq('id', fiscalPeriodId)
+        .eq('company_id', companyId)
+        .single()
+      const untransferred = await findUntransferredResults(supabase, companyId, {
+        beforePeriodStart: period?.period_start,
+      })
+      imbalanceDiagnosis = buildImbalanceDiagnosis(untransferred, differens) ?? undefined
+    } catch {
+      // Best-effort diagnosis only — the report still renders without it.
+    }
+  }
 
   return {
     asset_sections: assetSections.filter((s) => s.rows.length > 0),
-    total_assets: Math.round(totalAssets * 100) / 100,
+    total_assets: totalAssets,
     equity_liability_sections: equityLiabilitySections.filter((s) => s.rows.length > 0),
-    total_equity_liabilities: Math.round(totalEquityLiabilities * 100) / 100,
+    total_equity_liabilities: totalEquityLiabilities,
     period: { start: '', end: '' },
+    ...(imbalanceDiagnosis ? { imbalance_diagnosis: imbalanceDiagnosis } : {}),
   }
 }
 

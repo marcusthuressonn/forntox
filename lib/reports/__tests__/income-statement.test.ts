@@ -6,6 +6,7 @@ vi.mock('../trial-balance', () => ({
 
 import { generateIncomeStatement } from '../income-statement'
 import { generateTrialBalance } from '../trial-balance'
+import { roundOre } from '@/lib/money'
 import type { TrialBalanceRow } from '@/types'
 
 const mockTrialBalance = vi.mocked(generateTrialBalance)
@@ -197,7 +198,7 @@ describe('generateIncomeStatement', () => {
     mockTrialBalance.mockResolvedValue({
       rows: [
         makeRow({ account_number: '3001', account_name: 'Revenue', account_class: 3, closing_credit: 10000, closing_debit: 0 }),
-        // Amount 0.004 — below threshold, filtered from rows but included in subtotal
+        // Amount 0.004: below threshold, filtered from rows but included in subtotal
         makeRow({ account_number: '3002', account_name: 'Micro', account_class: 3, closing_credit: 0.004, closing_debit: 0 }),
       ],
       totalDebit: 0,
@@ -236,7 +237,7 @@ describe('generateIncomeStatement', () => {
 
     expect(report.total_revenue).toBe(370000)
     expect(report.total_expenses).toBe(149000)
-    // 8999 must not contribute — financial section should be empty
+    // 8999 must not contribute: financial section should be empty
     expect(report.financial_sections).toEqual([])
     expect(report.total_financial).toBe(0)
     // Computed net result equals what Bokio / NE-bilaga shows
@@ -244,7 +245,7 @@ describe('generateIncomeStatement', () => {
   })
 
   it('still includes legitimate class 8 accounts (8310 interest, 8410 interest expense)', async () => {
-    // Sanity check the 8999 exclusion is narrow — other class 8 accounts
+    // Sanity check the 8999 exclusion is narrow: other class 8 accounts
     // (interest income, interest expense, tax) must still appear.
     mockTrialBalance.mockResolvedValue({
       rows: [
@@ -263,7 +264,7 @@ describe('generateIncomeStatement', () => {
     const titles = report.financial_sections.map(s => s.title)
     expect(titles).toContain('Ränteintäkter')
     expect(titles).toContain('Räntekostnader')
-    // 89xx section would have been populated by 8999 only — excluded
+    // 89xx section would have been populated by 8999 only: excluded
     expect(titles).not.toContain('Skatter och årets resultat')
     expect(report.total_financial).toBe(300) // 500 - 200
     expect(report.net_result).toBe(100300) // 100000 - 0 + 300
@@ -288,5 +289,136 @@ describe('generateIncomeStatement', () => {
     expect(report.expense_sections).toEqual([])
     expect(report.financial_sections).toEqual([])
     expect(report.total_revenue).toBe(40000)
+  })
+
+  it('includes energikostnader (group 53, e.g. 5310) in expenses and net_result: regression', async () => {
+    // Regression: group '53' was missing from the expense label map, so 53xx
+    // accounts (energy costs like 5310 El för drift) were silently dropped from
+    // total_expenses and net_result. The Resultatrapport (which sums all class
+    // 3-8 rows directly) stayed correct, which is how the discrepancy surfaced.
+    mockTrialBalance.mockResolvedValue({
+      rows: [
+        makeRow({ account_number: '3001', account_name: 'Revenue', account_class: 3, closing_credit: 100000, closing_debit: 0 }),
+        makeRow({ account_number: '5310', account_name: 'El för drift', account_class: 5, closing_debit: 18000, closing_credit: 0 }),
+      ],
+      totalDebit: 18000,
+      totalCredit: 100000,
+      isBalanced: false,
+    })
+
+    const report = await generateIncomeStatement(supabase, 'company-1', 'period-1')
+
+    expect(report.total_expenses).toBe(18000) // was 0 before the fix
+    expect(report.net_result).toBe(82000) // was 100000 before the fix
+    const expenseAccounts = report.expense_sections.flatMap((s) => s.rows.map((r) => r.account_number))
+    expect(expenseAccounts).toContain('5310')
+  })
+
+  it('routes accounts from every unmapped group (48, 53, 67) into a catch-all, never dropping them', async () => {
+    mockTrialBalance.mockResolvedValue({
+      rows: [
+        makeRow({ account_number: '3001', account_name: 'Revenue', account_class: 3, closing_credit: 100000, closing_debit: 0 }),
+        makeRow({ account_number: '4810', account_name: 'Energi råvara', account_class: 4, closing_debit: 1000, closing_credit: 0 }),
+        makeRow({ account_number: '5310', account_name: 'El för drift', account_class: 5, closing_debit: 2000, closing_credit: 0 }),
+        makeRow({ account_number: '6710', account_name: 'Lämnade bidrag', account_class: 6, closing_debit: 3000, closing_credit: 0 }),
+      ],
+      totalDebit: 6000,
+      totalCredit: 100000,
+      isBalanced: false,
+    })
+
+    const report = await generateIncomeStatement(supabase, 'company-1', 'period-1')
+
+    // All three expense accounts must be counted, regardless of label coverage.
+    expect(report.total_expenses).toBe(6000)
+    expect(report.net_result).toBe(94000)
+    const expenseAccounts = report.expense_sections.flatMap((s) => s.rows.map((r) => r.account_number))
+    expect(expenseAccounts).toEqual(expect.arrayContaining(['4810', '5310', '6710']))
+  })
+
+  it('total_expenses equals the signed sum of every class 4-7 row (no silent drops)', async () => {
+    // Structural invariant guarding the whole class of "missing group label"
+    // bug: the sum of expense-section subtotals must equal Σ(debit - credit)
+    // over all class 4-7 rows, mixing mapped (50, 70) and unmapped (48, 53, 67)
+    // groups.
+    const rows = [
+      makeRow({ account_number: '5010', account_name: 'Lokalhyra', account_class: 5, closing_debit: 8000, closing_credit: 0 }),
+      makeRow({ account_number: '5310', account_name: 'El för drift', account_class: 5, closing_debit: 2500, closing_credit: 0 }),
+      makeRow({ account_number: '4810', account_name: 'Energi', account_class: 4, closing_debit: 1500, closing_credit: 0 }),
+      makeRow({ account_number: '6710', account_name: 'Bidrag', account_class: 6, closing_debit: 500, closing_credit: 0 }),
+      makeRow({ account_number: '7010', account_name: 'Löner', account_class: 7, closing_debit: 40000, closing_credit: 0 }),
+    ]
+    mockTrialBalance.mockResolvedValue({ rows, totalDebit: 52500, totalCredit: 0, isBalanced: false })
+
+    const report = await generateIncomeStatement(supabase, 'company-1', 'period-1')
+
+    const expectedTotal = rows.reduce((sum, r) => sum + (r.closing_debit - r.closing_credit), 0)
+    const sectionSum = report.expense_sections.reduce((sum, s) => sum + s.subtotal, 0)
+    expect(report.total_expenses).toBe(expectedTotal) // 52500
+    expect(roundOre(sectionSum)).toBe(expectedTotal)
+  })
+})
+
+describe('generateIncomeStatement with a fromDate range', () => {
+  // With fromDate > period_start, the trial balance rolls all pre-range
+  // activity (P&L accounts included) into the opening columns, so closing
+  // columns hold year-to-date figures. The ranged income statement must sum
+  // the window's movements only (period columns): a July-only report of a
+  // company with 10 000 kr January revenue and 5 000 kr July revenue shows
+  // 5 000, not 15 000.
+  const RANGED_ROWS = [
+    makeRow({
+      account_number: '3001',
+      account_name: 'Försäljning 25%',
+      account_class: 3,
+      opening_credit: 10000, // Jan-Jun activity rolled into IB at range start
+      period_credit: 5000, // July activity
+      closing_credit: 15000, // opening + period = YTD
+    }),
+    makeRow({
+      account_number: '5010',
+      account_name: 'Lokalhyra',
+      account_class: 5,
+      opening_debit: 6000,
+      period_debit: 1000,
+      closing_debit: 7000,
+    }),
+  ]
+
+  it('sums period movements, not YTD closing balances, when fromDate is set', async () => {
+    mockTrialBalance.mockResolvedValue({
+      rows: RANGED_ROWS,
+      totalDebit: 7000,
+      totalCredit: 15000,
+      isBalanced: false,
+    })
+
+    const report = await generateIncomeStatement(supabase, 'company-1', 'period-1', {
+      fromDate: '2026-07-01',
+      toDate: '2026-07-31',
+    })
+
+    expect(report.total_revenue).toBe(5000)
+    expect(report.total_expenses).toBe(1000)
+    expect(report.net_result).toBe(4000)
+  })
+
+  it('keeps closing-balance behavior when no fromDate is given', async () => {
+    mockTrialBalance.mockResolvedValue({
+      rows: RANGED_ROWS,
+      totalDebit: 7000,
+      totalCredit: 15000,
+      isBalanced: false,
+    })
+
+    const report = await generateIncomeStatement(supabase, 'company-1', 'period-1', {
+      toDate: '2026-07-31',
+    })
+
+    // Without fromDate there is no roll-forward: closing = period for P&L
+    // accounts in real data. The fixture's opening values stand in for the
+    // (absent) roll-forward, so closing-column sums are expected here.
+    expect(report.total_revenue).toBe(15000)
+    expect(report.total_expenses).toBe(7000)
   })
 })

@@ -12,16 +12,18 @@ import {
   getCommonTemplates,
   getAdvancedTemplates,
   validateTemplateForEntity,
+  stripBankNoise,
   type BookingTemplate,
 } from '../booking-templates'
+import { applySettlementAccount } from '../mapping-engine'
 
 // ============================================================
 // Template Data Integrity
 // ============================================================
 
 describe('BOOKING_TEMPLATES data integrity', () => {
-  it('has exactly 51 templates', () => {
-    expect(BOOKING_TEMPLATES).toHaveLength(51)
+  it('has exactly 83 templates', () => {
+    expect(BOOKING_TEMPLATES).toHaveLength(83)
   })
 
   it('all template IDs are unique', () => {
@@ -126,9 +128,9 @@ describe('getTemplatesByMcc', () => {
 })
 
 describe('getTemplateGroups', () => {
-  it('returns all 17 groups', () => {
+  it('returns all 20 groups', () => {
     const groups = getTemplateGroups()
-    expect(groups).toHaveLength(17)
+    expect(groups).toHaveLength(20)
     for (const g of groups) {
       expect(g.group).toBeTruthy()
       expect(g.label_sv).toBeTruthy()
@@ -140,7 +142,7 @@ describe('getTemplateGroups', () => {
   it('every template is in exactly one group', () => {
     const groups = getTemplateGroups()
     const allTemplates = groups.flatMap((g) => g.templates)
-    expect(allTemplates).toHaveLength(51)
+    expect(allTemplates).toHaveLength(83)
   })
 })
 
@@ -181,6 +183,38 @@ describe('searchTemplates', () => {
   it('supports multi-token search', () => {
     const results = searchTemplates('annonsering EU')
     expect(results.some((t) => t.id === 'marketing_online_ads_eu')).toBe(true)
+  })
+
+  // Account-number matching (issue #1877): an all-digit token prefix-matches
+  // the template's business account, so typing a konto in the booking
+  // dialog's search field surfaces the templates that book to it.
+  it('finds an expense template by its debit (business) account number', () => {
+    const results = searchTemplates('5010')
+    expect(results.some((t) => t.id === 'premises_rent')).toBe(true)
+  })
+
+  it('finds an income template by its credit (business) account number', () => {
+    const results = searchTemplates('3001')
+    expect(results.some((t) => t.id === 'revenue_standard_25')).toBe(true)
+  })
+
+  it('matches both legs of a transfer template', () => {
+    const results = searchTemplates('1630')
+    expect(results.some((t) => t.id === 'financial_tax_account')).toBe(true)
+  })
+
+  it('does not match the settlement leg (1930 must not light up every template)', () => {
+    const results = searchTemplates('1930')
+    expect(results.some((t) => t.id === 'premises_rent')).toBe(false)
+    expect(results.some((t) => t.id === 'revenue_standard_25')).toBe(false)
+    // Transfers legitimately involve the bank account on a business leg.
+    expect(results.every((t) => t.direction === 'transfer')).toBe(true)
+  })
+
+  it('prefix-matches account numbers (partial konto narrows, text does not match accounts)', () => {
+    expect(searchTemplates('501').some((t) => t.id === 'premises_rent')).toBe(true)
+    // A non-digit token never matches via accounts.
+    expect(searchTemplates('501x').some((t) => t.id === 'premises_rent')).toBe(false)
   })
 })
 
@@ -270,6 +304,135 @@ describe('findMatchingTemplates', () => {
 })
 
 // ============================================================
+// stripBankNoise: protects the matcher from bank-prefix noise
+// ============================================================
+
+describe('stripBankNoise', () => {
+  it('strips "överföring via internet" before keyword matching', () => {
+    expect(stripBankNoise('milersättning april överföring via internet')).toBe(
+      'milersättning april'
+    )
+  })
+
+  it('strips "autogiro" suffix', () => {
+    expect(stripBankNoise('elräkning autogiro')).toBe('elräkning')
+  })
+
+  it('strips "bg-betalning" and "bgmax"', () => {
+    expect(stripBankNoise('vattenfall bg-betalning')).toBe('vattenfall')
+    expect(stripBankNoise('kund x bgmax')).toBe('kund x')
+  })
+
+  it('strips multiple noise phrases at once', () => {
+    expect(stripBankNoise('swish till anna överföring')).toBe('anna')
+  })
+
+  it('preserves real merchant text after stripping', () => {
+    expect(stripBankNoise('kortköp ica supermarket')).toBe('ica supermarket')
+  })
+
+  it('is a no-op when no noise phrases are present', () => {
+    expect(stripBankNoise('lokalhyra mars 2026')).toBe('lokalhyra mars 2026')
+  })
+
+  it('strips Handelsbanken\'s truncated "internet bet" so it never reads as an internet subscription', () => {
+    expect(stripBankNoise('internet bet 1')).toBe('1')
+    expect(stripBankNoise('internet bet 1 if skadeförsäkring')).toBe('1 if skadeförsäkring')
+  })
+})
+
+// ============================================================
+// Milersättning / traktamente routing: regression guards for
+// the "Överföring via internet" → 6230 Internet miscategorization
+// ============================================================
+
+describe('milersättning routing', () => {
+  it('matches personnel_mileage_taxfree (7331) for "milersättning"', () => {
+    const tx = makeTransaction({
+      amount: -1496,
+      description: 'milersättning april',
+    })
+    const matches = findMatchingTemplates(tx)
+    expect(matches[0]?.template.id).toBe('personnel_mileage_taxfree')
+    expect(matches[0]?.template.debit_account).toBe('7331')
+  })
+
+  it('does NOT match telecom_internet when description contains "överföring via internet"', () => {
+    const tx = makeTransaction({
+      amount: -1496,
+      description: 'milersättning april Överföring via internet',
+    })
+    const matches = findMatchingTemplates(tx)
+    // The fragile substring match used to fire telecom_internet (6230 + 25% VAT)
+    // because the bank suffix contains the word "internet". After stripping
+    // bank noise, only milersättning should match.
+    expect(matches.find((m) => m.template.id === 'telecom_internet')).toBeUndefined()
+    expect(matches[0]?.template.id).toBe('personnel_mileage_taxfree')
+  })
+
+  it('emits no VAT lines for milersättning (employee reimbursement, not a purchase)', () => {
+    const template = getTemplateById('personnel_mileage_taxfree')
+    expect(template).toBeDefined()
+    const tx = makeTransaction({ amount: -1496 })
+    const result = buildMappingResultFromTemplate(template!, tx, 'aktiebolag')
+    expect(result.debit_account).toBe('7331')
+    expect(result.vat_lines).toHaveLength(0)
+  })
+
+  it('"körersättning" also matches personnel_mileage_taxfree', () => {
+    const tx = makeTransaction({
+      amount: -1850,
+      description: 'körersättning Q1',
+    })
+    const matches = findMatchingTemplates(tx)
+    expect(matches[0]?.template.id).toBe('personnel_mileage_taxfree')
+  })
+
+  it('still resolves real internet bills via the telecom_internet template', () => {
+    // Make sure we didn't break legitimate internet-bill matching by adding
+    // noise stripping. The merchant signal carries the match.
+    const tx = makeTransaction({
+      amount: -399,
+      description: 'Bahnhof bredband mars',
+      merchant_name: 'Bahnhof',
+    })
+    const matches = findMatchingTemplates(tx)
+    expect(matches[0]?.template.id).toBe('telecom_internet')
+  })
+})
+
+describe('traktamente routing', () => {
+  it('matches personnel_per_diem_sweden_taxfree (7321) for "traktamente"', () => {
+    const tx = makeTransaction({
+      amount: -290,
+      description: 'traktamente Stockholm april',
+    })
+    const matches = findMatchingTemplates(tx)
+    expect(matches[0]?.template.id).toBe('personnel_per_diem_sweden_taxfree')
+    expect(matches[0]?.template.debit_account).toBe('7321')
+  })
+
+  it('matches utlandstraktamente → 7323', () => {
+    const tx = makeTransaction({
+      amount: -800,
+      description: 'utlandstraktamente Tyskland',
+    })
+    const matches = findMatchingTemplates(tx)
+    expect(matches[0]?.template.id).toBe('personnel_per_diem_abroad_taxfree')
+    expect(matches[0]?.template.debit_account).toBe('7323')
+  })
+
+  it('emits no VAT lines for traktamente', () => {
+    const template = getTemplateById('personnel_per_diem_sweden_taxfree')
+    expect(template).toBeDefined()
+    const tx = makeTransaction({ amount: -290 })
+    const result = buildMappingResultFromTemplate(template!, tx, 'aktiebolag')
+    expect(result.debit_account).toBe('7321')
+    expect(result.vat_lines).toHaveLength(0)
+  })
+})
+
+// ============================================================
 // buildMappingResultFromTemplate
 // ============================================================
 
@@ -300,7 +463,10 @@ describe('buildMappingResultFromTemplate', () => {
     const tx = makeTransaction({ amount: -1120 })
     const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
 
-    expect(result.debit_account).toBe('5820')
+    // 5830 Kost och logi, not 5820 Hyrbilskostnader. This assertion used to
+    // read 5820, which pinned a real bug: the Hotell template posted hotel
+    // nights into car hire. It balanced, so nothing ever complained.
+    expect(result.debit_account).toBe('5830')
     expect(result.vat_lines).toHaveLength(1)
     expect(result.vat_lines[0].account_number).toBe('2641')
     expect(result.vat_lines[0].debit_amount).toBe(120) // 1120 * 0.12 / 1.12 = 120
@@ -316,18 +482,80 @@ describe('buildMappingResultFromTemplate', () => {
     expect(result.vat_lines[0].debit_amount).toBe(30) // 530 * 0.06 / 1.06 = 30
   })
 
-  it('produces reverse charge lines for EU purchases', () => {
+  it('produces reverse charge lines for EU purchases (fiktiv moms + basbelopp)', () => {
     const template = getTemplate('it_saas_eu')
     const tx = makeTransaction({ amount: -1000 })
     const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
 
-    expect(result.vat_lines).toHaveLength(2)
-    // Fiktiv ingående moms
+    // Four lines: fiktiv-moms pair + basbelopp pair. Without the basbelopp
+    // pair the deklaration is rejected with FK004 (ruta 30-32 without 20-24).
+    expect(result.vat_lines).toHaveLength(4)
+    // Fiktiv ingående moms (EU: 2645)
     expect(result.vat_lines[0].account_number).toBe('2645')
     expect(result.vat_lines[0].debit_amount).toBe(250)
-    // Fiktiv utgående moms
+    // Fiktiv utgående moms (25%: 2614)
     expect(result.vat_lines[1].account_number).toBe('2614')
     expect(result.vat_lines[1].credit_amount).toBe(250)
+    // Basbelopp EU services 25% → ruta 21
+    expect(result.vat_lines[2].account_number).toBe('4535')
+    expect(result.vat_lines[2].debit_amount).toBe(1000)
+    // Motkonto basbelopp
+    expect(result.vat_lines[3].account_number).toBe('4598')
+    expect(result.vat_lines[3].credit_amount).toBe(1000)
+  })
+
+  it('defaults to eu_business supplier type when not set on template', () => {
+    // it_cloud_hosting has no explicit reverse_charge_supplier_type
+    const template = getTemplate('it_cloud_hosting')
+    const tx = makeTransaction({ amount: -800 })
+    const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+
+    expect(result.vat_lines).toHaveLength(4)
+    // Defaults to EU services → 4535
+    expect(result.vat_lines[2].account_number).toBe('4535')
+    expect(result.vat_lines[2].debit_amount).toBe(800)
+  })
+
+  it('uses 4531 basbelopp for non-EU supplier type', () => {
+    const template: BookingTemplate = {
+      ...getTemplate('it_cloud_hosting'),
+      reverse_charge_supplier_type: 'non_eu_business',
+    }
+    const tx = makeTransaction({ amount: -1000 })
+    const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+
+    expect(result.vat_lines).toHaveLength(4)
+    expect(result.vat_lines[0].account_number).toBe('2645') // non-EU still uses 2645
+    expect(result.vat_lines[2].account_number).toBe('4531') // non-EU services → ruta 22
+  })
+
+  it('uses 4425 basbelopp and 2647 for domestic (swedish) reverse charge', () => {
+    const template: BookingTemplate = {
+      ...getTemplate('it_cloud_hosting'),
+      reverse_charge_supplier_type: 'swedish_business',
+    }
+    const tx = makeTransaction({ amount: -1000 })
+    const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+
+    expect(result.vat_lines).toHaveLength(4)
+    // Domestic RC uses 2647 (ML 16 kap) for the input pair
+    expect(result.vat_lines[0].account_number).toBe('2647')
+    // Domestic services (byggtjänster) → 4425, ruta 24
+    expect(result.vat_lines[2].account_number).toBe('4425')
+  })
+
+  it('skips basbelopp emission when template already debits a basis account', () => {
+    const template: BookingTemplate = {
+      ...getTemplate('it_cloud_hosting'),
+      debit_account: '4535', // user-customized template that books directly to basis
+    }
+    const tx = makeTransaction({ amount: -1000 })
+    const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+
+    // Only the fiktiv-moms pair: basbelopp would double-count.
+    expect(result.vat_lines).toHaveLength(2)
+    expect(result.vat_lines[0].account_number).toBe('2645')
+    expect(result.vat_lines[1].account_number).toBe('2614')
   })
 
   it('produces no VAT lines for exempt expenses', () => {
@@ -391,6 +619,16 @@ describe('buildMappingResultFromTemplate', () => {
     expect(abResult.debit_account).toBe('2893')
   })
 
+  it('books an ideell förening private expense to the member account 2890, never an owner account', () => {
+    const tx = makeTransaction({ amount: -300 })
+    const privat = buildMappingResultFromTemplate(getTemplate('private_expense'), tx, 'ideell_forening')
+    expect(privat.debit_account).toBe('2890')
+    expect(privat.credit_account).toBe('1930')
+    // Non-owner templates keep their base (EF) account for a förening.
+    const course = buildMappingResultFromTemplate(getTemplate('education_course'), tx, 'ideell_forening')
+    expect(course.debit_account).toBe('6991')
+  })
+
   it('includes template_id in the MappingResult', () => {
     const template = getTemplate('bank_fees')
     const tx = makeTransaction({ amount: -49 })
@@ -406,6 +644,74 @@ describe('buildMappingResultFromTemplate', () => {
     const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
 
     expect(result.description).toBe('Drivmedel & Laddning: OKQ8 tankstation')
+  })
+
+  // Foreign-currency transactions: the mall must always emit SEK amounts
+  // (issue #442). Previously buildMappingResultFromTemplate used
+  // Math.abs(transaction.amount) (which is in the source currency) to
+  // compute VAT lines, producing a verifikation in mixed currencies.
+  it('emits SEK amounts when transaction currency is USD (issue #442)', () => {
+    const template = getTemplate('it_saas_subscription') // 25% input VAT
+    const tx = makeTransaction({
+      amount: -125,           // -125 USD
+      currency: 'USD',
+      amount_sek: -1250,      // pre-converted to SEK
+      exchange_rate: 10,
+    })
+    const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+
+    // VAT line debit must be 250 SEK (1250 * 0.25 / 1.25), not 25 USD
+    expect(result.vat_lines).toHaveLength(1)
+    expect(result.vat_lines[0].account_number).toBe('2641')
+    expect(result.vat_lines[0].debit_amount).toBe(250)
+  })
+
+  it('falls back to amount * exchange_rate when amount_sek is missing', () => {
+    const template = getTemplate('it_saas_subscription')
+    const tx = makeTransaction({
+      amount: -100,
+      currency: 'EUR',
+      amount_sek: null,
+      exchange_rate: 11.5,
+    })
+    const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+
+    // 100 * 11.5 = 1150 SEK; 1150 * 0.25 / 1.25 = 230 SEK
+    expect(result.vat_lines[0].debit_amount).toBe(230)
+  })
+
+  it('emits SEK amounts for EU reverse-charge on a non-SEK transaction', () => {
+    const template = getTemplate('it_saas_eu')
+    const tx = makeTransaction({
+      amount: -100,
+      currency: 'USD',
+      amount_sek: -1000,
+      exchange_rate: 10,
+    })
+    const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+
+    // Fiktiv-moms pair sized at 25% of 1000 SEK = 250, not 25 USD
+    expect(result.vat_lines).toHaveLength(4)
+    expect(result.vat_lines[0].debit_amount).toBe(250)   // 2645
+    expect(result.vat_lines[1].credit_amount).toBe(250)  // 2614
+    expect(result.vat_lines[2].debit_amount).toBe(1000)  // 4535 basbelopp
+    expect(result.vat_lines[3].credit_amount).toBe(1000) // 4608
+  })
+
+  it('emits SEK amounts for output VAT on non-SEK income', () => {
+    const template = getTemplate('revenue_standard_25')
+    const tx = makeTransaction({
+      amount: 100,
+      currency: 'USD',
+      amount_sek: 1000,
+      exchange_rate: 10,
+    })
+    const result = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+
+    // Output VAT at 25% on 1000 SEK = 200, not 20 USD
+    expect(result.vat_lines).toHaveLength(1)
+    expect(result.vat_lines[0].account_number).toBe('2611')
+    expect(result.vat_lines[0].credit_amount).toBe(200)
   })
 })
 
@@ -501,12 +807,22 @@ describe('new and split templates', () => {
     expect(t!.common).toBe(false)
   })
 
-  it('has representation_internal with account 7622', () => {
+  it('has representation_internal on 7631 with deductible VAT', () => {
+    // 7622 is Sjuk- och hälsovård, ej avdragsgill; personal representation
+    // is 7631, and its VAT is deductible on a base of up to 300 kr/person.
     const t = getTemplateById('representation_internal')
     expect(t).toBeDefined()
-    expect(t!.debit_account).toBe('7622')
-    expect(t!.vat_treatment).toBeNull()
+    expect(t!.debit_account).toBe('7631')
+    expect(t!.vat_treatment).toBe('reduced_12')
     expect(t!.common).toBe(true)
+  })
+
+  it('routes Stripe fees to reverse charge, not to VAT-free bank fees', () => {
+    const t = getTemplateById('payment_fees_eu')
+    expect(t).toBeDefined()
+    expect(t!.debit_account).toBe('6570')
+    expect(t!.vat_treatment).toBe('reverse_charge')
+    expect(getTemplateById('bank_fees')!.keywords).not.toContain('stripe')
   })
 
   it('has shareholder_loan_received (AB, D:1930 K:2393)', () => {
@@ -544,5 +860,91 @@ describe('new and split templates', () => {
     const t = getTemplateById('representation_external')
     expect(t).toBeDefined()
     expect(t!.deductibility_note_sv).toContain('46 kr/person')
+  })
+})
+
+// ============================================================
+// applySettlementAccount: bank-leg routing for non-1930 accounts
+// ============================================================
+
+describe('applySettlementAccount (bank-leg routing)', () => {
+  it('routes the bank_interest_income debit leg to the transaction settlement account', () => {
+    const template = getTemplateById('bank_interest_income')
+    expect(template).toBeDefined()
+    const tx = makeTransaction({ amount: 50, currency: 'SEK' })
+    const base = buildMappingResultFromTemplate(template!, tx, 'enskild_firma')
+    // Template hardcodes 1930 as the bank leg.
+    expect(base.debit_account).toBe('1930')
+    expect(base.credit_account).toBe('8310')
+
+    // Interest that landed on a savings account mapped to 1931 must debit 1931,
+    // not 1930: otherwise the real bank transaction never reconciles.
+    const routed = applySettlementAccount(base, '1931')
+    expect(routed.debit_account).toBe('1931')
+    expect(routed.credit_account).toBe('8310')
+  })
+
+  it('routes the bank_fees credit leg to the transaction settlement account', () => {
+    const template = getTemplateById('bank_fees')
+    expect(template).toBeDefined()
+    const tx = makeTransaction({ amount: -29, currency: 'SEK' })
+    const base = buildMappingResultFromTemplate(template!, tx, 'enskild_firma')
+    expect(base.debit_account).toBe('6570')
+    expect(base.credit_account).toBe('1930')
+
+    const routed = applySettlementAccount(base, '1931')
+    expect(routed.debit_account).toBe('6570')
+    expect(routed.credit_account).toBe('1931')
+  })
+
+  it('is a no-op when the settlement account is 1930 (legacy/unresolved rows)', () => {
+    const template = getTemplateById('bank_interest_income')!
+    const tx = makeTransaction({ amount: 50, currency: 'SEK' })
+    const base = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+    const routed = applySettlementAccount(base, '1930')
+    expect(routed.debit_account).toBe('1930')
+    expect(routed.credit_account).toBe('8310')
+  })
+})
+
+// ============================================================
+// VAT registration: a non-registered company books no moms line
+// (lib/bookkeeping/vat-registration.ts)
+// ============================================================
+
+describe('buildMappingResultFromTemplate: VAT registration', () => {
+  it('a registered company (true, null or undefined) books the 25 % template exactly as before', () => {
+    const template = getTemplateById('it_saas_subscription')!
+    const tx = makeTransaction({ amount: -1250 })
+    const baseline = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
+    for (const flag of [true, null, undefined]) {
+      expect(buildMappingResultFromTemplate(template, tx, 'enskild_firma', flag)).toEqual(baseline)
+    }
+    expect(baseline.vat_lines).toEqual([
+      expect.objectContaining({ account_number: '2641', debit_amount: 250 }),
+    ])
+  })
+
+  it('a non-registered company books the 25 % template gross with no ingående moms', () => {
+    const template = getTemplateById('it_saas_subscription')!
+    const result = buildMappingResultFromTemplate(
+      template, makeTransaction({ amount: -1250 }), 'ideell_forening', false,
+    )
+    expect(result.template_id).toBe('it_saas_subscription')
+    expect(result.debit_account).toBe('5420')
+    expect(result.credit_account).toBe('1930')
+    expect(result.vat_lines).toEqual([])
+  })
+
+  it('keeps every reverse-charge leg for a non-registered company', () => {
+    const template = BOOKING_TEMPLATES.find(
+      (t) => t.vat_treatment === 'reverse_charge' && t.deductibility !== 'non_deductible' && !t.default_private,
+    )!
+    expect(template).toBeDefined()
+    const tx = makeTransaction({ amount: -1000 })
+    const registered = buildMappingResultFromTemplate(template, tx, 'aktiebolag')
+    const notRegistered = buildMappingResultFromTemplate(template, tx, 'aktiebolag', false)
+    expect(notRegistered.vat_lines).toEqual(registered.vat_lines)
+    expect(notRegistered.vat_lines.length).toBeGreaterThan(0)
   })
 })

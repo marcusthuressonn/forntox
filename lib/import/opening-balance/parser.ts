@@ -1,6 +1,11 @@
 import * as XLSX from 'xlsx'
+import { makeNotice, type ImportNotice } from '@/lib/import/notices'
+import { formatCurrency } from '@/lib/utils'
 import { detectColumns } from './column-detector'
 import { getBASReference } from '@/lib/bookkeeping/bas-reference'
+import { detectFileFormat } from '../bank-file/parser'
+import { decodeFileContent } from '../shared/encoding'
+import { readWorkbookFromBuffer } from '../shared/workbook-reader'
 import type {
   DetectedColumns,
   ParsedOpeningBalanceRow,
@@ -31,6 +36,25 @@ export function parseAmount(value: unknown): number {
 }
 
 /**
+ * When an opening-balance parse yields no rows, check whether the uploaded
+ * file is actually a bank statement (issue #918: users upload bank CSV
+ * exports here and only get a generic "no accounts found" error). Only CSV
+ * files can match: the bank-file detectors operate on decoded text, and the
+ * generic CSV fallback never auto-detects, so any match is a real bank format.
+ */
+function detectBankStatementFormat(buffer: ArrayBuffer, filename: string): string | null {
+  const ext = filename.toLowerCase().split('.').pop() ?? ''
+  if (ext !== 'csv') return null
+  try {
+    const content = decodeFileContent(buffer)
+    return detectFileFormat(content, filename)?.name ?? null
+  } catch {
+    // Detection is a best-effort hint: never let it break the parse result
+    return null
+  }
+}
+
+/**
  * Parse an opening balance file (Excel or CSV) and return structured rows
  * with validation and BAS account matching.
  *
@@ -43,7 +67,7 @@ export function parseOpeningBalanceFile(
   filename: string,
   columnOverrides?: DetectedColumns,
 ): OpeningBalanceParseResult {
-  const workbook = XLSX.read(buffer, { type: 'array' })
+  const workbook = readWorkbookFromBuffer(buffer, filename)
 
   // Pick the sheet with the most rows (heuristic for multi-sheet workbooks)
   let bestSheet = workbook.SheetNames[0]
@@ -86,6 +110,7 @@ export function parseOpeningBalanceFile(
       total_credit: 0,
       is_balanced: true,
       warnings: ['Filen innehåller för få rader.'],
+      detected_bank_format: detectBankStatementFormat(buffer, filename),
     }
   }
 
@@ -97,23 +122,27 @@ export function parseOpeningBalanceFile(
 
   const rows: ParsedOpeningBalanceRow[] = []
   const warnings: string[] = []
+  const notices: ImportNotice[] = []
   const seenAccounts = new Map<string, number>() // account_number → first row_index
 
   for (let i = 0; i < dataRows.length; i++) {
     const row = dataRows[i]
-    const rawAccountNumber = String(row[columns.account_number_col] || '').trim()
+    const rawAccountNumber = String(row[columns.account_number_col] || '')
+      .replace(/[ ​‌‍﻿]/g, '') // strip NBSP and zero-width chars
+      .trim()
 
     // Skip empty rows
     if (!rawAccountNumber) continue
 
-    // Clean account number (remove leading zeros, spaces, dashes)
-    const accountNumber = rawAccountNumber.replace(/[^0-9]/g, '')
+    // Clean account number: strip every non-digit (whitespace, dots, dashes, letters)
+    const accountNumber = rawAccountNumber.replace(/\D/g, '')
 
     // Skip non-4-digit account numbers (likely header/total rows)
     if (!/^\d{4}$/.test(accountNumber)) {
-      // Could be a summary/total row — skip silently unless it looked intentional
+      // Could be a summary/total row: skip silently unless it looked intentional
       if (rawAccountNumber.length > 0 && !/^(summa|total|sum|samman)/i.test(rawAccountNumber)) {
-        warnings.push(`Rad ${i + 2}: "${rawAccountNumber}" är inte ett giltigt kontonummer (4 siffror) — hoppades över`)
+        warnings.push(`Rad ${i + 2}: "${rawAccountNumber}" är inte ett giltigt kontonummer (4 siffror): hoppades över`)
+        notices.push(makeNotice('ob_invalid_account_row', 'notice', { row: i + 2, raw: rawAccountNumber }))
       }
       continue
     }
@@ -164,12 +193,13 @@ export function parseOpeningBalanceFile(
     // Warn on P&L accounts (class 3-8)
     const accountClass = parseInt(accountNumber.charAt(0), 10)
     if (accountClass >= 3 && accountClass <= 8) {
-      validationErrors.push(`Konto ${accountNumber} är ett resultatkonto (klass ${accountClass}) — ingående balanser ska normalt bara innehålla balanskonton (klass 1-2)`)
+      validationErrors.push(`Konto ${accountNumber} är ett resultatkonto (klass ${accountClass}): ingående balanser ska normalt bara innehålla balanskonton (klass 1-2)`)
     }
 
     // Track duplicates
     if (seenAccounts.has(accountNumber)) {
-      warnings.push(`Konto ${accountNumber} förekommer på flera rader — beloppen kommer summeras`)
+      warnings.push(`Konto ${accountNumber} förekommer på flera rader: beloppen kommer summeras`)
+      notices.push(makeNotice('ob_duplicate_account', 'notice', { account: accountNumber }))
     }
     seenAccounts.set(accountNumber, i + 2) // +2 for header row + 1-based
 
@@ -185,15 +215,29 @@ export function parseOpeningBalanceFile(
     })
   }
 
-  // Merge duplicate accounts
+  // Merge duplicate accounts: keyed on the already-normalized account_number.
+  // Union validation_errors across rows so a warning that fires on row 5 (e.g.
+  // BAS-class mismatch) isn't silently dropped because row 2 of the same
+  // account had no error. Suppressed validation issues on IB-feeding data
+  // would risk a misclassification propagating into the ledger.
   const mergedMap = new Map<string, ParsedOpeningBalanceRow>()
   for (const row of rows) {
     const existing = mergedMap.get(row.account_number)
     if (existing) {
       existing.debit_amount = Math.round((existing.debit_amount + row.debit_amount) * 100) / 100
       existing.credit_amount = Math.round((existing.credit_amount + row.credit_amount) * 100) / 100
+      if (!existing.account_name && row.account_name) {
+        existing.account_name = row.account_name
+      }
+      if (row.validation_errors?.length) {
+        const seen = new Set(existing.validation_errors)
+        for (const err of row.validation_errors) {
+          if (!seen.has(err)) existing.validation_errors.push(err)
+        }
+        existing.is_valid = existing.is_valid && row.is_valid
+      }
     } else {
-      mergedMap.set(row.account_number, { ...row })
+      mergedMap.set(row.account_number, { ...row, validation_errors: [...row.validation_errors] })
     }
   }
   const mergedRows = Array.from(mergedMap.values())
@@ -210,7 +254,14 @@ export function parseOpeningBalanceFile(
   const isBalanced = Math.abs(diff) < 0.01
 
   if (!isBalanced) {
-    warnings.push(`Debet (${totalDebit.toFixed(2)}) och kredit (${totalCredit.toFixed(2)}) balanserar inte — differens: ${diff.toFixed(2)} SEK`)
+    warnings.push(`Debet (${totalDebit.toFixed(2)}) och kredit (${totalCredit.toFixed(2)}) balanserar inte: differens: ${diff.toFixed(2)} SEK`)
+    notices.push(
+      makeNotice('ob_unbalanced', 'action', {
+        debit: formatCurrency(totalDebit, 'SEK', { minimumFractionDigits: 2 }),
+        credit: formatCurrency(totalCredit, 'SEK', { minimumFractionDigits: 2 }),
+        diff: formatCurrency(diff, 'SEK', { minimumFractionDigits: 2 }),
+      })
+    )
   }
 
   return {
@@ -225,5 +276,8 @@ export function parseOpeningBalanceFile(
     total_credit: totalCredit,
     is_balanced: isBalanced,
     warnings,
+    notices,
+    detected_bank_format:
+      mergedRows.length === 0 ? detectBankStatementFormat(buffer, filename) : null,
   }
 }

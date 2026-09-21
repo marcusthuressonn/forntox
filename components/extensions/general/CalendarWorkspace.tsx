@@ -2,10 +2,13 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
+import { guardBrowserWrite } from '@/lib/company/tab-guard'
 import { useToast } from '@/components/ui/use-toast'
 import { PaymentCalendar } from '@/extensions/general/calendar/components/PaymentCalendar'
+import type { DeadlineFormValues } from '@/components/deadlines/DeadlineForm'
 import type { WorkspaceComponentProps } from '@/lib/extensions/workspace-registry'
 import type { Invoice, Deadline } from '@/types'
+import { Skeleton } from '@/components/ui/skeleton'
 
 export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
   const [invoices, setInvoices] = useState<Invoice[]>([])
@@ -29,6 +32,7 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
       const { data: deadlinesData, error: deadlinesError } = await supabase
         .from('deadlines')
         .select('*, customer:customers(name)')
+        .is('dismissed_at', null)
         .order('due_date', { ascending: true })
 
       if (deadlinesError) throw deadlinesError
@@ -36,6 +40,7 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
       const { data: customersData, error: customersError } = await supabase
         .from('customers')
         .select('id, name')
+        .is('archived_at', null)
         .order('name', { ascending: true })
 
       if (customersError) throw customersError
@@ -45,8 +50,7 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
       setCustomers(customersData || [])
     } catch {
       toast({
-        title: 'Fel',
-        description: 'Kunde inte hamta data',
+        title: 'Kunde inte hämta data',
         variant: 'destructive',
       })
     } finally {
@@ -58,9 +62,10 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
     fetchData()
   }, [fetchData])
 
-  const handleDeadlineCreate = async (
-    data: Omit<Deadline, 'id' | 'user_id' | 'company_id' | 'created_at' | 'updated_at'>
-  ) => {
+  const handleDeadlineCreate = async (data: DeadlineFormValues) => {
+    // Cross-tab guard (WL-09): browser-direct Supabase write, outside the
+    // patched-fetch seam. The blocking dialog is the user feedback.
+    if (!guardBrowserWrite()) return
     try {
       const { error } = await supabase.from('deadlines').insert([data])
 
@@ -74,8 +79,7 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
       fetchData()
     } catch (error) {
       toast({
-        title: 'Fel',
-        description: 'Kunde inte skapa deadline',
+        title: 'Kunde inte skapa deadline',
         variant: 'destructive',
       })
       throw error
@@ -83,6 +87,7 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
   }
 
   const handleDeadlineToggle = async (deadline: Deadline) => {
+    if (!guardBrowserWrite()) return
     try {
       const { error } = await supabase
         .from('deadlines')
@@ -101,8 +106,7 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
       fetchData()
     } catch {
       toast({
-        title: 'Fel',
-        description: 'Kunde inte uppdatera deadline',
+        title: 'Kunde inte uppdatera deadline',
         variant: 'destructive',
       })
     }
@@ -110,9 +114,9 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
 
   if (isLoading) {
     return (
-      <div className="animate-pulse">
-        <div className="h-10 bg-muted rounded w-48 mb-4" />
-        <div className="h-96 bg-muted rounded" />
+      <div className="space-y-4">
+        <Skeleton className="h-10 w-48" />
+        <Skeleton className="h-96 w-full" />
       </div>
     )
   }

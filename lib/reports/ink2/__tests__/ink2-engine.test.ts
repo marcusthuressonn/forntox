@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import { INK2R_ACCOUNT_MAPPINGS, isAccountInMapping, checkBalanceWarning } from '../ink2-engine'
 import type { INK2RSRUCode } from '../types'
+import {
+  SIGN_RECLASSIFICATION_RULES,
+  type SignReclassificationId,
+} from '@/lib/reports/sign-reclassification'
 
 /**
  * Helper to find which SRU code an account maps to
@@ -47,9 +51,10 @@ describe('INK2R Account Mappings', () => {
       expect(findSRUCodeForAccount('1099')).toBe('7201')
     })
 
-    it('1080-1089 -> 7202 (Förskott immateriella)', () => {
-      expect(findSRUCodeForAccount('1080')).toBe('7202')
-      expect(findSRUCodeForAccount('1089')).toBe('7202')
+    it('1088 -> 7202 (Förskott immateriella); 1080-1087 and 1089 stay on 7201', () => {
+      expect(findSRUCodeForAccount('1088')).toBe('7202')
+      expect(findSRUCodeForAccount('1080')).toBe('7201')
+      expect(findSRUCodeForAccount('1089')).toBe('7201')
     })
 
     it('1100-1119, 1130-1179, 1190-1199 -> 7214 (Byggnader och mark)', () => {
@@ -75,15 +80,22 @@ describe('INK2R Account Mappings', () => {
       expect(findSRUCodeForAccount('1299')).toBe('7215')
     })
 
-    it('1500-1519 -> 7251 (Kundfordringar)', () => {
-      expect(findSRUCodeForAccount('1500')).toBe('7251')
+    it('151x-155x and 158x -> 7251 (Kundfordringar); 1500-1509 has no post', () => {
       expect(findSRUCodeForAccount('1510')).toBe('7251')
       expect(findSRUCodeForAccount('1519')).toBe('7251')
+      expect(findSRUCodeForAccount('1520')).toBe('7251')
+      expect(findSRUCodeForAccount('1559')).toBe('7251')
+      expect(findSRUCodeForAccount('1580')).toBe('7251')
+      expect(findSRUCodeForAccount('1500')).toBeNull()
     })
 
-    it('1520-1559 -> 7261 (Övriga fordringar, not 7251)', () => {
-      expect(findSRUCodeForAccount('1520')).toBe('7261')
-      expect(findSRUCodeForAccount('1550')).toBe('7261')
+    it('161x, 163x-165x, 168x-169x -> 7261 (Övriga fordringar)', () => {
+      expect(findSRUCodeForAccount('1610')).toBe('7261')
+      expect(findSRUCodeForAccount('1630')).toBe('7261')
+      expect(findSRUCodeForAccount('1650')).toBe('7261')
+      expect(findSRUCodeForAccount('1680')).toBe('7261')
+      expect(findSRUCodeForAccount('1573')).toBe('7261')
+      expect(findSRUCodeForAccount('1673')).toBe('7261')
     })
 
     it('1700-1799 -> 7263 (Förutbetalda kostnader)', () => {
@@ -141,7 +153,7 @@ describe('INK2R Account Mappings', () => {
     })
   })
 
-  describe('Income statement (per bas.se — CRITICAL: 5000-6999 ALL → 7513)', () => {
+  describe('Income statement (per bas.se: CRITICAL: 5000-6999 ALL → 7513)', () => {
     it('3000-3799 -> 7410 (Nettoomsättning)', () => {
       expect(findSRUCodeForAccount('3000')).toBe('7410')
       expect(findSRUCodeForAccount('3001')).toBe('7410')
@@ -184,8 +196,19 @@ describe('INK2R Account Mappings', () => {
       expect(findSRUCodeForAccount('7899')).toBe('7515')
     })
 
-    it('7700-7799 -> 7516 (Nedskrivningar OT)', () => {
-      expect(findSRUCodeForAccount('7700')).toBe('7516')
+    it('7700-7739, 7750-7789 -> 7515 (nedskrivningar AT + återföringar)', () => {
+      expect(findSRUCodeForAccount('7700')).toBe('7515')
+      expect(findSRUCodeForAccount('7710')).toBe('7515')
+      expect(findSRUCodeForAccount('7733')).toBe('7515')
+      expect(findSRUCodeForAccount('7750')).toBe('7515')
+      expect(findSRUCodeForAccount('7770')).toBe('7515')
+      expect(findSRUCodeForAccount('7789')).toBe('7515')
+    })
+
+    it('7740-7749, 7790-7799 -> 7516 (Nedskrivningar OT)', () => {
+      expect(findSRUCodeForAccount('7740')).toBe('7516')
+      expect(findSRUCodeForAccount('7749')).toBe('7516')
+      expect(findSRUCodeForAccount('7790')).toBe('7516')
       expect(findSRUCodeForAccount('7799')).toBe('7516')
     })
 
@@ -208,25 +231,53 @@ describe('INK2R Account Mappings', () => {
       expect(findSRUCodeForAccount('8900')).toBe('7528')
       expect(findSRUCodeForAccount('8910')).toBe('7528')
     })
+
+    describe('bokslutsdispositioner (BAS 2020-aligned)', () => {
+      // These mappings were corrected when the Phase 2 bokslut calculators
+      // landed: the previous ranges (8810/8830/8840) targeted accounts that
+      // BAS doesn't seed. Locking the corrected mapping prevents regression.
+      it('8811 -> 7525 (Avsättning till periodiseringsfond)', () => {
+        expect(findSRUCodeForAccount('8811')).toBe('7525')
+      })
+      it('8819 -> 7420 (Återföring av periodiseringsfond)', () => {
+        expect(findSRUCodeForAccount('8819')).toBe('7420')
+      })
+      it('8820 -> 7419 (Mottagna koncernbidrag)', () => {
+        expect(findSRUCodeForAccount('8820')).toBe('7419')
+      })
+      it('8830 -> 7524 (Lämnade koncernbidrag)', () => {
+        expect(findSRUCodeForAccount('8830')).toBe('7524')
+      })
+      it('8850-8859 -> 7421 (Förändring av överavskrivningar)', () => {
+        expect(findSRUCodeForAccount('8850')).toBe('7421')
+        expect(findSRUCodeForAccount('8853')).toBe('7421') // M&I sub-cat
+        expect(findSRUCodeForAccount('8859')).toBe('7421')
+      })
+      it('8840 + 8860-8899 -> 7422 (Övriga bokslutsdispositioner)', () => {
+        expect(findSRUCodeForAccount('8840')).toBe('7422')
+        expect(findSRUCodeForAccount('8860')).toBe('7422')
+        expect(findSRUCodeForAccount('8899')).toBe('7422')
+      })
+    })
   })
 
   describe('no overlap between mappings', () => {
     it('representative boundary accounts match exactly one mapping', () => {
       const testAccounts = [
-        '1079', '1080', // 7201/7202 boundary
-        '1089', '1090', // 7202/7201 boundary
+        '1087', '1088', // 7201/7202 boundary
+        '1088', '1089', // 7202/7201 boundary
         '1099', '1100', // 7201/7214 boundary
         '1119', '1120', // 7214/7216 boundary
         '1129', '1130', // 7216/7214 boundary
         '1199', '1200', // 7214/7215 boundary
         '1299', '1311', // 7215/7230 boundary
-        '1519', '1520', // 7251/7261 boundary
-        '1559', '1560', // 7261/7252 boundary
+        '1589', '1610', // 7251/7261 boundary
+        '1559', '1560', // 7251/7252 boundary
         '1930', '1999', // 7281 bank accounts
         '2089', '2090', // 7301/7302 boundary
         '2099', '2110', // 7302/7321 boundary
-        '2439', '2440', // 7361/7365 boundary
-        '2449', '2450', // 7365/7363 boundary
+        '2439', '2440', // 7363/7365 boundary
+        '2449', '2450', // 7365/7364 boundary
         '2499', '2500', // 7369/7368 boundary
         '2599', '2600', // 7368/7369 boundary
         '2899', '2900', // 7369/7370 boundary
@@ -326,5 +377,37 @@ describe('checkBalanceWarning', () => {
     expect(warning).toContain('100000')
     expect(warning).toContain('100005')
     expect(warning).toContain('5')
+  })
+})
+
+describe('INK2R mapping table invariants', () => {
+  it('declares exactly one mapping per SRU code', () => {
+    // The engine indexes mappings by sruCode to re-orient reclassified
+    // accounts under their new post; a duplicate would silently drop one.
+    const seen = new Map<string, number>()
+    for (const mapping of INK2R_ACCOUNT_MAPPINGS) {
+      seen.set(mapping.sruCode, (seen.get(mapping.sruCode) ?? 0) + 1)
+    }
+    const duplicates = [...seen.entries()].filter(([, count]) => count > 1)
+    expect(duplicates).toEqual([])
+  })
+
+  it('routes every sign-reclassification rule out of the post its range maps to', () => {
+    // Pins lib/reports/sign-reclassification.ts against the mapping table: if
+    // a range moves to another SRU code, the reclassification would try to
+    // relocate accounts that are not in the source post.
+    const expectedSource: Record<SignReclassificationId, string> = {
+      tax_account_credit_to_liability: '7261',
+      tax_liability_debit_to_receivable: '7368',
+      vat_liability_debit_to_receivable: '7369',
+    }
+
+    for (const rule of SIGN_RECLASSIFICATION_RULES) {
+      for (const range of rule.ranges) {
+        for (const account of [range.start, range.end]) {
+          expect(findSRUCodeForAccount(account)).toBe(expectedSource[rule.id])
+        }
+      }
+    }
   })
 })

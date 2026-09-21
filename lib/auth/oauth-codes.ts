@@ -5,7 +5,7 @@ import crypto from 'crypto'
  * The auth code is an AES-256-GCM encrypted JSON payload containing
  * the user ID, PKCE code_challenge, and expiry.
  *
- * The API key is NOT embedded — it gets created at token exchange
+ * The API key is NOT embedded: it gets created at token exchange
  * after PKCE verification, preventing orphaned keys.
  */
 
@@ -22,6 +22,20 @@ export interface AuthCodePayload {
   userId: string
   codeChallenge: string
   redirectUri: string
+  /**
+   * Scopes the user consented to grant the resulting API key. Undefined on
+   * codes minted before this field was added: the token endpoint falls back
+   * to ALL_SCOPES so existing Claude flows are unaffected.
+   */
+  scopes?: string[]
+  /**
+   * Company shown on the consent page and used to cap `scopes` to the user's
+   * role there. The token route binds the key to it and re-checks the role
+   * cap against it. Null for an account with no company yet (issue #1814);
+   * undefined on codes minted before the field existed, where the token
+   * route falls back to resolving the active company itself.
+   */
+  companyId?: string | null
   exp: number
 }
 

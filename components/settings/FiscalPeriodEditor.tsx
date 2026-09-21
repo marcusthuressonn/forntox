@@ -1,22 +1,27 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useTranslations } from 'next-intl'
 import { useCompany } from '@/contexts/CompanyContext'
+import { useFiscalPeriods } from '@/lib/reference-data/hooks'
+import { invalidateReferenceData } from '@/lib/reference-data/invalidate'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { useToast } from '@/components/ui/use-toast'
 import {
   DestructiveConfirmDialog,
   useDestructiveConfirm,
 } from '@/components/ui/destructive-confirm-dialog'
-import { Loader2, Info, Lock } from 'lucide-react'
+import { Loader2, Lock } from 'lucide-react'
 import { parseDateParts } from '@/lib/bookkeeping/validate-period-duration'
+import { validateFirstPeriod } from '@/components/bookkeeping/FiscalPeriodDateFields'
 import {
-  FiscalPeriodDateFields,
-  validateFirstPeriod,
-} from '@/components/bookkeeping/FiscalPeriodDateFields'
+  SettingsGroup,
+  SettingsInput,
+  SettingsRow,
+  SettingsRowNote,
+} from '@/components/settings/SettingsRows'
 import type { FiscalPeriod } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 function formatSwedishDate(dateStr: string): string {
   const months = [
@@ -34,6 +39,7 @@ function isCalendarYear(period: { period_start: string; period_end: string }): b
 }
 
 export function FiscalPeriodEditor() {
+  const t = useTranslations('settings_company')
   const { company, role } = useCompany()
   const { toast } = useToast()
   const { dialogProps, confirm } = useDestructiveConfirm()
@@ -50,17 +56,29 @@ export function FiscalPeriodEditor() {
   const isEF = company?.entity_type === 'enskild_firma'
   const canEdit = role === 'owner' || role === 'admin'
 
+  // Periods come from the session cache (lib/reference-data). The editor
+  // snapshots the FIRST period once per company (a background revalidation
+  // must not reset the dates the user is editing), then loads that period's
+  // posted-entry count, which is what gates editing.
+  const { periods, isLoading: periodsLoading, error: periodsError } = useFiscalPeriods()
+  const periodsRef = useRef(periods)
   useEffect(() => {
-    if (!company) return
+    periodsRef.current = periods
+  }, [periods])
+  const initialisedForRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (!company || periodsLoading) return
+    if (initialisedForRef.current === company.id) return
+    initialisedForRef.current = company.id
     let cancelled = false
 
     async function load() {
       setIsLoading(true)
       setLoadError(null)
       try {
-        const res = await fetch('/api/bookkeeping/fiscal-periods')
-        if (!res.ok) throw new Error('Kunde inte hämta räkenskapsår')
-        const { data } = (await res.json()) as { data: FiscalPeriod[] }
+        if (periodsError) throw new Error(t('fp_load_error_periods'))
+        const data = periodsRef.current
         if (!data || data.length === 0) {
           if (!cancelled) {
             setPeriod(null)
@@ -72,7 +90,7 @@ export function FiscalPeriodEditor() {
         const first = sorted[0]
 
         const countRes = await fetch(`/api/bookkeeping/fiscal-periods/${first.id}/entry-count`)
-        if (!countRes.ok) throw new Error('Kunde inte hämta verifikationsantal')
+        if (!countRes.ok) throw new Error(t('fp_load_error_entry_count'))
         const { data: countData } = (await countRes.json()) as { data: { posted_count: number } }
 
         if (cancelled) return
@@ -82,7 +100,7 @@ export function FiscalPeriodEditor() {
         setEndDate(first.period_end)
       } catch (err) {
         if (!cancelled) {
-          setLoadError(err instanceof Error ? err.message : 'Okänt fel')
+          setLoadError(err instanceof Error ? getUserErrorMessage(err) : t('fp_load_error_unknown'))
         }
       } finally {
         if (!cancelled) setIsLoading(false)
@@ -93,7 +111,7 @@ export function FiscalPeriodEditor() {
     return () => {
       cancelled = true
     }
-  }, [company])
+  }, [company, periodsLoading, periodsError, t])
 
   const validation = validateFirstPeriod(
     startDate,
@@ -114,10 +132,15 @@ export function FiscalPeriodEditor() {
     if (!isDirty) return
 
     const ok = await confirm({
-      title: 'Ändra första räkenskapsåret?',
-      description: `Detta ändrar ditt första räkenskapsår från ${formatSwedishDate(period.period_start)} – ${formatSwedishDate(period.period_end)} till ${formatSwedishDate(startDate)} – ${formatSwedishDate(endDate)}. Ändringen är bara tillåten eftersom inga verifikationer är bokförda ännu. Fortsätt?`,
-      confirmLabel: 'Ja, ändra räkenskapsår',
-      cancelLabel: 'Avbryt',
+      title: t('fp_confirm_title'),
+      description: t('fp_confirm_description', {
+        oldStart: formatSwedishDate(period.period_start),
+        oldEnd: formatSwedishDate(period.period_end),
+        newStart: formatSwedishDate(startDate),
+        newEnd: formatSwedishDate(endDate),
+      }),
+      confirmLabel: t('fp_confirm_yes'),
+      cancelLabel: t('fp_confirm_cancel'),
       variant: 'warning',
     })
     if (!ok) return
@@ -128,8 +151,8 @@ export function FiscalPeriodEditor() {
       const endYear = parseDateParts(endDate).year
       const newName =
         startYear === endYear
-          ? `Räkenskapsår ${startYear}`
-          : `Räkenskapsår ${startYear}/${endYear}`
+          ? t('fp_year_label_single', { year: startYear })
+          : t('fp_year_label_range', { startYear, endYear })
       const res = await fetch(`/api/bookkeeping/fiscal-periods/${period.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -141,17 +164,19 @@ export function FiscalPeriodEditor() {
       })
       const body = await res.json().catch(() => ({}))
       if (!res.ok) {
-        throw new Error(body.error || 'Kunde inte ändra räkenskapsår')
+        throw new Error(body.error || t('fp_update_failed_title'))
       }
       setPeriod(body.data as FiscalPeriod)
+      // Every picker reads the shared list: refresh it with the new dates.
+      void invalidateReferenceData('ref:fiscal-periods')
       toast({
-        title: 'Räkenskapsår uppdaterat',
-        description: `${formatSwedishDate(body.data.period_start)} – ${formatSwedishDate(body.data.period_end)}`,
+        title: t('fp_updated_title'),
+        description: `${formatSwedishDate(body.data.period_start)}: ${formatSwedishDate(body.data.period_end)}`,
       })
     } catch (err) {
       toast({
-        title: 'Kunde inte ändra räkenskapsår',
-        description: err instanceof Error ? err.message : 'Försök igen.',
+        title: t('fp_update_failed_title'),
+        description: err instanceof Error ? getUserErrorMessage(err) : t('fp_try_again'),
         variant: 'destructive',
       })
     } finally {
@@ -167,76 +192,83 @@ export function FiscalPeriodEditor() {
 
   return (
     <>
-      <section className="space-y-4 border-t border-border/8 pt-8">
-        <div className="space-y-1">
-          <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-            Första räkenskapsår
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Om du valde fel räkenskapsår vid uppstart kan du justera det här — så länge du inte har bokfört någon verifikation ännu.
-          </p>
-        </div>
-
+      <SettingsGroup label={t('fp_heading')} help={t('fp_intro')}>
         {isLoading ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <div className="flex items-center gap-2 px-1 py-3 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
-            Hämtar räkenskapsår...
+            {t('fp_loading')}
           </div>
         ) : loadError ? (
-          <p className="text-sm text-destructive">{loadError}</p>
+          <p className="px-1 py-3 text-sm text-destructive">{loadError}</p>
         ) : !period ? (
-          <p className="text-sm text-muted-foreground">Inget räkenskapsår hittades.</p>
+          <p className="px-1 py-3 text-sm text-muted-foreground">{t('fp_none')}</p>
         ) : isBlocked ? (
-          <BlockedState
-            period={period}
-            postedCount={postedCount ?? 0}
-          />
+          <BlockedRow period={period} postedCount={postedCount ?? 0} />
         ) : (
-          <div className="space-y-4">
-            <div className="rounded-lg border border-warning/20 bg-warning/5 p-3 text-sm flex gap-2">
-              <Info className="h-4 w-4 text-warning flex-shrink-0 mt-0.5" />
-              <div className="space-y-1">
-                <p className="font-medium">Ändra med omsorg.</p>
-                <p className="text-muted-foreground">
-                  Ändringen påverkar öppningsbalanser och rapporter.
-                  {isEF && ' Enskild firma måste använda kalenderår enligt BFL 3 kap.'}
-                </p>
-              </div>
-            </div>
+          <>
+            {/* Consequential warning: stays visible as one quiet ochre sentence. */}
+            <p className="px-1 py-3 text-[12.5px] text-attn">
+              {t('fp_warning_title')} {t('fp_warning_body')}
+              {isEF ? t('fp_warning_ef_suffix') : null}
+            </p>
 
-            <FiscalPeriodDateFields
-              startDate={startDate}
-              onStartDateChange={setStartDate}
-              endDate={endDate}
-              entityType={company?.entity_type}
-              summaryTitle="Föreslaget räkenskapsår"
-              endDateSlot={
-                <div className="space-y-2">
-                  <Label htmlFor="fp_end">Slutdatum</Label>
-                  <Input
-                    id="fp_end"
-                    type="date"
-                    value={endDate}
-                    onChange={(e) => setEndDate(e.target.value)}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Måste vara sista dagen i en månad.
-                  </p>
-                </div>
-              }
-            />
+            <SettingsRow
+              label={t('fp_start_date_label')}
+              htmlFor="fiscal-period-start"
+              help={t('fp_start_date_help')}
+              align="baseline"
+            >
+              <SettingsInput
+                id="fiscal-period-start"
+                type="date"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                className="max-w-44 flex-none tabular-nums"
+              />
+            </SettingsRow>
 
-            <div className="flex justify-end gap-2">
+            <SettingsRow
+              label={t('fp_end_date_label')}
+              htmlFor="fp_end"
+              help={t('fp_end_date_help')}
+              align="baseline"
+            >
+              <SettingsInput
+                id="fp_end"
+                type="date"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                className="max-w-44 flex-none tabular-nums"
+              />
+            </SettingsRow>
+
+            {validation.canSummarise && (
+              <p className="px-1 pt-3 text-xs text-muted-foreground">
+                {t('fp_summary_title')}:{' '}
+                <span className="tabular-nums">
+                  {t('fp_range', { start: formatSwedishDate(startDate), end: formatSwedishDate(endDate) })}
+                </span>
+                {validation.months !== null && <> · {t('fp_months', { count: validation.months })}</>}
+              </p>
+            )}
+            {validation.error && (
+              <p className="px-1 pt-1 text-xs text-destructive">{validation.error}</p>
+            )}
+
+            <div className="flex justify-end gap-2 px-1 pt-3">
               <Button
                 type="button"
                 variant="outline"
+                size="sm"
                 onClick={handleReset}
                 disabled={!isDirty || isSaving}
+                className="text-muted-foreground hover:text-foreground"
               >
-                Återställ
+                {t('fp_reset')}
               </Button>
               <Button
                 type="button"
+                size="sm"
                 onClick={handleSave}
                 disabled={
                   !isDirty ||
@@ -249,56 +281,57 @@ export function FiscalPeriodEditor() {
                 {isSaving ? (
                   <>
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Sparar...
+                    {t('fp_saving')}
                   </>
                 ) : (
-                  'Spara ändring'
+                  t('fp_save')
                 )}
               </Button>
             </div>
-          </div>
+          </>
         )}
-      </section>
+      </SettingsGroup>
       <DestructiveConfirmDialog {...dialogProps} />
     </>
   )
 }
 
-function BlockedState({
+function BlockedRow({
   period,
   postedCount,
 }: {
   period: FiscalPeriod
   postedCount: number
 }) {
+  const t = useTranslations('settings_company')
   const reason = period.locked_at
-    ? 'Räkenskapsåret är låst.'
+    ? t('fp_blocked_reason_locked')
     : period.is_closed
-      ? 'Räkenskapsåret är stängt.'
-      : `${postedCount} bokförd${postedCount === 1 ? '' : 'a'} verifikation${postedCount === 1 ? '' : 'er'} finns redan i perioden.`
+      ? t('fp_blocked_reason_closed')
+      : t('fp_blocked_reason_posted', { count: postedCount })
 
   return (
-    <div className="rounded-lg border border-border/60 bg-muted/30 p-4 space-y-3">
-      <div className="flex gap-2">
-        <Lock className="h-4 w-4 text-muted-foreground flex-shrink-0 mt-0.5" />
-        <div className="space-y-1">
-          <p className="text-sm font-medium">Räkenskapsåret kan inte längre ändras</p>
-          <p className="text-sm text-muted-foreground">{reason}</p>
-        </div>
-      </div>
-      <div className="text-sm text-muted-foreground space-y-1">
-        <p>
-          Nuvarande period:{' '}
-          <span className="font-medium text-foreground">
-            {formatSwedishDate(period.period_start)} &ndash; {formatSwedishDate(period.period_end)}
-          </span>
-          {isCalendarYear(period) ? ' (kalenderår)' : ' (brutet räkenskapsår)'}
-        </p>
-        <p>
-          Om du måste börja om kan du radera företaget längst ner på sidan och skapa ett nytt.
-          Bokföringsdata behålls i 7 år enligt BFL 7 kap. 2§.
-        </p>
-      </div>
-    </div>
+    <SettingsRow
+      // The key carries a trailing colon from its old inline usage; strip it
+      // for the micro-label position.
+      label={t('fp_blocked_first_year').replace(/:$/, '')}
+      help={
+        <>
+          <p>
+            {t('fp_blocked_title')}. {reason}
+          </p>
+          <p className="mt-2">{t('fp_blocked_explainer')}</p>
+        </>
+      }
+      borderless
+    >
+      <Lock aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      <span className="tabular-nums">
+        {t('fp_range', { start: formatSwedishDate(period.period_start), end: formatSwedishDate(period.period_end) })}
+      </span>
+      <SettingsRowNote>
+        {(isCalendarYear(period) ? t('fp_blocked_calendar_year') : t('fp_blocked_broken_year')).trim()}
+      </SettingsRowNote>
+    </SettingsRow>
   )
 }

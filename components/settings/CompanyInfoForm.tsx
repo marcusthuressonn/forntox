@@ -1,7 +1,11 @@
 'use client'
 
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
+import { useTranslations } from 'next-intl'
+import {
+  SettingsGroup,
+  SettingsInput,
+  SettingsRow,
+} from '@/components/settings/SettingsRows'
 import type { CompanySettings } from '@/types'
 
 interface CompanyInfoFormProps {
@@ -9,109 +13,77 @@ interface CompanyInfoFormProps {
 }
 
 export function CompanyInfoForm({ settings }: CompanyInfoFormProps) {
+  const t = useTranslations('settings_company')
+  const orgLocked = settings.onboarding_complete === true
   return (
-    <section className="space-y-4">
-      <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-        Företagsuppgifter
-      </h2>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div className="space-y-2">
-          <Label htmlFor="company_name">Företagsnamn</Label>
-          <Input
-            id="company_name"
-            name="company_name"
-            defaultValue={settings.company_name || ''}
-            disabled={settings.onboarding_complete === true}
-          />
-          {settings.onboarding_complete && (
-            <p className="text-xs text-muted-foreground">Kan inte ändras efter att kontot skapats</p>
-          )}
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="trade_name">Handelsnamn</Label>
-          <Input
-            id="trade_name"
-            name="trade_name"
-            defaultValue={settings.trade_name || ''}
-            placeholder="Visas på fakturor istället för företagsnamnet"
-          />
-          <p className="text-xs text-muted-foreground">
-            Valfritt. Visas som huvudnamn på fakturor och e-post, med det juridiska namnet i parentes.
-          </p>
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="org_number">Organisationsnummer</Label>
-          <Input
-            id="org_number"
-            name="org_number"
-            defaultValue={settings.org_number || ''}
-            disabled={settings.onboarding_complete === true}
-          />
-          {settings.onboarding_complete && (
-            <p className="text-xs text-muted-foreground">Kan inte ändras efter att kontot skapats</p>
-          )}
-        </div>
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor="address_line1">Adress</Label>
-        <Input
+    <SettingsGroup label={t('company_info_heading')}>
+      <SettingsRow
+        label={t('company_name_label')}
+        htmlFor="company_name"
+        help={t('company_name_help')}
+        align="baseline"
+      >
+        <SettingsInput
+          id="company_name"
+          name="company_name"
+          defaultValue={settings.company_name || ''}
+        />
+      </SettingsRow>
+      <SettingsRow
+        label={t('org_number_label')}
+        htmlFor="org_number"
+        help={orgLocked ? t('org_number_locked') : undefined}
+        align="baseline"
+      >
+        <SettingsInput
+          id="org_number"
+          name="org_number"
+          defaultValue={settings.org_number || ''}
+          disabled={orgLocked}
+        />
+      </SettingsRow>
+      <SettingsRow label={t('address_label')} htmlFor="address_line1" align="baseline">
+        <SettingsInput
           id="address_line1"
           name="address_line1"
           defaultValue={settings.address_line1 || ''}
         />
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div className="space-y-2">
-          <Label htmlFor="postal_code">Postnummer</Label>
-          <Input
-            id="postal_code"
-            name="postal_code"
-            defaultValue={settings.postal_code || ''}
-          />
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="city">Ort</Label>
-          <Input
-            id="city"
-            name="city"
-            defaultValue={settings.city || ''}
-          />
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div className="space-y-2">
-          <Label htmlFor="phone">Telefon</Label>
-          <Input
-            id="phone"
-            name="phone"
-            type="tel"
-            defaultValue={settings.phone || ''}
-          />
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="email">E-post</Label>
-          <Input
-            id="email"
-            name="email"
-            type="email"
-            defaultValue={settings.email || ''}
-          />
-        </div>
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor="website">Webbplats</Label>
-        <Input
+      </SettingsRow>
+      <SettingsRow label={t('postal_code_label')} htmlFor="postal_code" align="baseline">
+        <SettingsInput
+          id="postal_code"
+          name="postal_code"
+          defaultValue={settings.postal_code || ''}
+          className="max-w-24 flex-none"
+        />
+      </SettingsRow>
+      <SettingsRow label={t('city_label')} htmlFor="city" align="baseline">
+        <SettingsInput id="city" name="city" defaultValue={settings.city || ''} />
+      </SettingsRow>
+      <SettingsRow label={t('phone_label')} htmlFor="phone" align="baseline">
+        <SettingsInput
+          id="phone"
+          name="phone"
+          type="tel"
+          defaultValue={settings.phone || ''}
+        />
+      </SettingsRow>
+      <SettingsRow label={t('email_label')} htmlFor="email" align="baseline">
+        <SettingsInput
+          id="email"
+          name="email"
+          type="email"
+          defaultValue={settings.email || ''}
+        />
+      </SettingsRow>
+      <SettingsRow label={t('website_label')} htmlFor="website" align="baseline">
+        <SettingsInput
           id="website"
           name="website"
           defaultValue={settings.website || ''}
           placeholder="https://"
         />
-      </div>
-    </section>
+      </SettingsRow>
+    </SettingsGroup>
   )
 }

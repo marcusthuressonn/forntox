@@ -10,6 +10,7 @@
  * Reference: https://sie.se/format/
  */
 
+import { monthsBetween } from '@/lib/bookkeeping/validate-period-duration'
 import type {
   SIEType,
   SIEEncoding,
@@ -18,13 +19,15 @@ import type {
   SIEBalance,
   SIEVoucher,
   SIETransactionLine,
+  SIEDimension,
+  SIEDimensionValue,
   ParsedSIEFile,
   ParseIssue,
   ParseIssueSeverity,
   ValidationResult,
 } from './types'
 
-// CP437 to UTF-8 mapping — full 0x80-0x9F range
+// CP437 to UTF-8 mapping: full 0x80-0x9F range
 // CP437 was the standard encoding for DOS/early Windows (used by SIE #FORMAT PC8)
 const CP437_MAP: Record<number, string> = {
   // 0x80-0x8F
@@ -85,6 +88,10 @@ const WIN1252_SWEDISH_BYTES = new Set([
  *    so presence in one range rules out the other.
  * 4. UTF-8 multi-byte sequences (0xC3 + continuation) are detected with proper
  *    skipping of continuation bytes to avoid false CP437 counts.
+ *
+ * Scans the entire buffer (not a sample): SIE files are capped at 50 MB and
+ * Swedish characters often only appear deep in voucher descriptions, well past
+ * any small header sample.
  */
 export function detectEncoding(buffer: ArrayBuffer): SIEEncoding {
   const bytes = new Uint8Array(buffer)
@@ -99,19 +106,17 @@ export function detectEncoding(buffer: ArrayBuffer): SIEEncoding {
   // (Fortnox, Bokio, Dooer etc. export UTF-8 with #FORMAT PC8).
   // Instead, we detect encoding from actual byte patterns.
 
-  // Scan sample for encoding-specific byte ranges
-  const sampleSize = Math.min(bytes.length, 4000)
   let cp437Count = 0   // Swedish chars in 0x80-0x9F (CP437 range)
   let utf8Count = 0     // Valid UTF-8 multi-byte Swedish sequences
   let win1252Count = 0  // Swedish chars in 0xC0-0xFF (Win-1252 range)
 
-  for (let i = 0; i < sampleSize; i++) {
+  for (let i = 0; i < bytes.length; i++) {
     const byte = bytes[i]
 
     // Check for UTF-8 multi-byte sequences for Swedish chars FIRST
     // to avoid false CP437/Win-1252 counts from continuation bytes.
     // Ä = C3 84, Å = C3 85, Ö = C3 96, ä = C3 A4, å = C3 A5, ö = C3 B6, é = C3 A9
-    if (byte === 0xc3 && i + 1 < sampleSize) {
+    if (byte === 0xc3 && i + 1 < bytes.length) {
       const nextByte = bytes[i + 1]
       if ([0x84, 0x85, 0x96, 0xa4, 0xa5, 0xb6, 0xa9].includes(nextByte)) {
         utf8Count++
@@ -135,14 +140,34 @@ export function detectEncoding(buffer: ArrayBuffer): SIEEncoding {
   if (cp437Count > win1252Count) return 'cp437'
   if (win1252Count > 0) return 'windows1252'
 
-  // Pure ASCII (no high bytes) — UTF-8 is a superset of ASCII
+  // Pure ASCII (no high bytes): UTF-8 is a superset of ASCII
   return 'utf8'
 }
 
 /**
- * Decode a buffer to string using the specified encoding
+ * Decode a buffer to string using the specified encoding.
+ *
+ * After decoding, validates the result for U+FFFD replacement characters
+ * (which signal that the chosen encoding was wrong). When found, retries
+ * with each alternate encoding and returns the first result without U+FFFD.
+ * This guards against `detectEncoding` heuristic misses on files where
+ * Swedish characters are rare or absent in the bytes the detector looked at.
  */
 export function decodeBuffer(buffer: ArrayBuffer, encoding: SIEEncoding): string {
+  const primary = decodeBufferRaw(buffer, encoding)
+  if (!primary.includes('\uFFFD')) return primary
+
+  const alternates: SIEEncoding[] = (['utf8', 'windows1252', 'cp437'] as const).filter(
+    (e) => e !== encoding
+  )
+  for (const alt of alternates) {
+    const candidate = decodeBufferRaw(buffer, alt)
+    if (!candidate.includes('\uFFFD')) return candidate
+  }
+  return primary
+}
+
+function decodeBufferRaw(buffer: ArrayBuffer, encoding: SIEEncoding): string {
   if (encoding === 'utf8') {
     const decoder = new TextDecoder('utf-8')
     return decoder.decode(buffer)
@@ -240,7 +265,9 @@ function parseStringField(field: string): string {
 
   // Remove surrounding quotes if present
   if (field.startsWith('"') && field.endsWith('"')) {
-    return field.slice(1, -1).replace(/\\"/g, '"')
+    // `\"` is a literal quote and `\\` a literal backslash (what the export
+    // in lib/reports/sie-export.ts writes).
+    return field.slice(1, -1).replace(/\\(["\\])/g, '$1')
   }
 
   return field
@@ -300,7 +327,10 @@ function splitSIELine(line: string): string[] {
       continue
     }
 
-    if (char === ' ' && !inQuotes && braceDepth === 0) {
+    // SIE 4 spec allows either space or tab as field separator (programs like
+    // Bollbok export tab-separated lines). Quoted strings and brace-bounded
+    // dimension lists preserve any interior whitespace via the guards above.
+    if ((char === ' ' || char === '\t') && !inQuotes && braceDepth === 0) {
       if (current) {
         fields.push(current)
         current = ''
@@ -319,6 +349,41 @@ function splitSIELine(line: string): string[] {
 }
 
 /**
+ * Parse a #TRANS object list (`{1 "KS01" 6 "P001"}`) into an SIE dim
+ * number → object code map. The list arrives as ONE field thanks to the
+ * brace-aware splitter; the inner content is itself space-separated with
+ * SIE quoting, so it re-runs through splitSIELine. Returns undefined for an
+ * empty list ({}), malformed pairs are skipped with a warning issue.
+ */
+function parseObjectList(
+  raw: string,
+  issues: ParseIssue[],
+  lineNum: number
+): Record<string, string> | undefined {
+  const inner = raw.replace(/^\{/, '').replace(/\}$/, '').trim()
+  if (!inner) return undefined
+
+  const parts = splitSIELine(inner)
+  if (parts.length % 2 !== 0) {
+    addIssue(issues, 'warning', lineNum, `Objektlista med udda antal fält ignoreras delvis: ${raw}`, 'TRANS')
+  }
+
+  const dims: Record<string, string> = {}
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const dimNoRaw = parseStringField(parts[i])
+    const code = parseStringField(parts[i + 1]).trim()
+    const dimNo = parseInt(dimNoRaw, 10)
+    if (isNaN(dimNo) || dimNo < 1 || !code) {
+      addIssue(issues, 'warning', lineNum, `Ogiltigt objektpar i objektlista: ${dimNoRaw} ${code}`, 'TRANS')
+      continue
+    }
+    // Canonical numeric key ('01' → '1'): matches normalizeLineDimensions.
+    dims[String(dimNo)] = code
+  }
+  return Object.keys(dims).length > 0 ? dims : undefined
+}
+
+/**
  * Add an issue to the issues list
  */
 function addIssue(
@@ -326,9 +391,108 @@ function addIssue(
   severity: ParseIssueSeverity,
   line: number,
   message: string,
-  tag?: string
+  tag?: string,
+  details?: Pick<ParseIssue, 'code' | 'account' | 'yearIndex'>
 ): void {
-  issues.push({ severity, line, message, tag })
+  issues.push({ severity, line, message, tag, ...details })
+}
+
+/** Keep preview tolerant without turning damaged financial records into zero. */
+function parseAmountField(
+  field: string | undefined,
+  tag: string,
+  issues: ParseIssue[],
+  line: number,
+  account: string,
+  yearIndex?: number
+): number | null {
+  const cleaned = parseStringField(field ?? '').trim().replace(',', '.')
+  // Preserve quoted values, comma decimals and the numeric forms already
+  // accepted by the parser, but require the entire token and a finite value.
+  const amount = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(cleaned) ? Number(cleaned) : NaN
+  if (!Number.isFinite(amount)) {
+    const message = cleaned ? `Ogiltigt belopp i #${tag}: raden hoppas över` : `Belopp saknas i #${tag}: raden hoppas över`
+    addIssue(issues, 'warning', line, message, tag, { code: 'invalid_amount', account, yearIndex })
+    return null
+  }
+  return amount
+}
+
+/**
+ * Parse the fields of a #TRANS / #RTRANS / #BTRANS record (identical layout):
+ *   #TAG accountNumber {objectList} amount [date] [description] [quantity] [signature]
+ * Returns null (after reporting) when the amount is missing or invalid.
+ */
+function parseTransactionLine(
+  fields: string[],
+  tag: string,
+  issues: ParseIssue[],
+  lineNum: number
+): SIETransactionLine | null {
+  // Parse account and capture the object list (in braces)
+  let fieldIndex = 1
+  const account = parseStringField(fields[fieldIndex++])
+
+  // Object list (single field thanks to brace-aware splitting):
+  // dimension tags like {1 "KS01" 6 "P001"}. Parsed onto the line so
+  // import is lossless (dimensions plan PR5).
+  let objectListRaw: string | null = null
+  if (fields[fieldIndex]?.startsWith('{')) {
+    objectListRaw = fields[fieldIndex]
+    fieldIndex++
+  }
+
+  const amount = parseAmountField(fields[fieldIndex++], tag, issues, lineNum, account)
+  if (amount === null) return null
+
+  const transLine: SIETransactionLine = {
+    account,
+    amount,
+  }
+
+  if (objectListRaw) {
+    const dims = parseObjectList(objectListRaw, issues, lineNum)
+    if (dims) {
+      transLine.dimensions = dims
+    }
+  }
+
+  // Optional fields
+  if (fields[fieldIndex]) {
+    transLine.date = parseSIEDate(parseStringField(fields[fieldIndex++])) || undefined
+  }
+  if (fields[fieldIndex]) {
+    transLine.description = parseStringField(fields[fieldIndex++])
+  }
+  if (fields[fieldIndex]) {
+    transLine.quantity = parseNumberField(fields[fieldIndex++])
+  }
+  if (fields[fieldIndex]) {
+    transLine.signature = parseStringField(fields[fieldIndex++])
+  }
+
+  return transLine
+}
+
+/**
+ * How a voucher is identified back to the source file: "A12".
+ *
+ * A SIE4I voucher carries no number (`numberOmitted`, parsed as a placeholder
+ * 0) and often no series either, so the file's own order is the only handle a
+ * reader has on it and `ordinal` (1-based, the voucher's position among the
+ * file's #VER records) stands in: "#3", or "A#3" when only the number is
+ * blank. The "#" keeps these apart from real series+number references, so the
+ * result is unique per file either way. That uniqueness is load-bearing:
+ * sourceId keys the import RPC payload, the skipped list and the
+ * voucherNumberMapping audit trail, and every SIE4I voucher in a file would
+ * otherwise share the single key "0".
+ */
+export function formatVoucherRef(
+  voucher: { series: string; number: number; numberOmitted?: boolean },
+  ordinal: number
+): string {
+  const series = voucher.series.trim()
+  return voucher.numberOmitted ? `${series}#${ordinal}` : `${series}${voucher.number}`
 }
 
 /**
@@ -360,9 +524,30 @@ export function parseSIEFile(content: string): ParsedSIEFile {
   const closingBalances: SIEBalance[] = []
   const resultBalances: SIEBalance[] = []
   const vouchers: SIEVoucher[] = []
+  const dimensions: SIEDimension[] = []
+  const dimensionValues: SIEDimensionValue[] = []
+  let objectBalanceCount = 0
 
   // Track current voucher being parsed (inside #VER { ... })
   let currentVoucher: SIEVoucher | null = null
+
+  // SIE 4B: an #RTRANS row must be immediately followed by an identical
+  // #TRANS row (the twin older readers use). Remembered here so the twin
+  // can be verified; a missing twin is reported, since the final state is
+  // built from #TRANS only and would silently lack that line.
+  let pendingRtrans: { line: SIETransactionLine; lineNum: number } | null = null
+
+  const reportMissingRtransTwin = (): void => {
+    if (!pendingRtrans) return
+    addIssue(
+      issues,
+      'warning',
+      pendingRtrans.lineNum,
+      `#RTRANS ${pendingRtrans.line.account} ${pendingRtrans.line.amount.toFixed(2)} följs inte av en identisk #TRANS-rad: rättelseraden ingår inte i verifikatets slutliga rader`,
+      'RTRANS'
+    )
+    pendingRtrans = null
+  }
 
   for (let i = 0; i < lines.length; i++) {
     const lineNum = i + 1
@@ -373,6 +558,7 @@ export function parseSIEFile(content: string): ParsedSIEFile {
 
     // Handle voucher block end
     if (line === '}') {
+      reportMissingRtransTwin()
       if (currentVoucher) {
         // Validate voucher balance
         const total = currentVoucher.lines.reduce((sum, l) => sum + l.amount, 0)
@@ -381,7 +567,7 @@ export function parseSIEFile(content: string): ParsedSIEFile {
             issues,
             'error',
             lineNum,
-            `Verifikation ${currentVoucher.series}${currentVoucher.number} balanserar inte (differens: ${total.toFixed(2)} kr)`,
+            `Verifikation ${formatVoucherRef(currentVoucher, vouchers.length + 1)} balanserar inte (differens: ${total.toFixed(2)} kr)`,
             'VER'
           )
         }
@@ -404,6 +590,10 @@ export function parseSIEFile(content: string): ParsedSIEFile {
     // Parse the tag and fields
     const fields = splitSIELine(line)
     const tag = fields[0].substring(1).toUpperCase()
+
+    if (pendingRtrans && tag !== 'TRANS') {
+      reportMissingRtransTwin()
+    }
 
     try {
       switch (tag) {
@@ -459,15 +649,54 @@ export function parseSIEFile(content: string): ParsedSIEFile {
 
         case 'RAR': {
           // #RAR yearIndex start end
+          //
+          // Validated for EVERY year index, not just 0: prior-year records
+          // (#RAR -1, -2, ...) land in header.fiscalYears too, and a bogus
+          // entry there used to pass through silently. Malformed records are
+          // reported and skipped so fiscalYears never carries an entry the
+          // rest of the pipeline cannot trust. The one exception is the
+          // 18-month BFL 3 kap. cap: an over-long span is reported as a
+          // warning but the entry is KEPT, because executeSIEImport refuses
+          // the current year (#RAR 0) with a precise Swedish error that needs
+          // the real dates, and dropping the record here would degrade that
+          // message to "no fiscal year defined".
           const yearIndex = parseInt(fields[1], 10)
           const start = parseSIEDateString(fields[2])
           const end = parseSIEDateString(fields[3])
 
-          if (start && end) {
-            header.fiscalYears.push({ yearIndex, start, end })
-          } else {
-            addIssue(issues, 'warning', lineNum, 'Invalid fiscal year dates', tag)
+          if (!Number.isInteger(yearIndex)) {
+            addIssue(issues, 'warning', lineNum, `Ogiltigt årsindex i #RAR: "${fields[1] ?? ''}"`, tag)
+            break
           }
+
+          if (!start || !end) {
+            addIssue(issues, 'warning', lineNum, 'Invalid fiscal year dates', tag)
+            break
+          }
+
+          if (end < start) {
+            addIssue(
+              issues,
+              'warning',
+              lineNum,
+              `Räkenskapsårets slutdatum (${end}) ligger före startdatumet (${start}) i #RAR ${yearIndex}`,
+              tag
+            )
+            break
+          }
+
+          const rarMonths = monthsBetween(start, end)
+          if (rarMonths > 18) {
+            addIssue(
+              issues,
+              'warning',
+              lineNum,
+              `Räkenskapsåret i #RAR ${yearIndex} (${start} till ${end}) omfattar ${rarMonths} månader: ett räkenskapsår får vara högst 18 månader (BFL 3 kap.)`,
+              tag
+            )
+          }
+
+          header.fiscalYears.push({ yearIndex, start, end })
           break
         }
 
@@ -497,8 +726,10 @@ export function parseSIEFile(content: string): ParsedSIEFile {
 
         case 'KTYP': {
           // #KTYP accountNumber type
+          // Bollbok 2025 writes the type unquoted (T), Bollbok 2026 writes it
+          // quoted ("T"). parseStringField strips the quotes in both cases.
           const accountNum = fields[1]
-          const accountType = fields[2]
+          const accountType = parseStringField(fields[2])
           const account = accounts.find((a) => a.number === accountNum)
           if (account) {
             account.accountType = accountType
@@ -510,14 +741,8 @@ export function parseSIEFile(content: string): ParsedSIEFile {
           // #IB yearIndex accountNumber amount [quantity]
           const yearIndex = parseInt(fields[1], 10)
           const account = fields[2]
-          const amountStr = fields[3]
-
-          if (!amountStr || amountStr.trim() === '') {
-            addIssue(issues, 'warning', lineNum, 'Belopp saknas i #IB — raden hoppas över', tag)
-            break
-          }
-
-          const amount = parseNumberField(amountStr)
+          const amount = parseAmountField(fields[3], tag, issues, lineNum, account, yearIndex)
+          if (amount === null) break
           const quantity = fields[4] ? parseNumberField(fields[4]) : undefined
 
           if (account) {
@@ -530,14 +755,8 @@ export function parseSIEFile(content: string): ParsedSIEFile {
           // #UB yearIndex accountNumber amount [quantity]
           const yearIndex = parseInt(fields[1], 10)
           const account = fields[2]
-          const amountStr = fields[3]
-
-          if (!amountStr || amountStr.trim() === '') {
-            addIssue(issues, 'warning', lineNum, 'Belopp saknas i #UB — raden hoppas över', tag)
-            break
-          }
-
-          const amount = parseNumberField(amountStr)
+          const amount = parseAmountField(fields[3], tag, issues, lineNum, account, yearIndex)
+          if (amount === null) break
           const quantity = fields[4] ? parseNumberField(fields[4]) : undefined
 
           if (account) {
@@ -550,14 +769,8 @@ export function parseSIEFile(content: string): ParsedSIEFile {
           // #RES yearIndex accountNumber amount [quantity]
           const yearIndex = parseInt(fields[1], 10)
           const account = fields[2]
-          const amountStr = fields[3]
-
-          if (!amountStr || amountStr.trim() === '') {
-            addIssue(issues, 'warning', lineNum, 'Belopp saknas i #RES — raden hoppas över', tag)
-            break
-          }
-
-          const amount = parseNumberField(amountStr)
+          const amount = parseAmountField(fields[3], tag, issues, lineNum, account, yearIndex)
+          if (amount === null) break
           const quantity = fields[4] ? parseNumberField(fields[4]) : undefined
 
           if (account) {
@@ -570,7 +783,15 @@ export function parseSIEFile(content: string): ParsedSIEFile {
           // #VER series number date "description" [regdate] [signature]
           // Some programs quote all fields, so strip quotes from number/date too
           const series = parseStringField(fields[1])
-          const number = parseInt(parseStringField(fields[2]), 10)
+          // SIE 4B: in 4I (subsystem import) files both series and number may
+          // be blank, because the receiving system assigns them. myWebLog and
+          // other payroll/POS exports write `#VER "" "" 20240115 "text"`.
+          // A blank number is therefore data, not a defect; `numberOmitted`
+          // marks it so nothing downstream mistakes the placeholder 0 for a
+          // real source number. A non-empty token that is not a number stays
+          // an error, and the date stays compulsory.
+          const sourceNumber = parseStringField(fields[2])
+          const number = sourceNumber === '' ? 0 : parseInt(sourceNumber, 10)
           const date = parseSIEDate(parseStringField(fields[3]))
           const description = parseStringField(fields[4])
 
@@ -578,6 +799,7 @@ export function parseSIEFile(content: string): ParsedSIEFile {
             currentVoucher = {
               series,
               number,
+              ...(sourceNumber === '' ? {numberOmitted:true} : {}),
               date,
               description: description || '',
               lines: [],
@@ -591,7 +813,7 @@ export function parseSIEFile(content: string): ParsedSIEFile {
               currentVoucher.signature = parseStringField(fields[6])
             }
           } else {
-            addIssue(issues, 'error', lineNum, 'Ogiltig verifikationsdefinition — nummer eller datum kunde inte tolkas', tag)
+            addIssue(issues, 'error', lineNum, 'Ogiltig verifikationsdefinition: nummer eller datum kunde inte tolkas', tag)
           }
           break
         }
@@ -599,68 +821,102 @@ export function parseSIEFile(content: string): ParsedSIEFile {
         case 'TRANS':
         case 'RTRANS':
         case 'BTRANS': {
-          // #TRANS = final transaction lines (the current state of the voucher)
-          // #RTRANS = supplementary/corrected transaction (must be followed by identical #TRANS for backward compat)
-          // #BTRANS = removed/cancelled transaction (programs not understanding BTRANS simply ignore it)
+          // #TRANS = the voucher's final lines (its current state).
+          // #BTRANS = "removed transaction item": a line struck in the source
+          //   system after posting (how the voucher looked before the rättelse).
+          // #RTRANS = "supplementary transaction item": a line added by a
+          //   rättelse. Per SIE 4B it is always immediately followed by an
+          //   identical #TRANS row, so the line is ALSO in the final state.
           //
-          // When a voucher has been corrected, Fortnox/Visma emit all three types.
-          // Only #TRANS represents the final voucher state; #RTRANS and #BTRANS are
-          // supplementary history. We skip RTRANS/BTRANS to avoid double-counting
-          // which would make balanced vouchers appear unbalanced.
+          // When a voucher has been corrected, Fortnox/Visma emit all three
+          // types. Only #TRANS is booked (summing all three would double-count
+          // and make balanced vouchers look unbalanced, #63). #BTRANS/#RTRANS
+          // are kept aside as `corrections`: the correction history behind the
+          // verifikat, persisted by the import into the rättelselogg (#2427).
           if (!currentVoucher) {
-            addIssue(issues, 'error', lineNum, `#${tag} utanför verifikationsblock (#VER) — filen kan vara skadad`, tag)
+            addIssue(issues, 'error', lineNum, `#${tag} utanför verifikationsblock (#VER): filen kan vara skadad`, tag)
             break
           }
 
-          // Skip RTRANS/BTRANS — they are correction audit trail, not final state
-          if (tag === 'RTRANS' || tag === 'BTRANS') {
+          const transLine = parseTransactionLine(fields, tag, issues, lineNum)
+          if (!transLine) {
             break
           }
 
-          // Parse account and skip object list (in braces)
-          let fieldIndex = 1
-          const account = parseStringField(fields[fieldIndex++])
-
-          // Skip object list if present (now a single field thanks to brace-aware splitting)
-          if (fields[fieldIndex]?.startsWith('{')) {
-            fieldIndex++
-          }
-
-          const transAmountStr = fields[fieldIndex]
-          if (!transAmountStr || transAmountStr.trim() === '') {
-            addIssue(issues, 'warning', lineNum, `Belopp saknas i #${tag} — raden hoppas över`, tag)
+          if (tag === 'BTRANS') {
+            const corrections = (currentVoucher.corrections ??= { struck: [], added: [] })
+            corrections.struck.push(transLine)
             break
           }
 
-          const amount = parseNumberField(fields[fieldIndex++])
-
-          const transLine: SIETransactionLine = {
-            account,
-            amount,
+          if (tag === 'RTRANS') {
+            const corrections = (currentVoucher.corrections ??= { struck: [], added: [] })
+            corrections.added.push(transLine)
+            pendingRtrans = { line: transLine, lineNum }
+            break
           }
 
-          // Optional fields
-          if (fields[fieldIndex]) {
-            transLine.date = parseSIEDate(parseStringField(fields[fieldIndex++])) || undefined
-          }
-          if (fields[fieldIndex]) {
-            transLine.description = parseStringField(fields[fieldIndex++])
-          }
-          if (fields[fieldIndex]) {
-            transLine.quantity = parseNumberField(fields[fieldIndex++])
-          }
-          if (fields[fieldIndex]) {
-            transLine.signature = parseStringField(fields[fieldIndex++])
+          if (pendingRtrans) {
+            const twin = pendingRtrans.line
+            if (twin.account === transLine.account && Math.abs(twin.amount - transLine.amount) < 0.005) {
+              pendingRtrans = null
+            } else {
+              reportMissingRtransTwin()
+            }
           }
 
           currentVoucher.lines.push(transLine)
           break
         }
 
+        case 'DIM': {
+          // #DIM dimNo "name"
+          const dimNo = parseInt(parseStringField(fields[1]), 10)
+          const name = parseStringField(fields[2])
+          if (!isNaN(dimNo) && dimNo >= 1) {
+            dimensions.push({ sieDimNo: dimNo, name: name || '' })
+          } else {
+            addIssue(issues, 'warning', lineNum, 'Ogiltig dimensionsdefinition: numret kunde inte tolkas', tag)
+          }
+          break
+        }
+
+        case 'UNDERDIM': {
+          // #UNDERDIM dimNo "name" parentDimNo
+          const dimNo = parseInt(parseStringField(fields[1]), 10)
+          const name = parseStringField(fields[2])
+          const parent = parseInt(parseStringField(fields[3]), 10)
+          if (!isNaN(dimNo) && dimNo >= 1 && !isNaN(parent) && parent >= 1) {
+            dimensions.push({ sieDimNo: dimNo, name: name || '', parentSieDimNo: parent })
+          } else {
+            addIssue(issues, 'warning', lineNum, 'Ogiltig underdimension: nummer eller överdimension kunde inte tolkas', tag)
+          }
+          break
+        }
+
+        case 'OBJEKT': {
+          // #OBJEKT dimNo "code" "name"
+          const dimNo = parseInt(parseStringField(fields[1]), 10)
+          const code = parseStringField(fields[2]).trim()
+          const name = parseStringField(fields[3])
+          if (!isNaN(dimNo) && dimNo >= 1 && code) {
+            dimensionValues.push({ sieDimNo: dimNo, code, name: name || code })
+          } else {
+            addIssue(issues, 'warning', lineNum, 'Ogiltigt objekt: dimension eller kod kunde inte tolkas', tag)
+          }
+          break
+        }
+
         default:
-          // Unknown tag - add info issue for notable ones
-          if (!['KSUMMA', 'BKOD', 'TAXAR', 'OMFATTN', 'DIM', 'OBJEKT', 'OIB', 'OUB', 'PBUDGET', 'PSALDO'].includes(tag)) {
-            addIssue(issues, 'info', lineNum, `Okänd tagg: #${tag} — ignoreras`, tag)
+          // Unknown tag - add info issue for notable ones. OIB/OUB (per-object
+          // opening/closing balances) are counted and surfaced as ONE info
+          // issue below: dimension reporting is P&L-only in v1, so
+          // object-level balance records have no consumer yet, but dropping
+          // them must never be silent (#866 review).
+          if (tag === 'OIB' || tag === 'OUB') {
+            objectBalanceCount++
+          } else if (!['KSUMMA', 'BKOD', 'TAXAR', 'OMFATTN', 'PBUDGET', 'PSALDO'].includes(tag)) {
+            addIssue(issues, 'info', lineNum, `Okänd tagg: #${tag}, ignoreras`, tag)
           }
       }
     } catch (error) {
@@ -696,6 +952,63 @@ export function parseSIEFile(content: string): ParsedSIEFile {
     addIssue(issues, 'info', 0, `Account ${accountNumber} added from transaction data (not in #KONTO)`)
   }
 
+  // Silent-failure diagnostic: if the raw input declares #IB / #VER records
+  // but parsing produced none, surface a warning instead of letting the file
+  // look empty. Historically a tab-separator or encoding mismatch could swallow
+  // all balance/voucher records without any visible signal.
+  //
+  // Suppressed when per-record 'error' issues already exist for the same tag:
+  // in that case the parser already pinpointed the root cause (e.g. malformed
+  // verification definition), so the generic "check separator/encoding" hint
+  // would be misleading.
+  const rawIBCount = lines.filter((l) => /^\s*#IB\b/.test(l)).length
+  const rawVERCount = lines.filter((l) => /^\s*#VER\b/.test(l)).length
+  const hasIBError = issues.some((i) => i.severity === 'error' && i.tag === 'IB')
+  const hasVERError = issues.some((i) => i.severity === 'error' && i.tag === 'VER')
+  if (rawIBCount > 0 && openingBalances.length === 0 && !hasIBError) {
+    addIssue(
+      issues,
+      'warning',
+      0,
+      `${rawIBCount} #IB-rader hittades men inga ingående saldon kunde tolkas: kontrollera fältavskiljare och teckenkodning`,
+      'IB'
+    )
+  }
+  if (rawVERCount > 0 && vouchers.length === 0 && !hasVERError) {
+    addIssue(
+      issues,
+      'warning',
+      0,
+      `${rawVERCount} #VER-rader hittades men inga verifikationer kunde tolkas: kontrollera fältavskiljare och teckenkodning`,
+      'VER'
+    )
+  }
+
+  // Dimension visibility: the preview step renders parse issues, so these
+  // make dimension handling explicit BEFORE the user executes the import.
+  if (objectBalanceCount > 0) {
+    addIssue(
+      issues,
+      'info',
+      0,
+      `${objectBalanceCount} objektbalansrader (#OIB/#OUB) hoppades över: balanser per objekt stöds inte ännu`,
+      'OIB'
+    )
+  }
+  const taggedLineCount = vouchers.reduce(
+    (sum, v) => sum + v.lines.filter((l) => l.dimensions).length,
+    0
+  )
+  if (dimensions.length > 0 || dimensionValues.length > 0 || taggedLineCount > 0) {
+    addIssue(
+      issues,
+      'info',
+      0,
+      `Filen innehåller dimensionsdata (kostnadsställen/projekt): ${taggedLineCount} taggade rader, dimensionerna följer med importen`,
+      'DIM'
+    )
+  }
+
   // Calculate statistics
   const currentFiscalYear = header.fiscalYears.find((fy) => fy.yearIndex === 0)
   const totalTransactionLines = vouchers.reduce((sum, v) => sum + v.lines.length, 0)
@@ -707,6 +1020,8 @@ export function parseSIEFile(content: string): ParsedSIEFile {
     closingBalances,
     resultBalances,
     vouchers,
+    dimensions,
+    dimensionValues,
     issues,
     stats: {
       totalAccounts: accounts.length,
@@ -716,6 +1031,104 @@ export function parseSIEFile(content: string): ParsedSIEFile {
       fiscalYearEnd: currentFiscalYear?.end || null,
     },
   }
+}
+
+/**
+ * Wording that identifies a voucher as the year's opening balance
+ * (ingående balans). Shared between the parser's OB-voucher candidate
+ * detection below and the importer's isLikelyOpeningBalance tagging
+ * (lib/import/sie-import.ts) so the two checks can never drift apart.
+ */
+export const OPENING_BALANCE_DESCRIPTION_RE = /ing[åa]ende balans|ing[åa]ende saldo|opening balance/i
+
+/**
+ * Vouchers mentioning share capital are never treated as opening balances:
+ * a share-capital deposit dated on the FY start is a real bank movement.
+ */
+export const SHARE_CAPITAL_DESCRIPTION_RE = /aktiekapital/i
+
+/**
+ * Determine if an account is balance sheet (class 1-2) or P&L (class 3-8)
+ */
+export function isBalanceSheetAccount(accountNumber: string): boolean {
+  const firstDigit = parseInt(accountNumber.charAt(0), 10)
+  return firstDigit >= 1 && firstDigit <= 2
+}
+
+/**
+ * Format a Date to "YYYY-MM-DD" using LOCAL components.
+ * parseSIEDate() builds local-time Dates, so toISOString() would shift the
+ * day across the UTC boundary in non-UTC timezones: never use it here.
+ */
+function formatLocalDate(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+/**
+ * True when the file contains a voucher that looks like the year's opening
+ * balance: dated on the fiscal-year start, only balance-sheet accounts,
+ * IB wording in the description and no share-capital mention.
+ *
+ * Raw-file mirror of the importer's isLikelyOpeningBalance check
+ * (lib/import/sie-import.ts), but deliberately MORE eager: it runs on
+ * source account numbers with no knowledge of account mappings, so a
+ * candidate containing an unmapped line still counts here even though the
+ * importer would later skip that voucher as unmapped. In that residual case
+ * no IB is created at all: the user falls back to the manual
+ * "Märk som ingående balans" action in Bankavstämning.
+ */
+export function hasOpeningBalanceVoucherCandidate(parsed: ParsedSIEFile): boolean {
+  const fyStart = parsed.stats.fiscalYearStart
+  if (!fyStart) return false
+
+  return parsed.vouchers.some(
+    (v) =>
+      v.lines.length > 0 &&
+      formatLocalDate(v.date) === fyStart.slice(0, 10) &&
+      v.lines.every((l) => isBalanceSheetAccount(l.account)) &&
+      OPENING_BALANCE_DESCRIPTION_RE.test(v.description || '') &&
+      !SHARE_CAPITAL_DESCRIPTION_RE.test(v.description || '')
+  )
+}
+
+/**
+ * Resolve the opening balances the import should actually book (issue #675).
+ *
+ * Some systems export no #IB 0 records at all: the current year's IB exists
+ * only implicitly via the SIE continuity invariant IB(year 0) = UB(year -1).
+ * Every IB consumer goes through this helper so the precedence below is the
+ * single source of truth:
+ *
+ *   1. Explicit #IB 0 records: trusted as-is, never merged with #UB -1.
+ *   2. An opening-balance #VER candidate: the voucher itself serves as IB
+ *      during voucher import (tagged source_type 'opening_balance');
+ *      deriving from #UB -1 as well would double-count every
+ *      balance-sheet account.
+ *   3. #UB -1 records, re-labeled to yearIndex 0 and filtered to
+ *      balance-sheet accounts (result accounts must always open at zero).
+ *   4. Nothing: the file genuinely carries no opening balances.
+ */
+export function getEffectiveOpeningBalances(parsed: ParsedSIEFile): {
+  balances: SIEBalance[]
+  derivedFromPriorYearUB: boolean
+} {
+  const explicit = parsed.openingBalances.filter((b) => b.yearIndex === 0)
+  if (explicit.length > 0) {
+    return { balances: explicit, derivedFromPriorYearUB: false }
+  }
+
+  if (hasOpeningBalanceVoucherCandidate(parsed)) {
+    return { balances: [], derivedFromPriorYearUB: false }
+  }
+
+  const derived = parsed.closingBalances
+    .filter((b) => b.yearIndex === -1 && isBalanceSheetAccount(b.account))
+    .map((b) => ({ ...b, yearIndex: 0 }))
+
+  return { balances: derived, derivedFromPriorYearUB: derived.length > 0 }
 }
 
 /**
@@ -732,17 +1145,17 @@ export function validateSIEFile(parsed: ParsedSIEFile): ValidationResult {
 
   // Check for SIE type
   if (!parsed.header.sieType) {
-    errors.push('SIE-typ saknas (#SIETYP). Filen kanske inte är en giltig SIE-fil — kontrollera att du exporterat i rätt format.')
+    errors.push('SIE-typ saknas (#SIETYP). Filen kanske inte är en giltig SIE-fil: kontrollera att du exporterat i rätt format.')
   }
 
   // Check for company info
   if (!parsed.header.companyName) {
-    warnings.push('Företagsnamn saknas (#FNAMN) — vanligtvis ofarligt men bör kontrolleras')
+    warnings.push('Företagsnamn saknas (#FNAMN): vanligtvis ofarligt men bör kontrolleras')
   }
 
   // Check for fiscal year
   if (parsed.header.fiscalYears.length === 0) {
-    errors.push('Inget räkenskapsår definierat (#RAR). Filen saknar information om vilken period bokföringen gäller — kontrollera att exporten inkluderar räkenskapsårsdata.')
+    errors.push('Inget räkenskapsår definierat (#RAR). Filen saknar information om vilken period bokföringen gäller: kontrollera att exporten inkluderar räkenskapsårsdata.')
   }
 
   // Check for accounts
@@ -750,24 +1163,28 @@ export function validateSIEFile(parsed: ParsedSIEFile): ValidationResult {
     warnings.push('Inga konton hittades (#KONTO). Om filen bara innehåller saldon (SIE1) är detta normalt.')
   }
 
-  // Warn if non-BAS kontoplan declared — mapping logic assumes BAS number ranges
+  // Warn if non-BAS kontoplan declared: mapping logic assumes BAS number ranges
   if (parsed.header.kontoPlanType) {
     const planType = parsed.header.kontoPlanType.toUpperCase()
-    const isBAS = planType.startsWith('BAS') || planType === 'EUBAS' || planType === 'EU-BAS'
+    // EUBAS97 is one of the four kontoplanstyp values the SIE 4B spec
+    // enumerates (BAS95, BAS96, EUBAS97, NE2007), and the spec routes every
+    // BAS2xxx chart through it. Matched exactly, not by prefix, so this stays
+    // pinned to the spec's own table.
+    const isBAS = planType.startsWith('BAS') || planType === 'EUBAS97' || planType === 'EUBAS' || planType === 'EU-BAS'
     if (!isBAS) {
       warnings.push(
-        `Kontoplanstyp "${parsed.header.kontoPlanType}" är inte BAS-baserad. Automatisk kontomappning kan bli felaktig — granska alla mappningar manuellt i nästa steg.`
+        `Kontoplanstyp "${parsed.header.kontoPlanType}" är inte BAS-baserad. Automatisk kontomappning kan bli felaktig: granska alla mappningar manuellt i nästa steg.`
       )
     }
   }
 
   // Check for unbalanced vouchers
   const unbalancedVouchers: string[] = []
-  for (const voucher of parsed.vouchers) {
+  for (const [index, voucher] of parsed.vouchers.entries()) {
     const total = voucher.lines.reduce((sum, l) => sum + l.amount, 0)
     if (Math.abs(total) > 0.01) {
       unbalancedVouchers.push(
-        `${voucher.series}${voucher.number} (${voucher.date.toISOString().split('T')[0]}, diff: ${total.toFixed(2)} kr)`
+        `${formatVoucherRef(voucher, index + 1)} (${voucher.date.toISOString().split('T')[0]}, diff: ${total.toFixed(2)} kr)`
       )
     }
   }
@@ -807,13 +1224,50 @@ export function validateSIEFile(parsed: ParsedSIEFile): ValidationResult {
     )
   }
 
-  // Check opening balance is balanced (for balance sheet accounts)
-  const ibTotal = parsed.openingBalances
-    .filter((b) => b.yearIndex === 0)
-    .reduce((sum, b) => sum + b.amount, 0)
+  // Check opening balance is balanced (for balance sheet accounts).
+  // Uses the effective set so files without #IB 0 (where IB is derived from
+  // #UB -1, issue #675) still get the adjustment heads-up. The parser has no
+  // company, so the text names equity rather than the form's result-closing
+  // account (2099 AB, 2010 EF, 2069 ideell förening): the import result says
+  // which account was used.
+  const effectiveIB = getEffectiveOpeningBalances(parsed)
+
+  if (effectiveIB.derivedFromPriorYearUB) {
+    warnings.push(
+      'Filen saknar ingående balanser (#IB) för aktuellt räkenskapsår: de härleds från föregående års utgående balans (#UB -1) vid import.'
+    )
+  }
+
+  const ibTotal = effectiveIB.balances.reduce((sum, b) => sum + b.amount, 0)
 
   if (Math.abs(ibTotal) > 0.01) {
-    warnings.push(`Ingående balanser balanserar inte (differens: ${ibTotal.toFixed(2)} kr). En automatisk justeringspost mot konto 2099 skapas vid import.`)
+    warnings.push(`Ingående balanser balanserar inte (differens: ${ibTotal.toFixed(2)} kr). En automatisk justeringspost mot eget kapital (företagsformens konto för årets resultat) skapas vid import.`)
+  }
+
+  // Completed fiscal year whose vouchers leave a residual on P&L accounts:
+  // the year's result was never transferred to equity (omföring saknas).
+  // Later years derive their opening balance from balance-sheet accounts
+  // only, so the residual becomes a permanent balansräkning differens for
+  // every subsequent year. SIE amounts are debit-positive, so the class 3-8
+  // sum is the un-transferred result with flipped sign.
+  const currentFiscalYear = parsed.header.fiscalYears.find((fy) => fy.yearIndex === 0)
+  if (currentFiscalYear?.end && currentFiscalYear.end < formatLocalDate(new Date())) {
+    const plResidual = parsed.vouchers.reduce(
+      (sum, voucher) =>
+        sum +
+        voucher.lines.reduce(
+          (lineSum, line) =>
+            lineSum + (isBalanceSheetAccount(line.account) ? 0 : line.amount),
+          0
+        ),
+      0
+    )
+    if (Math.abs(plResidual) > 0.01) {
+      warnings.push(
+        `Räkenskapsåret är avslutat men filen saknar omföring av årets resultat (${Math.abs(plResidual).toFixed(2)} kr ligger kvar på resultatkonton). ` +
+        `Om senare räkenskapsår importeras kommer balansräkningen att visa en differens på ${Math.abs(plResidual).toFixed(2)} kr tills omföringen bokförs.`
+      )
+    }
   }
 
   // Add parse issues as errors/warnings

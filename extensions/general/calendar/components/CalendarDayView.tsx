@@ -22,6 +22,17 @@ interface CalendarDayViewProps {
   onAddDeadline: (date: Date) => void
 }
 
+// Per-invoice amount label. Shows the SEK conversion when one exists;
+// otherwise the invoice's own amount in its own currency: total_sek is NULL
+// for non-SEK invoices whose rate fetch failed, and labelling the raw foreign
+// amount "kr" would misstate it.
+function invoiceAmountLabel(invoice: Invoice): string {
+  if (invoice.total_sek != null || !invoice.currency || invoice.currency === 'SEK') {
+    return `${(invoice.total_sek ?? invoice.total).toLocaleString('sv-SE')} kr`
+  }
+  return `${invoice.total.toLocaleString('sv-SE')} ${invoice.currency}`
+}
+
 export function CalendarDayView({
   date,
   invoices,
@@ -81,7 +92,7 @@ export function CalendarDayView({
                 <div
                   key={invoice.id}
                   className={cn(
-                    'p-2 rounded-md',
+                    'p-2 rounded-lg',
                     isInvoiceOverdue(invoice)
                       ? 'bg-destructive/10 border border-destructive/30'
                       : 'bg-primary/10 border border-primary/30'
@@ -99,13 +110,13 @@ export function CalendarDayView({
                       )}>
                         Faktura {invoice.invoice_number}
                         {isInvoiceOverdue(invoice) && (
-                          <span className="ml-2 text-xs bg-destructive/20 px-1.5 py-0.5 rounded">
+                          <span className="ml-2 text-xs bg-destructive/20 px-1.5 py-0.5 rounded-sm">
                             Förfallen
                           </span>
                         )}
                       </div>
                       <div className="text-xs text-muted-foreground">
-                        {invoice.customer?.name} • {(invoice.total_sek || invoice.total).toLocaleString('sv-SE')} kr
+                        {invoice.customer?.name} • {invoiceAmountLabel(invoice)}
                       </div>
                     </div>
                   </div>
@@ -120,19 +131,19 @@ export function CalendarDayView({
               {paidInvoices.map((invoice) => (
                 <div
                   key={invoice.id}
-                  className="p-2 rounded-md bg-success/10 border border-success/30"
+                  className="p-2 rounded-lg bg-success/10 border border-success/30"
                 >
                   <div className="flex items-center gap-2">
                     <div className="w-3 h-3 rounded-full bg-success flex-shrink-0" />
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium text-success">
                         Faktura {invoice.invoice_number}
-                        <span className="ml-2 text-xs bg-success/20 px-1.5 py-0.5 rounded">
+                        <span className="ml-2 text-xs bg-success/20 px-1.5 py-0.5 rounded-sm">
                           Betald
                         </span>
                       </div>
                       <div className="text-xs text-muted-foreground">
-                        {invoice.customer?.name} • {(invoice.total_sek || invoice.total).toLocaleString('sv-SE')} kr
+                        {invoice.customer?.name} • {invoiceAmountLabel(invoice)}
                       </div>
                     </div>
                   </div>
@@ -148,7 +159,7 @@ export function CalendarDayView({
                 <div
                   key={deadline.id}
                   className={cn(
-                    'p-2 rounded-md',
+                    'p-2 rounded-lg',
                     isDeadlineOverdue(deadline)
                       ? 'bg-destructive/10 border border-destructive/30'
                       : 'bg-warning/10 border border-warning/30'
@@ -166,7 +177,7 @@ export function CalendarDayView({
                       )}>
                         {deadline.title}
                         {isDeadlineOverdue(deadline) && (
-                          <span className="ml-2 text-xs bg-destructive/20 px-1.5 py-0.5 rounded">
+                          <span className="ml-2 text-xs bg-destructive/20 px-1.5 py-0.5 rounded-sm">
                             Försenad
                           </span>
                         )}
@@ -175,9 +186,9 @@ export function CalendarDayView({
                         {DEADLINE_TYPE_LABELS[deadline.deadline_type] || deadline.deadline_type}
                         {deadline.priority !== 'normal' && (
                           <span className={cn(
-                            'ml-2 px-1.5 py-0.5 rounded',
+                            'ml-2 px-1.5 py-0.5 rounded-sm',
                             deadline.priority === 'critical' && 'bg-destructive/10 text-destructive',
-                            deadline.priority === 'important' && 'bg-orange-100 text-orange-700'
+                            deadline.priority === 'important' && 'bg-warning/10 text-warning-foreground'
                           )}>
                             {PRIORITY_LABELS[deadline.priority]}
                           </span>
@@ -197,7 +208,7 @@ export function CalendarDayView({
               {completedDeadlines.map((deadline) => (
                 <div
                   key={deadline.id}
-                  className="p-2 rounded-md bg-success/10 border border-success/30 opacity-60"
+                  className="p-2 rounded-lg bg-success/10 border border-success/30 opacity-60"
                 >
                   <div className="flex items-center gap-2">
                     <div className="w-3 h-3 rounded-sm bg-success flex-shrink-0" />
@@ -207,7 +218,7 @@ export function CalendarDayView({
                       </div>
                       <div className="text-xs text-muted-foreground">
                         {DEADLINE_TYPE_LABELS[deadline.deadline_type] || deadline.deadline_type}
-                        <span className="ml-2 bg-success/20 px-1.5 py-0.5 rounded">Klar</span>
+                        <span className="ml-2 bg-success/20 px-1.5 py-0.5 rounded-sm">Klar</span>
                       </div>
                     </div>
                   </div>

@@ -1,36 +1,42 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
-import { manualLink } from '@/lib/reconciliation/bank-reconciliation'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { linkTransactionToVouchers, manualLink } from '@/lib/reconciliation/bank-reconciliation'
 import { validateBody } from '@/lib/api/validate'
 import { BankLinkSchema } from '@/lib/api/schemas'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
 
 ensureInitialized()
 
-export async function POST(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
+export const POST = withRouteContext(
+  'reconciliation.bank.link',
+  async (request, { supabase, user, companyId }) => {
+    const validation = await validateBody(request, BankLinkSchema)
+    if (!validation.success) return validation.response
+    const { transaction_id, journal_entry_id, allocations, account_number } = validation.data
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+    // One verifikat: the plain link. Several: the 1:N split (#1553), all or
+    // nothing, slices summing to the transaction.
+    const result = journal_entry_id
+      ? await manualLink(supabase, companyId, transaction_id, journal_entry_id, user.id, account_number ?? '1930')
+      : await linkTransactionToVouchers(
+          supabase,
+          companyId,
+          transaction_id,
+          allocations ?? [],
+          user.id,
+          account_number ?? '1930',
+        )
 
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
+    if (!result.success) {
+      return NextResponse.json({ error: result.error }, { status: 400 })
+    }
 
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  const validation = await validateBody(request, BankLinkSchema)
-  if (!validation.success) return validation.response
-  const { transaction_id, journal_entry_id } = validation.data
-
-  const result = await manualLink(supabase, companyId, transaction_id, journal_entry_id)
-
-  if (!result.success) {
-    return NextResponse.json({ error: result.error }, { status: 400 })
-  }
-
-  return NextResponse.json({ data: { success: true } })
-}
+    // A split echoes the slices as validated (defaults resolved); the plain
+    // link has nothing to add.
+    const resolvedAllocations = 'allocations' in result ? result.allocations : undefined
+    return NextResponse.json({
+      data: { success: true, ...(resolvedAllocations ? { allocations: resolvedAllocations } : {}) },
+    })
+  },
+  { requireWrite: true },
+)

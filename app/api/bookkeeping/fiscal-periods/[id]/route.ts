@@ -1,9 +1,7 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateBody } from '@/lib/api/validate'
 import { validatePeriodDuration, parseDateParts } from '@/lib/bookkeeping/validate-period-duration'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
 import { z } from 'zod'
 
 const UpdateFiscalPeriodSchema = z.object({
@@ -12,22 +10,14 @@ const UpdateFiscalPeriodSchema = z.object({
   period_end: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Slutdatum måste vara i format ÅÅÅÅ-MM-DD').optional(),
 })
 
-export async function PATCH(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+// Response shapes are legacy `{ error: string }` (Swedish) — the fiscal-year
+// settings UI renders them directly. Only the auth/company layer was moved
+// into withRouteContext.
+export const PATCH = withRouteContext(
+  'period.update',
+  async (request, ctx, { params }: { params: Promise<{ id: string }> }) => {
   const { id } = await params
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
+  const { supabase, companyId } = ctx
 
   const validation = await validateBody(request, UpdateFiscalPeriodSchema)
   if (!validation.success) return validation.response
@@ -72,25 +62,9 @@ export async function PATCH(
     const newStart = body.period_start || period.period_start
     const newEnd = body.period_end || period.period_end
 
-    // Enskild firma must use calendar year per BFL 3 kap.
-    const { data: companyRow } = await supabase
-      .from('companies')
-      .select('entity_type')
-      .eq('id', companyId)
-      .single()
-
-    if (companyRow?.entity_type === 'enskild_firma') {
-      const s = parseDateParts(newStart)
-      const e = parseDateParts(newEnd)
-      if (s.month !== 1 || s.day !== 1 || e.month !== 12 || e.day !== 31) {
-        return NextResponse.json(
-          { error: 'Enskild firma måste använda kalenderår (1 januari – 31 december) enligt BFL 3 kap.' },
-          { status: 400 }
-        )
-      }
-    }
-
-    // First period for this company may start on any day (BFL 3 kap.)
+    // First period for this company may start on any day (BFL 3 kap.).
+    // EF's first period may also extend to 31 dec next year (förlängt
+    // räkenskapsår, max 18 months) when the company started after 1 juli.
     const { count: earlierCount } = await supabase
       .from('fiscal_periods')
       .select('id', { count: 'exact', head: true })
@@ -100,7 +74,34 @@ export async function PATCH(
 
     const isFirstPeriod = !earlierCount || earlierCount === 0
 
-    // Validate period duration (max 18 months per BFL 3 kap.)
+    // Enskild firma must end on 31 december (BFL 3 kap.). Subsequent periods
+    // must also start on 1 januari. The first period may start any day.
+    const { data: companyRow } = await supabase
+      .from('companies')
+      .select('entity_type')
+      .eq('id', companyId)
+      .single()
+
+    if (companyRow?.entity_type === 'enskild_firma') {
+      const e = parseDateParts(newEnd)
+      if (e.month !== 12 || e.day !== 31) {
+        return NextResponse.json(
+          { error: 'Enskild firma måste ha slutdatum 31 december enligt BFL 3 kap.' },
+          { status: 400 }
+        )
+      }
+      if (!isFirstPeriod) {
+        const s = parseDateParts(newStart)
+        if (s.month !== 1 || s.day !== 1) {
+          return NextResponse.json(
+            { error: 'Enskild firma måste använda kalenderår (1 januari till 31 december) enligt BFL 3 kap.' },
+            { status: 400 }
+          )
+        }
+      }
+    }
+
+    // Validate period duration (max 18 months for first period, 12 for subsequent, per BFL 3 kap.)
     const durationError = validatePeriodDuration(newStart, newEnd, { isFirstPeriod })
     if (durationError) {
       return NextResponse.json({ error: durationError }, { status: 400 })
@@ -155,4 +156,6 @@ export async function PATCH(
   }
 
   return NextResponse.json({ data: updated })
-}
+  },
+  { requireWrite: true },
+)

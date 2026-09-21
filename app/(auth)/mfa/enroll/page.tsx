@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, Suspense } from 'react'
+import { useState, useRef, useEffect, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import { Button } from '@/components/ui/button'
@@ -8,6 +8,10 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useToast } from '@/components/ui/use-toast'
 import { Loader2, ShieldCheck, Copy, Check, ArrowLeft } from 'lucide-react'
+import { getBranding } from '@/lib/branding/service'
+import { userHasPassword } from '@/lib/auth/has-password'
+import { safeReturnTo } from '@/lib/auth/safe-return-to'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 export default function MfaEnrollPage() {
   return (
@@ -31,8 +35,49 @@ function MfaEnrollContent() {
   const searchParams = useSearchParams()
   const supabase = createClient()
 
-  const rawReturnTo = searchParams.get('returnTo') || '/'
-  const returnTo = rawReturnTo.startsWith('/') && !rawReturnTo.startsWith('//') ? rawReturnTo : '/'
+  const returnTo = safeReturnTo(searchParams.get('returnTo'), '/')
+
+  // Always a hard navigation, for two reasons that point the same way.
+  // Route-handler destinations (the MCP OAuth consent page sends new
+  // password accounts here with returnTo=/api/mcp-oauth/authorize...) return
+  // raw HTML the client router cannot render. And enrolling raises the
+  // session to aal2, which lib/supabase/middleware.ts only re-evaluates on a
+  // fresh document request: `router.push` followed by `router.refresh` raced,
+  // the refresh won, and the user was left on the QR screen with 2FA already
+  // active and no way forward but the address bar (#1948).
+  const leave = () => {
+    window.location.assign(returnTo)
+  }
+  // Back must not bounce into the consent page: with no factor enrolled it
+  // redirects straight back here. Abort the connect flow to the app instead.
+  const abort = () => {
+    router.push(returnTo.startsWith('/api/') ? '/' : returnTo)
+  }
+
+  // UX defense: middleware already blocks this route for BankID-only users
+  // without a password, but a stale tab might land here too. Bounce them to
+  // the set-password flow before they enroll a factor they cannot later
+  // un-enroll without AAL2.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser()
+      if (cancelled || !user) return
+      if (!userHasPassword(user)) {
+        router.replace(
+          `/account/set-password?returnTo=${encodeURIComponent(
+            `/mfa/enroll?returnTo=${encodeURIComponent(returnTo)}`,
+          )}`,
+        )
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const handleEnroll = async () => {
     setIsEnrolling(true)
@@ -50,13 +95,13 @@ function MfaEnrollContent() {
 
       const { data, error } = await supabase.auth.mfa.enroll({
         factorType: 'totp',
-        friendlyName: 'gnubok',
+        friendlyName: getBranding().appName.toLowerCase(),
       })
 
       if (error) {
         toast({
           title: 'Kunde inte aktivera 2FA',
-          description: error.message,
+          description: getUserErrorMessage(error),
           variant: 'destructive',
         })
         setIsEnrolling(false)
@@ -124,8 +169,7 @@ function MfaEnrollContent() {
         description: 'Ditt konto är nu skyddat med 2FA.',
       })
 
-      router.push(returnTo)
-      router.refresh()
+      leave()
     } catch {
       toast({
         title: 'Verifiering misslyckades',
@@ -147,21 +191,21 @@ function MfaEnrollContent() {
   // Step 1: Show enroll button
   if (!qrCode) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-b from-background to-primary/[0.03] p-4">
+      <div className="min-h-dvh flex flex-col items-center justify-center bg-frame p-4">
         <div className="w-full max-w-sm animate-slide-up">
           <div className="text-center mb-10">
             <div className="flex justify-center mb-4">
-              <div className="h-14 w-14 rounded-2xl bg-primary/8 flex items-center justify-center">
+              <div className="h-14 w-14 rounded-xl bg-primary/8 flex items-center justify-center">
                 <ShieldCheck className="h-7 w-7 text-primary" />
               </div>
             </div>
-            <h1 className="text-2xl font-medium tracking-tight">Aktivera tvåfaktorsautentisering</h1>
+            <h1 className="text-2xl tracking-tight">Aktivera tvåfaktorsautentisering</h1>
             <p className="text-muted-foreground text-sm mt-2">
               Skydda ditt konto med en autentiseringsapp som Google Authenticator eller Authy
             </p>
           </div>
 
-          <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
+          <div className="rounded-lg border bg-card p-6">
             <div className="space-y-4">
               <div className="rounded-lg border bg-muted/50 p-4">
                 <p className="text-sm text-muted-foreground leading-relaxed">
@@ -189,7 +233,7 @@ function MfaEnrollContent() {
           <Button
             variant="ghost"
             className="w-full mt-4 text-muted-foreground"
-            onClick={() => router.push(returnTo)}
+            onClick={abort}
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
             Tillbaka
@@ -201,21 +245,21 @@ function MfaEnrollContent() {
 
   // Step 2: Show QR code and verification
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-b from-background to-primary/[0.03] p-4">
+    <div className="min-h-dvh flex flex-col items-center justify-center bg-frame p-4">
       <div className="w-full max-w-sm animate-slide-up">
         <div className="text-center mb-8">
           <div className="flex justify-center mb-4">
-            <div className="h-14 w-14 rounded-2xl bg-primary/8 flex items-center justify-center">
+            <div className="h-14 w-14 rounded-xl bg-primary/8 flex items-center justify-center">
               <ShieldCheck className="h-7 w-7 text-primary" />
             </div>
           </div>
-          <h1 className="text-2xl font-medium tracking-tight">Skanna QR-koden</h1>
+          <h1 className="text-2xl tracking-tight">Skanna QR-koden</h1>
           <p className="text-muted-foreground text-sm mt-2">
             Öppna din autentiseringsapp och skanna koden nedan
           </p>
         </div>
 
-        <div className="rounded-xl border bg-card p-6 space-y-6" style={{ boxShadow: 'var(--shadow-md)' }}>
+        <div className="rounded-lg border bg-card p-6 space-y-6">
           {/* QR Code */}
           <div className="flex justify-center">
             <div
@@ -230,7 +274,7 @@ function MfaEnrollContent() {
               Kan du inte skanna? Ange denna nyckel manuellt:
             </p>
             <div className="flex items-center gap-2">
-              <code className="flex-1 rounded-md border bg-muted/50 px-3 py-2 text-xs font-mono text-center break-all select-all">
+              <code className="flex-1 rounded-sm border bg-muted/50 px-3 py-2 text-xs font-mono text-center break-all select-all">
                 {secret}
               </code>
               <Button
@@ -288,7 +332,7 @@ function MfaEnrollContent() {
         <Button
           variant="ghost"
           className="w-full mt-4 text-muted-foreground"
-          onClick={() => router.push(returnTo)}
+          onClick={abort}
         >
           <ArrowLeft className="mr-2 h-4 w-4" />
           Tillbaka

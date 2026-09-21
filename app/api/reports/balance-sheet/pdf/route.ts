@@ -1,21 +1,14 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { renderToBuffer } from '@react-pdf/renderer'
 import { generateBalanceSheet } from '@/lib/reports/balance-sheet'
 import { FinancialStatementPDF } from '@/lib/reports/financial-statement-pdf-template'
-import { requireCompanyId } from '@/lib/company/context'
+import { buildBalanceSheetPdfModel, balanceSheetImbalanceKronor } from '@/lib/reports/financial-statement-pdf'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { parseReportDateRange } from '@/lib/reports/date-range'
 import type { CompanySettings } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
+export const GET = withRouteContext('report.balance_sheet.pdf', async (request, { supabase, companyId }) => {
   const { searchParams } = new URL(request.url)
   const periodId = searchParams.get('period_id')
 
@@ -49,21 +42,19 @@ export async function GET(request: Request) {
     )
   }
 
+  const parsedRange = parseReportDateRange(searchParams, period)
+  if (!parsedRange.ok) {
+    return NextResponse.json({ error: parsedRange.error }, { status: 400 })
+  }
+  const range = parsedRange.range
+  const effectiveStart = range.fromDate ?? period.period_start
+  const effectiveEnd = range.toDate ?? period.period_end
+
   try {
-    const report = await generateBalanceSheet(supabase, companyId, periodId)
-    report.period = { start: period.period_start, end: period.period_end }
+    const report = await generateBalanceSheet(supabase, companyId, periodId, range)
+    report.period = { start: effectiveStart, end: effectiveEnd }
 
-    const totalAssets = report.total_assets
-    const totalEquityLiab = report.total_equity_liabilities
-
-    // ÅRL 3 kap / K2 / K3 require balansräkningen to balance. Compare rounded
-    // to whole kronor — matches SFL 22:1's truncation convention for statutory
-    // reports and is immune to floating-point accumulation across hundreds of
-    // ledger lines (öresavrundning noise under half a krona is never a real
-    // accounting error). The on-screen view still surfaces a "Balanserar ej"
-    // warning at öre precision so users can diagnose smaller discrepancies.
-    const diffInKronor = Math.abs(Math.round(totalAssets) - Math.round(totalEquityLiab))
-    if (diffInKronor >= 1) {
+    if (balanceSheetImbalanceKronor(report) >= 1) {
       return NextResponse.json(
         {
           error:
@@ -76,20 +67,7 @@ export async function GET(request: Request) {
     const pdfBuffer = await renderToBuffer(
       FinancialStatementPDF({
         title: 'Balansräkning',
-        groups: [
-          {
-            heading: 'Tillgångar',
-            sections: report.asset_sections,
-            totalLabel: 'Summa tillgångar',
-            total: totalAssets,
-          },
-          {
-            heading: 'Eget kapital och skulder',
-            sections: report.equity_liability_sections,
-            totalLabel: 'Summa eget kapital och skulder',
-            total: totalEquityLiab,
-          },
-        ],
+        groups: buildBalanceSheetPdfModel(report).groups,
         period: report.period,
         company: companyRow as CompanySettings,
         generatedAt: new Date().toISOString(),
@@ -97,8 +75,8 @@ export async function GET(request: Request) {
     )
 
     // "-utkast" suffix keeps the draft status visible even after the file
-    // leaves the browser — complements the in-document ÅRL 2:7 disclaimer.
-    const filename = `balansrakning-${report.period.start}-utkast.pdf`
+    // leaves the browser: complements the in-document ÅRL 2:7 disclaimer.
+    const filename = `balansrakning-${report.period.start}--${report.period.end}-utkast.pdf`
 
     return new Response(new Uint8Array(pdfBuffer), {
       headers: {
@@ -108,8 +86,8 @@ export async function GET(request: Request) {
     })
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Kunde inte generera balansräkning' },
+      { error: err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte generera balansräkning' },
       { status: 500 }
     )
   }
-}
+}, { requireCompleteLedger: true })

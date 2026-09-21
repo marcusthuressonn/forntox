@@ -1,6 +1,8 @@
 'use client'
 
 import { useState, useCallback } from 'react'
+import Link from 'next/link'
+import { useTranslations } from 'next-intl'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
@@ -16,8 +18,8 @@ import {
   FileText,
   AlertCircle,
   CheckCircle,
-  Building2,
   HelpCircle,
+  Landmark,
 } from 'lucide-react'
 import type { BankFileFormatId } from '@/lib/import/bank-file/types'
 
@@ -31,6 +33,8 @@ const FORMAT_NAMES: Record<string, string> = {
   ica_banken: 'ICA Banken',
   skandia: 'Skandia',
   lunar: 'Lunar',
+  northmill: 'Northmill',
+  wise: 'Wise',
   generic_csv: 'CSV (manuell mappning)',
   camt053: 'ISO 20022 camt.053',
 }
@@ -39,17 +43,23 @@ interface BankFileUploadStepProps {
   onFileSelect: (file: File, formatOverride?: BankFileFormatId) => void
   isLoading: boolean
   error: string | null
+  errorTitle?: string | null
   detectedFormat?: string | null
   detectedFormatName?: string | null
+  /** The uploaded file was recognized as a Skatteverket skattekontoutdrag. */
+  skattekontoDetected?: boolean
 }
 
 export default function BankFileUploadStep({
   onFileSelect,
   isLoading,
   error,
+  errorTitle,
   detectedFormat,
   detectedFormatName,
+  skattekontoDetected,
 }: BankFileUploadStepProps) {
+  const t = useTranslations('import')
   const [isDragging, setIsDragging] = useState(false)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [formatOverride, setFormatOverride] = useState<BankFileFormatId | undefined>(undefined)
@@ -131,6 +141,9 @@ export default function BankFileUploadStep({
                 <SelectItem value="ica_banken">ICA Banken</SelectItem>
                 <SelectItem value="skandia">Skandia</SelectItem>
                 <SelectItem value="lunar">Lunar</SelectItem>
+                <SelectItem value="northmill">Northmill</SelectItem>
+                <SelectItem value="wise">Wise</SelectItem>
+                <SelectItem value="wise_statement">{t('bank_format_wise_statement')}</SelectItem>
                 <SelectItem value="camt053">ISO 20022 camt.053 (XML)</SelectItem>
                 <SelectItem value="generic_csv">Annan CSV (manuell mappning)</SelectItem>
               </SelectContent>
@@ -174,8 +187,10 @@ export default function BankFileUploadStep({
                     {(selectedFile.size / 1024).toFixed(1)} KB
                   </p>
                   <Badge variant="secondary" className="mt-2">
-                    <Building2 className="mr-1 h-3 w-3" />
-                    {detectedFormatName || FORMAT_NAMES[detectedFormat] || detectedFormat}
+                    <Landmark className="mr-1 h-3 w-3" />
+                    {detectedFormat === 'wise_statement'
+                      ? t('bank_format_wise_statement')
+                      : detectedFormatName || FORMAT_NAMES[detectedFormat] || detectedFormat}
                   </Badge>
                 </div>
               </div>
@@ -193,12 +208,28 @@ export default function BankFileUploadStep({
             )}
           </div>
 
+          {/* Skattekonto redirect: not an error, a pointer to the right flow */}
+          {skattekontoDetected && (
+            <div className="p-4 bg-muted/30 border border-border rounded-lg flex gap-3">
+              <AlertCircle className="h-5 w-5 text-warning flex-shrink-0 mt-0.5" />
+              <div className="text-sm">
+                <p className="font-medium">{t('skattekonto_detected_title')}</p>
+                <p className="mt-1 text-muted-foreground">
+                  {t('skattekonto_detected_body')}{' '}
+                  <Link href="/import?mode=skattekonto" className="underline underline-offset-2">
+                    {t('skattekonto_detected_link')}
+                  </Link>
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Error display */}
           {error && (
             <div className="p-4 bg-destructive/10 border border-destructive/20 rounded-lg flex gap-3">
               <AlertCircle className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
               <div>
-                <p className="font-medium text-destructive">Kunde inte läsa filen</p>
+                <p className="font-medium text-destructive">{errorTitle || 'Kunde inte läsa filen'}</p>
                 <p className="text-sm text-muted-foreground">{error}</p>
               </div>
             </div>
@@ -224,7 +255,7 @@ export default function BankFileUploadStep({
           <div>
             <p className="font-medium">SEB</p>
             <p className="text-muted-foreground">
-              Logga in → Konton → Kontoutdrag → Hämta som fil (CSV)
+              Logga in → Konton → Transaktioner → Exportera (CSV), eller Kontoutdrag → Hämta som fil (CSV)
             </p>
           </div>
           <div>
@@ -261,6 +292,12 @@ export default function BankFileUploadStep({
             <p className="font-medium">Lunar</p>
             <p className="text-muted-foreground">
               Logga in → Konto → Transaktioner → Exportera (CSV)
+            </p>
+          </div>
+          <div>
+            <p className="font-medium">Northmill</p>
+            <p className="text-muted-foreground">
+              Logga in → Konto → Kontoutdrag → Ladda ner (CSV)
             </p>
           </div>
         </CardContent>

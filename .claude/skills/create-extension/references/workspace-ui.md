@@ -40,10 +40,7 @@ Settings component fetches/saves via extension API routes (`GET/PUT /settings`).
 
 ## Sidebar
 
-Enabled extensions auto-appear in the "Tillägg" sidebar section as links to `/e/{sector}/{slug}`. Additional nav items via:
-```typescript
-sidebarItems: [{ label: 'My Tool', icon: 'Wrench', path: '/tools/my-tool', order: 10 }]
-```
+The sidebar lists an enabled extension only when its manifest has both a `workspace` and `definition.quickAction.href`. `sidebarItems` is declared on the `Extension` type, but no core code reads it.
 
 ## Extension Enablement
 
@@ -59,5 +56,4 @@ const isAvailable = ENABLED_EXTENSION_IDS.has('my-extension')
 
 ```typescript
 const { data, save, remove, getByKey } = useExtensionData('general', 'my-extension')
-const { totals, monthly, totalNet } = useAccountTotals({ from, to, monthly: true })
 ```

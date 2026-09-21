@@ -149,18 +149,18 @@ function HeroMockup() {
 
   return (
     <div className="relative">
-      <div className="absolute -inset-8 rounded-[2.5rem] bg-primary/15 blur-3xl -z-10" />
+      <div className="absolute -inset-8 rounded-xl bg-primary/15 blur-3xl -z-10" />
 
       <div
-        className="relative rounded-2xl border overflow-hidden shadow-[var(--shadow-card)]"
+        className="relative rounded-xl border overflow-hidden shadow-[var(--shadow-card)]"
         style={{
           background: "oklch(0.92 0.012 95)",
           color: "oklch(0.26 0.018 150)",
-          ["--background" as string]: "oklch(0.96 0.010 95)",
-          ["--foreground" as string]: "oklch(0.24 0.020 150)",
-          ["--muted-foreground" as string]: "oklch(0.50 0.018 150)",
-          ["--border" as string]: "oklch(0.84 0.012 95)",
-          ["--card" as string]: "oklch(0.96 0.010 95)",
+          ["--background" as string]: "48 29% 94%",
+          ["--foreground" as string]: "131 16% 11%",
+          ["--muted-foreground" as string]: "129 5% 38%",
+          ["--border" as string]: "48 10% 78%",
+          ["--card" as string]: "48 29% 94%",
           borderColor: "oklch(0.82 0.014 95)",
         } as React.CSSProperties}
       >
@@ -179,16 +179,16 @@ function HeroMockup() {
         <div className="p-5 space-y-4 min-h-[420px]">
           <div className="rounded-xl border border-border/70 p-4 bg-background/40">
             <div className="flex items-center gap-3">
-              <div className="relative h-12 w-10 rounded-md border border-border overflow-hidden bg-paper text-paper-foreground shrink-0 transition">
+              <div className="relative h-12 w-10 rounded-sm border border-border overflow-hidden bg-paper text-paper-foreground shrink-0 transition">
                 <div className="px-1.5 pt-1.5 space-y-0.5">
-                  <div className="h-0.5 w-6 bg-paper-foreground/40 rounded" />
-                  <div className="h-0.5 w-5 bg-paper-foreground/30 rounded" />
-                  <div className="h-0.5 w-7 bg-paper-foreground/30 rounded" />
-                  <div className="h-0.5 w-4 bg-paper-foreground/30 rounded" />
-                  <div className="h-0.5 w-6 bg-paper-foreground/30 rounded" />
+                  <div className="h-0.5 w-6 bg-paper-foreground/40 rounded-sm" />
+                  <div className="h-0.5 w-5 bg-paper-foreground/30 rounded-sm" />
+                  <div className="h-0.5 w-7 bg-paper-foreground/30 rounded-sm" />
+                  <div className="h-0.5 w-4 bg-paper-foreground/30 rounded-sm" />
+                  <div className="h-0.5 w-6 bg-paper-foreground/30 rounded-sm" />
                 </div>
                 {step < 1 && (
-                  <div className="absolute inset-x-0 h-[2px] bg-primary shadow-[0_0_8px_var(--primary)] animate-[scanline_1.2s_ease-in-out_infinite]" />
+                  <div className="absolute inset-x-0 h-[2px] bg-primary shadow-[0_0_8px_hsl(var(--primary))] animate-[scanline_1.2s_ease-in-out_infinite]" />
                 )}
               </div>
               <div className="flex-1 min-w-0">
@@ -299,7 +299,7 @@ function HeroMockup() {
 
       <div
         className={
-          "absolute -left-4 sm:-left-8 top-32 max-w-[200px] rounded-2xl rounded-bl-sm bg-paper text-paper-foreground p-3 shadow-[var(--shadow-card)] transition-all duration-500 hidden sm:block " +
+          "absolute -left-4 sm:-left-8 top-32 max-w-[200px] rounded-xl rounded-bl-sm bg-paper text-paper-foreground p-3 shadow-[var(--shadow-card)] transition-all duration-500 hidden sm:block " +
           (step >= 2 && step < 4 ? "opacity-100 translate-y-0" : "opacity-0 translate-y-2 pointer-events-none")
         }
       >
@@ -311,7 +311,7 @@ function HeroMockup() {
 
       <div
         className={
-          "absolute -right-3 sm:-right-6 -bottom-4 rounded-2xl bg-primary text-primary-foreground p-4 shadow-[var(--shadow-card)] transition-all duration-700 " +
+          "absolute -right-3 sm:-right-6 -bottom-4 rounded-xl bg-primary text-primary-foreground p-4 shadow-[var(--shadow-card)] transition-all duration-700 " +
           (step >= 5 ? "opacity-100 translate-y-0 rotate-[-3deg]" : "opacity-0 translate-y-3 rotate-0")
         }
       >

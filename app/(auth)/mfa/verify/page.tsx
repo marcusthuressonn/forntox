@@ -1,7 +1,8 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, useEffect, useRef, Suspense } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { useTranslations } from 'next-intl'
 import { createClient } from '@/lib/supabase/client'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -9,8 +10,25 @@ import { Label } from '@/components/ui/label'
 import { useToast } from '@/components/ui/use-toast'
 import { Loader2, ShieldCheck, LogOut } from 'lucide-react'
 import { SupportLink } from '@/components/ui/support-link'
+import { safeReturnTo } from '@/lib/auth/safe-return-to'
+import { resolvePostLoginDestination } from '@/lib/company/post-login-landing'
+import {
+  consumeInviteCookie,
+  INVITE_PROBLEM_MESSAGE_KEYS,
+} from '@/lib/auth/consume-invite-cookie'
 
 export default function MfaVerifyPage() {
+  return (
+    <Suspense>
+      <MfaVerifyContent />
+    </Suspense>
+  )
+}
+
+function MfaVerifyContent() {
+  const t = useTranslations('mfa')
+  const tCommon = useTranslations('common')
+  const tInvite = useTranslations('invite')
   const [code, setCode] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [factorId, setFactorId] = useState<string | null>(null)
@@ -20,7 +38,14 @@ export default function MfaVerifyPage() {
   const inputRef = useRef<HTMLInputElement>(null)
   const { toast } = useToast()
   const router = useRouter()
+  const searchParams = useSearchParams()
   const supabase = createClient()
+
+  // Step-up landing target. Set by callers that need AAL2 to do something
+  // sensitive (set/change password, unenroll MFA, etc.): /api/account/password
+  // and SecuritySettings redirect here when GoTrue rejects with "AAL2 session
+  // is required". Falls back to the dashboard for direct visits.
+  const returnTo = safeReturnTo(searchParams.get('returnTo'), '/')
 
   useEffect(() => {
     async function loadFactor() {
@@ -29,7 +54,6 @@ export default function MfaVerifyPage() {
       if (verifiedFactor) {
         setFactorId(verifiedFactor.id)
       } else {
-        // No MFA factor enrolled — shouldn't be here
         router.push('/')
       }
     }
@@ -38,7 +62,6 @@ export default function MfaVerifyPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Lockout countdown timer
   useEffect(() => {
     if (!lockoutUntil) return
     const tick = () => {
@@ -50,6 +73,24 @@ export default function MfaVerifyPage() {
     const interval = setInterval(tick, 1000)
     return () => clearInterval(interval)
   }, [lockoutUntil])
+
+  // Accept a pending invite, if any, and report a non-definitive failure.
+  // Returns true when the caller should land the user in the app directly.
+  // The invite cookie survives anything that is not a settled outcome, so
+  // /onboarding and /select-company can retry acceptance server-side.
+  const acceptPendingInvite = async (): Promise<boolean> => {
+    const invite = await consumeInviteCookie()
+    if (invite.accepted) return true
+    if (invite.problem) {
+      const keys = INVITE_PROBLEM_MESSAGE_KEYS[invite.problem]
+      toast({
+        title: tInvite(keys.title),
+        description: tInvite(keys.body),
+        variant: 'destructive',
+      })
+    }
+    return false
+  }
 
   const handleVerify = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
@@ -64,8 +105,8 @@ export default function MfaVerifyPage() {
 
       if (challengeError) {
         toast({
-          title: 'Verifiering misslyckades',
-          description: 'Kunde inte starta verifiering. Försök igen.',
+          title: t('verify_failed_title'),
+          description: t('verify_challenge_failed_description'),
           variant: 'destructive',
         })
         setIsLoading(false)
@@ -82,7 +123,6 @@ export default function MfaVerifyPage() {
         const attempts = failedAttempts + 1
         setFailedAttempts(attempts)
 
-        // Exponential backoff after 3 failed attempts: 5s, 15s, 30s
         if (attempts >= 3) {
           const delays = [5_000, 15_000, 30_000]
           const delay = delays[Math.min(attempts - 3, delays.length - 1)]
@@ -90,8 +130,8 @@ export default function MfaVerifyPage() {
         }
 
         toast({
-          title: 'Fel kod',
-          description: 'Kontrollera koden och försök igen.',
+          title: t('wrong_code_title'),
+          description: t('wrong_code_description'),
           variant: 'destructive',
         })
         setCode('')
@@ -100,35 +140,32 @@ export default function MfaVerifyPage() {
         return
       }
 
-      // Check for pending invite token
-      const cookieMatch = document.cookie.match(/gnubok-invite-token=([^;]+)/)
-      const inviteToken = cookieMatch?.[1]
-
-      if (inviteToken) {
-        try {
-          const res = await fetch('/api/team/accept', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token: inviteToken }),
-          })
-
-          if (res.ok) {
-            document.cookie = 'gnubok-invite-token=; path=/; max-age=0'
-            window.location.href = '/'
-            return
-          }
-        } catch (err) {
-          console.error('[mfa/verify] invite acceptance failed:', err)
-        }
-        document.cookie = 'gnubok-invite-token=; path=/; max-age=0'
+      if (await acceptPendingInvite()) {
+        window.location.href = '/'
+        return
       }
 
-      router.push('/')
-      router.refresh()
+      // Hosted byrå staff hit MFA before any dashboard, so the cockpit
+      // landing (WL-14) resolves here too: only when no explicit step-up
+      // destination was requested. Everyone else keeps returnTo/'/' exactly
+      // as before (the helper degrades to '/' on any failure). The session
+      // is AAL2 at this point, so the /api MFA gate passes.
+      //
+      // Always a hard navigation, for two reasons that point the same way.
+      // Route-handler destinations (e.g. the MCP OAuth consent page) return
+      // raw HTML the client router cannot render. And verifying raises the
+      // session to aal2, which lib/supabase/middleware.ts only re-evaluates
+      // on a fresh document request: `router.push` followed by
+      // `router.refresh` raced, the refresh won, and the user stayed on the
+      // code screen; re-entering the same code is then rejected as reuse and
+      // bumps the lockout counter (#2056, the shape #1984 fixed on enroll).
+      // returnTo went through safeReturnTo and the helper only ever returns
+      // '/clients' or '/', so the navigation stays same-origin.
+      window.location.assign(returnTo === '/' ? await resolvePostLoginDestination() : returnTo)
     } catch {
       toast({
-        title: 'Verifiering misslyckades',
-        description: 'Ett oväntat fel uppstod. Försök igen.',
+        title: t('verify_failed_title'),
+        description: t('unexpected_error'),
         variant: 'destructive',
       })
     } finally {
@@ -142,24 +179,24 @@ export default function MfaVerifyPage() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-b from-background to-primary/[0.03] p-4">
+    <div className="min-h-dvh flex flex-col items-center justify-center bg-frame p-4">
       <div className="w-full max-w-sm animate-slide-up">
         <div className="text-center mb-10">
           <div className="flex justify-center mb-4">
-            <div className="h-14 w-14 rounded-2xl bg-primary/8 flex items-center justify-center">
+            <div className="h-14 w-14 rounded-xl bg-primary/8 flex items-center justify-center">
               <ShieldCheck className="h-7 w-7 text-primary" />
             </div>
           </div>
-          <h1 className="text-2xl font-medium tracking-tight">Tvåfaktorsverifiering</h1>
+          <h1 className="text-2xl tracking-tight">{t('verify_title')}</h1>
           <p className="text-muted-foreground text-sm mt-2">
-            Ange den 6-siffriga koden från din autentiseringsapp
+            {t('verify_subtitle_full')}
           </p>
         </div>
 
-        <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
+        <div className="rounded-lg border bg-card p-6">
           <form onSubmit={handleVerify} className="space-y-5">
             <div className="space-y-2">
-              <Label htmlFor="code">Verifieringskod</Label>
+              <Label htmlFor="code">{t('verify_code_label')}</Label>
               <Input
                 ref={inputRef}
                 id="code"
@@ -184,12 +221,12 @@ export default function MfaVerifyPage() {
               {isLoading ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Verifierar...
+                  {t('verifying')}
                 </>
               ) : lockoutUntil ? (
-                `Vänta ${lockoutRemaining}s`
+                t('wait_seconds', { seconds: lockoutRemaining })
               ) : (
-                'Verifiera'
+                t('verify_button')
               )}
             </Button>
           </form>
@@ -201,13 +238,13 @@ export default function MfaVerifyPage() {
           onClick={handleLogout}
         >
           <LogOut className="mr-2 h-4 w-4" />
-          Logga ut
+          {tCommon('logout')}
         </Button>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          Förlorat din autentiseringsapp?{' '}
-          <SupportLink variant="muted" subject="MFA-problem — kan inte logga in" className="inline">
-            Kontakta support
+          {t('lost_authenticator')}{' '}
+          <SupportLink variant="muted" subject="MFA: cannot sign in" className="inline">
+            {t('contact_support')}
           </SupportLink>
         </p>
       </div>

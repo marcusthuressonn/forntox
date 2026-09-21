@@ -1,8 +1,9 @@
 'use client'
 
 import { useState, useCallback, useEffect } from 'react'
+import { useCompanySettings } from '@/lib/reference-data/hooks'
+import { useTranslations } from 'next-intl'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -16,26 +17,91 @@ import {
 import { useExtensionData } from '@/lib/extensions/use-extension-data'
 import { useToast } from '@/components/ui/use-toast'
 import {
-  Building2,
   CheckCircle,
   XCircle,
   MapPin,
   Mail,
   Phone,
   Settings,
+  AlertTriangle,
+  CalendarRange,
+  ShieldCheck,
+  Users,
+  Receipt,
+  Briefcase,
 } from 'lucide-react'
+import { Badge } from '@/components/ui/badge'
 import Link from 'next/link'
 import type { WorkspaceComponentProps } from '@/lib/extensions/workspace-registry'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import type { TICCompanyProfile } from '@/extensions/general/tic/lib/tic-types'
 
+/**
+ * The profile is hydrated from a persisted `extension_data` jsonb blob, so its
+ * shape is whatever the TIC schema looked like when it was cached, not what
+ * TICCompanyProfile promises today. A blob written before the v2 upgrade (#584)
+ * has no `statuses` key at all, and `profile.statuses.length` on a rendered
+ * blob like that dropped the whole workspace into the error boundary.
+ *
+ * Normalising once at the hydration boundary keeps every list read below
+ * honest, including the ones a future schema change would otherwise break.
+ */
+function normalizeProfile(raw: unknown): TICCompanyProfile {
+  const p = (raw ?? {}) as Partial<TICCompanyProfile>
+  const list = <T,>(value: T[] | undefined | null): T[] => (Array.isArray(value) ? value : [])
+  return {
+    ...(p as TICCompanyProfile),
+    registration: p.registration ?? { fTax: false, vat: false, payroll: false },
+    sniCodes: list(p.sniCodes),
+    bankAccounts: list(p.bankAccounts),
+    beneficialOwners: list(p.beneficialOwners),
+    financialReports: list(p.financialReports),
+    fiscalYearHistory: list(p.fiscalYearHistory),
+    signatory: list(p.signatory),
+    representatives: list(p.representatives),
+    payrolls: list(p.payrolls),
+    statuses: list(p.statuses),
+    // Declared nullable, so undefined would already read as falsy at the
+    // render guards; normalised anyway so the object matches its own type.
+    fiscalYear: p.fiscalYear ?? null,
+    board: p.board ?? null,
+    financials: p.financials ?? null,
+  }
+}
+
 function formatKSEK(value: number | null): string {
-  if (value === null) return '—'
+  if (value === null) return '-'
   return `${(value * 1000).toLocaleString('sv-SE')} kr`
 }
 
 function formatPercent(value: number | null): string {
-  if (value === null) return '—'
+  if (value === null) return '-'
   return `${value.toFixed(1)} %`
+}
+
+function formatSek(value: number | null): string {
+  if (value === null || value === undefined) return '-'
+  return `${value.toLocaleString('sv-SE')} kr`
+}
+
+function formatIsoDate(iso: string | null): string {
+  if (!iso) return '-'
+  return iso.slice(0, 10)
+}
+
+function statusColorToVariant(
+  color: 'red' | 'yellow' | 'green' | 'neutral' | null
+): 'destructive' | 'warning' | 'success' | 'secondary' {
+  switch (color) {
+    case 'red':
+      return 'destructive'
+    case 'yellow':
+      return 'warning'
+    case 'green':
+      return 'success'
+    default:
+      return 'secondary'
+  }
 }
 
 function toMs(epoch: number): number {
@@ -48,47 +114,69 @@ function formatPeriod(start: number, end: number): string {
   const e = new Date(toMs(end))
   const fmt = (d: Date) =>
     d.toLocaleDateString('sv-SE', { year: 'numeric', month: '2-digit', day: '2-digit' })
-  return `${fmt(s)} – ${fmt(e)}`
+  return `${fmt(s)} to ${fmt(e)}`
 }
 
-function timeAgo(isoDate: string): string {
+function timeAgo(isoDate: string, t: (key: string, values?: Record<string, string | number>) => string): string {
   const diff = Date.now() - new Date(isoDate).getTime()
   const minutes = Math.floor(diff / 60000)
-  if (minutes < 1) return 'just nu'
-  if (minutes < 60) return `${minutes} min sedan`
+  if (minutes < 1) return t('time_just_now')
+  if (minutes < 60) return t('time_minutes_ago', { n: minutes })
   const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} tim sedan`
+  if (hours < 24) return t('time_hours_ago', { n: hours })
   const days = Math.floor(hours / 24)
-  return `${days} dag${days > 1 ? 'ar' : ''} sedan`
+  return t('time_days_ago', { n: days })
 }
 
+// Mirrors the live layout (two cards: company info + financials) so the
+// transition from the route-level loading.tsx to data-loaded content has no
+// visible reflow. Keep in sync with app/(dashboard)/e/[sector]/[slug]/loading.tsx.
 function ProfileSkeleton() {
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-2">
-        <Skeleton className="h-6 w-16" />
-        <Skeleton className="h-6 w-16" />
-        <Skeleton className="h-6 w-16" />
-      </div>
       <div className="grid gap-6 md:grid-cols-2">
         <Card>
-          <CardHeader>
-            <Skeleton className="h-5 w-40" />
+          <CardHeader className="space-y-2">
+            <Skeleton className="h-5 w-48" />
+            <Skeleton className="h-3.5 w-40" />
           </CardHeader>
           <CardContent className="space-y-3">
-            <Skeleton className="h-4 w-full" />
-            <Skeleton className="h-4 w-3/4" />
-            <Skeleton className="h-4 w-1/2" />
+            <div className="flex items-start gap-2">
+              <Skeleton className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+              <Skeleton className="h-3.5 flex-1 max-w-[260px]" />
+            </div>
+            <div className="flex items-center gap-2">
+              <Skeleton className="h-3.5 w-3.5 shrink-0" />
+              <Skeleton className="h-3.5 w-48" />
+            </div>
+            <div className="flex items-center gap-2">
+              <Skeleton className="h-3.5 w-3.5 shrink-0" />
+              <Skeleton className="h-3.5 w-36" />
+            </div>
+            <div className="pt-2 border-t space-y-1.5">
+              <Skeleton className="h-3 w-24" />
+              <Skeleton className="h-3 w-44" />
+            </div>
+            <div className="pt-2 border-t space-y-1.5">
+              <Skeleton className="h-3 w-20" />
+              <Skeleton className="h-3 w-full" />
+              <Skeleton className="h-3 w-3/4" />
+            </div>
+            <Skeleton className="h-3 w-32 mt-2" />
           </CardContent>
         </Card>
         <Card>
-          <CardHeader>
+          <CardHeader className="space-y-2">
             <Skeleton className="h-5 w-40" />
+            <Skeleton className="h-3.5 w-44" />
           </CardHeader>
           <CardContent>
             <div className="grid grid-cols-2 gap-4">
               {Array.from({ length: 6 }).map((_, i) => (
-                <Skeleton key={i} className="h-12 w-full" />
+                <div key={i} className="space-y-1.5">
+                  <Skeleton className="h-3 w-20" />
+                  <Skeleton className="h-4 w-24" />
+                </div>
               ))}
             </div>
           </CardContent>
@@ -101,6 +189,10 @@ function ProfileSkeleton() {
 export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
   const { getByKey, save, isLoading: isDataLoading } = useExtensionData('general', 'tic')
   const { toast } = useToast()
+  // org_number from the session-cached settings row (lib/reference-data):
+  // the profile fetch no longer pays a /api/settings round trip first.
+  const { settings: companySettings, error: settingsError } = useCompanySettings()
+  const t = useTranslations('tic_workspace')
   const [profile, setProfile] = useState<TICCompanyProfile | null>(null)
   const [isFetching, setIsFetching] = useState(false)
   const [noOrgNumber, setNoOrgNumber] = useState(false)
@@ -111,8 +203,13 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
   useEffect(() => {
     if (isDataLoading) return
     const cached = getByKey('company_profile')
-    if (cached?.value) {
-      setProfile(cached.value as unknown as TICCompanyProfile)
+    // Blobs written before the TIC v2 upgrade (#584) predate the statuses /
+    // board / payroll sections entirely. Rendering one normalized would show
+    // a permanently section-less profile, because the success path has no
+    // refresh button to repair it: leaving `profile` null instead lets the
+    // auto-fetch effect below pull the current shape and re-save it.
+    if (cached?.value && 'statuses' in cached.value) {
+      setProfile(normalizeProfile(cached.value))
     }
     setInitialLoad(false)
   }, [isDataLoading, getByKey])
@@ -123,14 +220,13 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
     setFetchFailed(false)
 
     try {
-      // Get org_number from company settings
-      const settingsRes = await fetch('/api/settings')
-      if (!settingsRes.ok) {
-        toast({ title: 'Kunde inte hämta inställningar', variant: 'destructive' })
+      // Get org_number from company settings (settled without a row = the
+      // same failure the old fetch reported).
+      if (settingsError) {
+        toast({ title: t('toast_settings_failed'), variant: 'destructive' })
         return
       }
-      const { data: settings } = await settingsRes.json()
-      const orgNumber = settings?.org_number
+      const orgNumber = companySettings?.org_number
 
       if (!orgNumber) {
         setNoOrgNumber(true)
@@ -142,22 +238,27 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
       )
 
       if (!res.ok) {
-        const { error } = await res.json()
-        toast({ title: error ?? 'Kunde inte hämta företagsprofil', variant: 'destructive' })
+        // `error` is the canonical envelope object, not a string: as a bare
+        // toast title it would render an object as a React child.
+        const body = await res.json().catch(() => null)
+        toast({
+          title: body?.error ? getErrorMessage(body, { statusCode: res.status }) : t('toast_profile_failed'),
+          variant: 'destructive',
+        })
         setFetchFailed(true)
         return
       }
 
       const { data } = await res.json()
-      setProfile(data)
+      setProfile(normalizeProfile(data))
       await save('company_profile', data)
     } catch {
-      toast({ title: 'Ett oväntat fel inträffade', variant: 'destructive' })
+      toast({ title: t('toast_unexpected_error'), variant: 'destructive' })
       setFetchFailed(true)
     } finally {
       setIsFetching(false)
     }
-  }, [save, toast])
+  }, [save, toast, t, companySettings, settingsError])
 
   // Auto-fetch on first visit when no cached data
   useEffect(() => {
@@ -174,14 +275,14 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
     return (
       <div className="flex flex-col items-center justify-center py-16 text-center">
         <Settings className="h-12 w-12 text-muted-foreground/40 mb-4" />
-        <h3 className="text-lg font-medium text-foreground">
-          Inget organisationsnummer
+        <h3 className="text-lg text-foreground">
+          {t('no_org_number_title')}
         </h3>
         <p className="text-sm text-muted-foreground mt-1 max-w-md">
-          Ange organisationsnummer under Inställningar för att visa företagsprofilen.
+          {t('no_org_number_description')}
         </p>
         <Button variant="outline" className="mt-4" asChild>
-          <Link href="/settings">Gå till Inställningar</Link>
+          <Link href="/settings">{t('go_to_settings')}</Link>
         </Button>
       </div>
     )
@@ -195,18 +296,18 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
     return (
       <div className="flex flex-col items-center justify-center py-16 text-center">
         <XCircle className="h-12 w-12 text-muted-foreground/40 mb-4" />
-        <h3 className="text-lg font-medium text-foreground">
-          Kunde inte hämta företagsprofil
+        <h3 className="text-lg text-foreground">
+          {t('fetch_failed_title')}
         </h3>
         <p className="text-sm text-muted-foreground mt-1 max-w-md">
-          Kontrollera att organisationsnumret i inställningarna är korrekt och försök igen.
+          {t('fetch_failed_description')}
         </p>
         <div className="flex gap-3 mt-4">
           <Button variant="outline" asChild>
-            <Link href="/settings">Inställningar</Link>
+            <Link href="/settings">{t('settings')}</Link>
           </Button>
           <Button variant="outline" onClick={fetchProfile} disabled={isFetching}>
-            Försök igen
+            {t('retry')}
           </Button>
         </div>
       </div>
@@ -216,33 +317,30 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
   if (!profile) return null
 
   const isActive = profile.activityStatus !== 'ceased'
+  const registrations = [
+    profile.registration.fTax && t('reg_f_tax'),
+    profile.registration.vat && t('reg_vat'),
+    profile.registration.payroll && t('reg_employer'),
+  ].filter((label): label is string => Boolean(label))
 
   return (
     <div className="space-y-6">
-      {/* Status bar */}
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge variant={isActive ? 'success' : 'destructive'}>
-          {isActive ? 'Aktiv' : 'Avregistrerat'}
-        </Badge>
-        {profile.registration.fTax && <Badge variant="outline">F-skatt</Badge>}
-        {profile.registration.vat && <Badge variant="outline">Moms</Badge>}
-        {profile.registration.payroll && <Badge variant="outline">Arbetsgivare</Badge>}
-
-        <span className="ml-auto text-xs text-muted-foreground">
-          Uppdaterad {timeAgo(profile.fetchedAt)}
-        </span>
-      </div>
-
       <div className="grid gap-6 md:grid-cols-2">
         {/* Company info card */}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
-              <Building2 className="h-4 w-4" />
-              {profile.companyName}
+              <Briefcase className="h-4 w-4" />
+              {/* data-ph-mask: the looked-up company name is user data */}
+              <span data-ph-mask="">{profile.companyName}</span>
             </CardTitle>
             <CardDescription>
-              {profile.orgNumber} &middot; {profile.legalEntityType}
+              {/* data-ph-mask: TIC serves the orgnr in unnormalized format, so
+                  the separator-based pattern scrub cannot be relied on */}
+              <span data-ph-mask="">{profile.orgNumber}</span> &middot; {profile.legalEntityType}
+              {!isActive && (
+                <span className="ml-2 text-destructive">&middot; {t('deregistered')}</span>
+              )}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3 text-sm">
@@ -268,9 +366,15 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
                 <span>{profile.phone}</span>
               </div>
             )}
+            {registrations.length > 0 && (
+              <div className="pt-2 border-t">
+                <p className="text-xs font-medium text-muted-foreground mb-1">{t('registered_for')}</p>
+                <p className="text-xs text-muted-foreground">{registrations.join(' · ')}</p>
+              </div>
+            )}
             {profile.sniCodes.length > 0 && (
               <div className="pt-2 border-t">
-                <p className="text-xs font-medium text-muted-foreground mb-1">SNI-koder</p>
+                <p className="text-xs font-medium text-muted-foreground mb-1">{t('sni_codes')}</p>
                 <div className="space-y-0.5">
                   {profile.sniCodes
                     .filter((sni, i, arr) => arr.findIndex(s => s.code === sni.code) === i)
@@ -285,7 +389,7 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
             )}
             {profile.bankAccounts.length > 0 && (
               <div className="pt-2 border-t">
-                <p className="text-xs font-medium text-muted-foreground mb-1">Bankuppgifter</p>
+                <p className="text-xs font-medium text-muted-foreground mb-1">{t('bank_accounts')}</p>
                 <div className="space-y-0.5">
                   {profile.bankAccounts.map((ba, i) => (
                     <p key={i} className="text-xs text-muted-foreground">
@@ -298,7 +402,7 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
             )}
             {profile.purpose && (
               <div className="pt-2 border-t">
-                <p className="text-xs font-medium text-muted-foreground mb-1">Verksamhet</p>
+                <p className="text-xs font-medium text-muted-foreground mb-1">{t('purpose')}</p>
                 <p className="text-xs text-muted-foreground">{profile.purpose}</p>
               </div>
             )}
@@ -306,23 +410,26 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
               <div className="pt-2 border-t">
                 {profile.employeeRange && (
                   <p className="text-xs text-muted-foreground">
-                    Anställda: {profile.employeeRange}
+                    {t('employees_range', { range: profile.employeeRange })}
                   </p>
                 )}
                 {profile.turnoverRange && (
                   <p className="text-xs text-muted-foreground">
-                    Omsättning: {profile.turnoverRange}
+                    {t('turnover_range', { range: profile.turnoverRange })}
                   </p>
                 )}
               </div>
             )}
+            <p className="pt-2 text-xs text-muted-foreground/70">
+              {t('updated_ago', { ago: timeAgo(profile.fetchedAt, t) })}
+            </p>
           </CardContent>
         </Card>
 
         {/* Financials card */}
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Senaste bokslut</CardTitle>
+            <CardTitle className="text-base">{t('latest_closing')}</CardTitle>
             {profile.financials && (
               <CardDescription>
                 {formatPeriod(profile.financials.periodStart, profile.financials.periodEnd)}
@@ -332,51 +439,260 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
           <CardContent>
             {profile.financials ? (
               <div className="grid grid-cols-2 gap-4">
-                <FinancialCell label="Omsättning" value={formatKSEK(profile.financials.netSalesK)} />
+                <FinancialCell label={t('net_sales')} value={formatKSEK(profile.financials.netSalesK)} />
                 <FinancialCell
-                  label="Rörelseresultat"
+                  label={t('operating_profit')}
                   value={formatKSEK(profile.financials.operatingProfitK)}
                   negative={(profile.financials.operatingProfitK ?? 0) < 0}
                 />
-                <FinancialCell label="Totala tillgångar" value={formatKSEK(profile.financials.totalAssetsK)} />
+                <FinancialCell label={t('total_assets')} value={formatKSEK(profile.financials.totalAssetsK)} />
                 <FinancialCell
-                  label="Anställda"
+                  label={t('employees')}
                   value={profile.financials.numberOfEmployees !== null
                     ? String(profile.financials.numberOfEmployees)
-                    : '—'}
+                    : '-'}
                 />
                 <FinancialCell
-                  label="Rörelsemarginal"
+                  label={t('operating_margin')}
                   value={formatPercent(profile.financials.operatingMargin)}
                   negative={(profile.financials.operatingMargin ?? 0) < 0}
                 />
                 <FinancialCell
-                  label="Soliditet"
+                  label={t('equity_ratio')}
                   value={formatPercent(profile.financials.equityAssetsRatio)}
                 />
               </div>
             ) : (
-              <p className="text-sm text-muted-foreground">Inga finansiella uppgifter tillgängliga.</p>
+              <p className="text-sm text-muted-foreground">{t('no_financials')}</p>
             )}
           </CardContent>
         </Card>
       </div>
 
-      {/* Financial reports table */}
-      {profile.financialReports.length > 0 && (
+      {/* Status entries: most recent first; usually 1-3 rows */}
+      {profile.statuses.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Årsredovisningar</CardTitle>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ShieldCheck className="h-4 w-4" />
+              {t('status_section')}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ul className="space-y-2">
+              {profile.statuses.slice(0, 6).map((status, i) => (
+                <li key={i} className="flex items-center justify-between gap-3 text-sm">
+                  <div className="flex items-center gap-2">
+                    {/* data-ph-mask: the Bolagsverket status text is user data */}
+                    <Badge variant={statusColorToVariant(status.color)} data-ph-mask="">
+                      {status.description ?? status.code ?? '-'}
+                    </Badge>
+                    {status.isCeased && (
+                      <span className="text-xs text-muted-foreground">
+                        {t('deregistered')}
+                      </span>
+                    )}
+                  </div>
+                  <span className="text-xs text-muted-foreground tabular-nums">
+                    {formatIsoDate(status.statusDate)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Fiscal year + signatory side-by-side */}
+      {(profile.fiscalYear || profile.signatory.length > 0) && (
+        <div className="grid gap-6 md:grid-cols-2">
+          {profile.fiscalYear && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <CalendarRange className="h-4 w-4" />
+                  {t('fiscal_year_section')}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm">
+                <p className="font-mono tabular-nums">
+                  {t('fiscal_year_current', {
+                    start: profile.fiscalYear.startMonthDay ?? '-',
+                    end: profile.fiscalYear.endMonthDay ?? '-',
+                  })}
+                </p>
+                {profile.fiscalYearHistory.length > 1 && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('fiscal_year_changed', { n: profile.fiscalYearHistory.length - 1 })}
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          )}
+          {profile.signatory.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">{t('signatory_section')}</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm">
+                {profile.signatory.map((s, i) => (
+                  <p key={i} className="text-muted-foreground whitespace-pre-line">
+                    {s.description}
+                  </p>
+                ))}
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {/* Board summary + representatives */}
+      {(profile.board || profile.representatives.length > 0) && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Users className="h-4 w-4" />
+              {t('board_section')}
+            </CardTitle>
+            {profile.board && (
+              <CardDescription className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                {profile.board.numberOfBoardMembers !== null && (
+                  <span>
+                    {t('board_summary_members', { n: profile.board.numberOfBoardMembers })}
+                  </span>
+                )}
+                {profile.board.numberOfDeputyBoardMembers !== null && profile.board.numberOfDeputyBoardMembers > 0 && (
+                  <span>
+                    {t('board_summary_deputies', { n: profile.board.numberOfDeputyBoardMembers })}
+                  </span>
+                )}
+                {profile.board.hasVacancy && (
+                  <Badge variant="warning" className="gap-1">
+                    <AlertTriangle className="h-3 w-3" />
+                    {t('board_vacancy')}
+                  </Badge>
+                )}
+                {profile.board.missingCEODate && (
+                  <span className="text-warning">
+                    {t('board_missing_ceo', { date: formatIsoDate(profile.board.missingCEODate) })}
+                  </span>
+                )}
+                {profile.board.missingAuditor && (
+                  <span className="text-warning">
+                    {t('board_missing_auditor', { date: formatIsoDate(profile.board.missingAuditor) })}
+                  </span>
+                )}
+              </CardDescription>
+            )}
+          </CardHeader>
+          <CardContent>
+            {profile.representatives.length > 0 ? (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{t('col_name')}</TableHead>
+                    <TableHead>{t('col_position')}</TableHead>
+                    <TableHead>{t('col_since')}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {profile.representatives.slice(0, 12).map((p, i) => (
+                    <TableRow key={i}>
+                      <TableCell className="text-sm">{p.name ?? '-'}</TableCell>
+                      <TableCell className="text-sm">
+                        {p.positionDescription ?? p.positionType ?? '-'}
+                      </TableCell>
+                      <TableCell className="text-xs tabular-nums text-muted-foreground">
+                        {formatIsoDate(p.positionStart)}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            ) : (
+              <p className="text-sm text-muted-foreground">{t('board_no_representatives')}</p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Payroll history: payroll2 array, newest first */}
+      {profile.payrolls.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Receipt className="h-4 w-4" />
+              {t('payroll_section')}
+            </CardTitle>
           </CardHeader>
           <CardContent>
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Period</TableHead>
-                  <TableHead>Titel</TableHead>
-                  <TableHead>Inlämnad</TableHead>
-                  <TableHead>Reviderad</TableHead>
-                  <TableHead>Revisionsutlåtande</TableHead>
+                  <TableHead>{t('col_payroll_period')}</TableHead>
+                  <TableHead className="text-right">{t('col_payroll_employees')}</TableHead>
+                  <TableHead className="text-right">{t('col_payroll_tax')}</TableHead>
+                  <TableHead className="text-right">{t('col_payroll_personnel_costs')}</TableHead>
+                  <TableHead className="text-right">{t('col_payroll_deviation')}</TableHead>
+                  <TableHead className="text-right">{t('col_payroll_late_fees')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {profile.payrolls.slice(0, 10).map((p, i) => (
+                  <TableRow key={i}>
+                    <TableCell className="font-mono tabular-nums text-xs">
+                      {p.periodStart && p.periodEnd
+                        ? `${formatIsoDate(p.periodStart)} to ${formatIsoDate(p.periodEnd)}`
+                        : '-'}
+                    </TableCell>
+                    <TableCell className="text-right text-sm tabular-nums">
+                      {p.numberOfEmployees !== null ? p.numberOfEmployees.toFixed(0) : '-'}
+                    </TableCell>
+                    <TableCell className="text-right text-sm tabular-nums">
+                      {formatSek(p.sumPayrollTax)}
+                    </TableCell>
+                    <TableCell className="text-right text-sm tabular-nums">
+                      {formatSek(p.calculatedPersonnelCosts)}
+                    </TableCell>
+                    <TableCell
+                      className={`text-right text-sm tabular-nums ${
+                        p.deviation !== null && Math.abs(p.deviation) > 0.1
+                          ? 'text-warning'
+                          : 'text-muted-foreground'
+                      }`}
+                    >
+                      {p.deviation !== null ? `${(p.deviation * 100).toFixed(1)} %` : '-'}
+                    </TableCell>
+                    <TableCell
+                      className={`text-right text-sm tabular-nums ${
+                        (p.numberOfLateFeesForPeriod ?? 0) > 0 ? 'text-destructive' : 'text-muted-foreground'
+                      }`}
+                    >
+                      {p.numberOfLateFeesForPeriod ?? 0}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Financial reports table */}
+      {profile.financialReports.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">{t('annual_reports')}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t('col_period')}</TableHead>
+                  <TableHead>{t('col_title')}</TableHead>
+                  <TableHead>{t('col_filed')}</TableHead>
+                  <TableHead>{t('col_audited')}</TableHead>
+                  <TableHead>{t('col_audit_opinion')}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -392,14 +708,14 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
                     <TableRow key={report.financialReportSummaryId ?? i}>
                       <TableCell className="font-mono tabular-nums text-xs">
                         {report.periodStart && report.periodEnd
-                          ? `${report.periodStart.slice(0, 10)} – ${report.periodEnd.slice(0, 10)}`
-                          : '—'}
+                          ? `${report.periodStart.slice(0, 10)} to ${report.periodEnd.slice(0, 10)}`
+                          : '-'}
                       </TableCell>
-                      <TableCell className="text-xs">{report.title ?? '—'}</TableCell>
+                      <TableCell className="text-xs">{report.title ?? '-'}</TableCell>
                       <TableCell className="text-xs">
                         {report.arrivalDate
                           ? new Date(report.arrivalDate).toLocaleDateString('sv-SE')
-                          : '—'}
+                          : '-'}
                       </TableCell>
                       <TableCell>
                         {report.isAudited === true ? (
@@ -407,10 +723,10 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
                         ) : report.isAudited === false ? (
                           <XCircle className="h-3.5 w-3.5 text-muted-foreground" />
                         ) : (
-                          <span className="text-xs text-muted-foreground">—</span>
+                          <span className="text-xs text-muted-foreground">-</span>
                         )}
                       </TableCell>
-                      <TableCell className="text-xs">{report.auditOpinion ?? '—'}</TableCell>
+                      <TableCell className="text-xs">{report.auditOpinion ?? '-'}</TableCell>
                     </TableRow>
                   ))}
               </TableBody>

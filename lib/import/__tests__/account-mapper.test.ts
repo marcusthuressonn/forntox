@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import type { BASAccount } from '@/types'
 import type { BASReferenceAccount } from '@/lib/bookkeeping/bas-reference'
 import type { SIEAccount, SIEAccountMappingRecord } from '../types'
+import { classifyAccount } from '@/lib/bookkeeping/account-classifier'
 import {
   suggestMappings,
   validateMappings,
@@ -15,14 +16,7 @@ import {
 
 function makeBASAccount(number: string, name: string): BASAccount {
   const classNum = parseInt(number.charAt(0), 10)
-  const accountType =
-    classNum <= 1
-      ? 'asset'
-      : classNum === 2
-        ? 'liability'
-        : classNum === 3
-          ? 'revenue'
-          : 'expense'
+  const classified = classifyAccount(number)
   return {
     id: `bas-${number}`,
     user_id: 'user-1',
@@ -31,12 +25,13 @@ function makeBASAccount(number: string, name: string): BASAccount {
     account_name: name,
     account_class: classNum,
     account_group: number.substring(0, 2),
-    account_type: accountType,
-    normal_balance: classNum <= 1 || classNum >= 4 ? 'debit' : 'credit',
+    account_type: classified.account_type,
+    normal_balance: classified.normal_balance,
     plan_type: 'k1',
     is_active: true,
     is_system_account: false,
     default_vat_code: null,
+    default_vat_rate: null,
     description: null,
     sru_code: null,
     k2_excluded: false,
@@ -113,6 +108,20 @@ describe('suggestMappings', () => {
     expect(result[0].matchType).toBe('bas_range')
   })
 
+  // Issue #2212: an account referenced only by #TRANS/#IB arrives without a
+  // #KONTO name. Refusing the self-map left it unmapped with no self-target to
+  // pick, while the parser had already promised it would be created.
+  it('self-maps a nameless in-range account (referenced without #KONTO)', () => {
+    const source = [makeSIEAccount('4599', '')]
+    const result = suggestMappings(source, basAccounts)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].targetAccount).toBe('4599')
+    expect(result[0].targetName).toBe('')
+    expect(result[0].matchType).toBe('bas_range')
+    expect(result[0].confidence).toBe(0.7)
+  })
+
   it('does not self-map accounts outside BAS range (9000+)', () => {
     const source = [makeSIEAccount('9100', 'Internt konto')]
     const result = suggestMappings(source, basAccounts)
@@ -153,6 +162,35 @@ describe('suggestMappings', () => {
     expect(result[0].targetAccount).toBe('3001')
     expect(result[0].isOverride).toBe(true)
     expect(result[0].matchType).toBe('manual')
+  })
+
+  it('takes the source name from the file, not from the stored mapping', () => {
+    // A source system renames an account between fiscal years. The override
+    // remembers the target that was chosen; the name is a fact about the file
+    // being imported. Real case: Spiris swapped the names of 3541 and 3542
+    // between 2022 and 2023 to match BAS, so the stored name would have shown
+    // "export" beside this year's EU momskod.
+    const source = [makeSIEAccount('3541', 'Faktureringsavgifter, EU-land')]
+    const existingMappings: SIEAccountMappingRecord[] = [
+      {
+        id: 'map-1',
+        user_id: 'user-1',
+        source_account: '3541',
+        source_name: 'Faktureringsavgifter, export',
+        target_account: '3541',
+        confidence: 1.0,
+        match_type: 'exact',
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]
+
+    const result = suggestMappings(source, basAccounts, existingMappings)
+
+    expect(result[0].sourceName).toBe('Faktureringsavgifter, EU-land')
+    // The target choice it was stored for still survives.
+    expect(result[0].targetAccount).toBe('3541')
+    expect(result[0].isOverride).toBe(true)
   })
 
   it('sorts by confidence (lowest first)', () => {
@@ -217,7 +255,7 @@ describe('suggestMappings', () => {
     expect(result[0].targetAccount).toBe('2641')
   })
 
-  it('handles empty BAS accounts — bas_range fallback for valid accounts', () => {
+  it('handles empty BAS accounts: bas_range fallback for valid accounts', () => {
     const source = [makeSIEAccount('1510', 'Kundfordringar')]
     const result = suggestMappings(source, [])
 

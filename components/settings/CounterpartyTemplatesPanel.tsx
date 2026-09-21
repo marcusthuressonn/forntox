@@ -1,33 +1,19 @@
 'use client'
 
+import { useTranslations } from 'next-intl'
 import { useState, useEffect, useCallback } from 'react'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
+import { EmptyState } from '@/components/ui/empty-state'
+import { Input } from '@/components/ui/input'
 import { useToast } from '@/components/ui/use-toast'
-import { Loader2, Trash2, Users, ChevronDown } from 'lucide-react'
+import { SettingsGroup } from '@/components/settings/SettingsRows'
+import { Loader2, Trash2, Users, ChevronDown, Pencil } from 'lucide-react'
 import { formatAccountWithName } from '@/lib/bookkeeping/client-account-names'
 import { formatCounterpartyName } from '@/lib/bookkeeping/counterparty-templates'
 import type { CategorizationTemplate } from '@/types'
 
-const SOURCE_LABELS: Record<string, string> = {
-  sie_import: 'SIE-import',
-  user_approved: 'Godkänd',
-  auto_learned: 'Automatisk',
-  sni_default: 'Standard',
-}
-
-const VAT_LABELS: Record<string, string> = {
-  standard_25: '25%',
-  reduced_12: '12%',
-  reduced_6: '6%',
-  reverse_charge: 'Omvänd',
-  export: 'Export',
-  exempt: 'Momsfri',
-}
-
 function formatDate(iso: string | null) {
-  if (!iso) return '—'
+  if (!iso) return '-'
   return new Date(iso).toLocaleDateString('sv-SE', {
     year: 'numeric',
     month: 'short',
@@ -36,18 +22,38 @@ function formatDate(iso: string | null) {
 }
 
 function confidenceColor(c: number): string {
-  if (c >= 0.8) return 'text-emerald-600 dark:text-emerald-400'
-  if (c >= 0.5) return 'text-amber-600 dark:text-amber-400'
+  if (c >= 0.8) return 'text-success'
+  if (c >= 0.5) return 'text-warning'
   return 'text-muted-foreground'
 }
 
 export function CounterpartyTemplatesPanel() {
+  const t = useTranslations('settings_counterparty_templates')
   const { toast } = useToast()
+
+  const SOURCE_LABELS: Record<string, string> = {
+    sie_import: t('source_sie_import'),
+    user_approved: t('source_user_approved'),
+    auto_learned: t('source_auto_learned'),
+    sni_default: t('source_sni_default'),
+  }
+
+  const VAT_LABELS: Record<string, string> = {
+    standard_25: '25%',
+    reduced_12: '12%',
+    reduced_6: '6%',
+    reverse_charge: t('vat_reverse_charge'),
+    export: t('vat_export'),
+    exempt: t('vat_exempt'),
+  }
 
   const [templates, setTemplates] = useState<CategorizationTemplate[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editName, setEditName] = useState('')
+  const [savingId, setSavingId] = useState<string | null>(null)
 
   const fetchTemplates = useCallback(async () => {
     try {
@@ -57,11 +63,11 @@ export function CounterpartyTemplatesPanel() {
         setTemplates(json.data)
       }
     } catch {
-      toast({ title: 'Fel', description: 'Kunde inte hämta mallar', variant: 'destructive' })
+      toast({ title: t('toast_fetch_failed'), variant: 'destructive' })
     } finally {
       setIsLoading(false)
     }
-  }, [toast])
+  }, [toast, t])
 
   useEffect(() => {
     fetchTemplates()
@@ -76,184 +82,257 @@ export function CounterpartyTemplatesPanel() {
         body: JSON.stringify({ id }),
       })
       if (!res.ok) {
-        toast({ title: 'Fel', description: 'Kunde inte ta bort mall', variant: 'destructive' })
+        toast({ title: t('toast_delete_failed'), variant: 'destructive' })
         return
       }
-      setTemplates((prev) => prev.filter((t) => t.id !== id))
+      setTemplates((prev) => prev.filter((tt) => tt.id !== id))
       if (expandedId === id) setExpandedId(null)
-      toast({ title: 'Mall borttagen' })
+      toast({ title: t('toast_deleted') })
     } catch {
-      toast({ title: 'Fel', description: 'Kunde inte ta bort mall', variant: 'destructive' })
+      toast({ title: t('toast_delete_failed'), variant: 'destructive' })
     } finally {
       setDeletingId(null)
     }
   }
 
+  function startRename(tt: CategorizationTemplate) {
+    setEditingId(tt.id)
+    setEditName(formatCounterpartyName(tt.counterparty_name))
+  }
+
+  function cancelRename() {
+    setEditingId(null)
+    setEditName('')
+  }
+
+  async function handleRename(id: string) {
+    const name = editName.trim()
+    if (!name) return
+    setSavingId(id)
+    try {
+      const res = await fetch('/api/settings/counterparty-templates', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, counterparty_name: name }),
+      })
+      if (res.status === 409) {
+        toast({ title: t('toast_duplicate_name'), variant: 'destructive' })
+        return
+      }
+      if (!res.ok) {
+        toast({ title: t('toast_rename_failed'), variant: 'destructive' })
+        return
+      }
+      const json = (await res.json()) as { data?: CategorizationTemplate }
+      if (json.data) {
+        const updated = json.data
+        setTemplates((prev) => prev.map((tt) => (tt.id === id ? { ...tt, ...updated } : tt)))
+      }
+      cancelRename()
+      toast({ title: t('toast_renamed') })
+    } catch {
+      toast({ title: t('toast_rename_failed'), variant: 'destructive' })
+    } finally {
+      setSavingId(null)
+    }
+  }
+
   return (
-    <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle>Bokföringsmallar</CardTitle>
-          <CardDescription>
-            Inlärda mönster som automatiskt föreslår kontering baserat på motpart.
-            Mallar skapas från SIE-import och när du godkänner kategoriseringar.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {isLoading ? (
-            <div className="flex items-center justify-center py-8">
-              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-            </div>
-          ) : templates.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-8 text-center">
-              <Users className="h-8 w-8 text-muted-foreground/50 mb-3" />
-              <p className="text-sm text-muted-foreground">Inga mallar ännu.</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                Mallar skapas automatiskt när du kategoriserar transaktioner eller importerar en SIE-fil.
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-1">
-              {templates.map((t) => {
-                const isExpanded = expandedId === t.id
-                const isMultiLine = t.line_pattern && t.line_pattern.length > 0
+    <SettingsGroup label={t('title')} help={t('description')}>
+      {isLoading ? (
+        <div className="flex items-center justify-center py-8">
+          <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+        </div>
+      ) : templates.length === 0 ? (
+        <EmptyState
+          icon={Users}
+          title={t('empty_title')}
+          description={t('empty_help')}
+        />
+      ) : (
+        templates.map((tt) => {
+          const isExpanded = expandedId === tt.id
+          const isMultiLine = tt.line_pattern && tt.line_pattern.length > 0
 
-                return (
-                  <div key={t.id} className="rounded-md border overflow-hidden">
-                    {/* Clickable summary row */}
-                    <button
-                      type="button"
-                      onClick={() => setExpandedId(isExpanded ? null : t.id)}
-                      className="w-full text-left px-4 py-3 flex items-center gap-3 hover:bg-muted/50 transition-colors"
-                    >
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <p className="text-sm font-medium truncate">{formatCounterpartyName(t.counterparty_name)}</p>
-                          <Badge variant="outline" className="text-[10px] shrink-0">
-                            {SOURCE_LABELS[t.source] || t.source}
-                          </Badge>
-                        </div>
-                        <div className="flex items-center gap-1.5 mt-0.5 text-xs text-muted-foreground">
-                          {isMultiLine ? (
-                            <span className="font-mono">
-                              {t.line_pattern!.filter(lp => lp.type === 'business').map(lp => lp.account).join(', ')}
+          return (
+            <div key={tt.id} className="border-b border-border">
+              {/* Clickable summary row: flat hairline, one line. */}
+              <button
+                type="button"
+                onClick={() => setExpandedId(isExpanded ? null : tt.id)}
+                aria-expanded={isExpanded}
+                className="flex w-full items-center gap-3 px-1 py-3 text-left transition-colors duration-150 hover:bg-secondary/60"
+              >
+                <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-3 gap-y-1">
+                  <span className="truncate text-sm">{formatCounterpartyName(tt.counterparty_name)}</span>
+                  <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                    {isMultiLine ? (
+                      <span className="font-mono">
+                        {tt.line_pattern!.filter(lp => lp.type === 'business').map(lp => lp.account).join(', ')}
+                      </span>
+                    ) : (
+                      <span className="font-mono">
+                        {tt.debit_account}
+                        <span className="text-muted-foreground/50"> → </span>
+                        {tt.credit_account}
+                      </span>
+                    )}
+                    {tt.vat_treatment && (
+                      <span>· {VAT_LABELS[tt.vat_treatment] || tt.vat_treatment}</span>
+                    )}
+                    <span>· {t('times_count', { count: tt.occurrence_count })}</span>
+                    <span className={`tabular-nums ${confidenceColor(Number(tt.confidence))}`}>
+                      {Math.round(Number(tt.confidence) * 100)}%
+                    </span>
+                    <span>· {SOURCE_LABELS[tt.source] || tt.source}</span>
+                  </span>
+                </div>
+                <ChevronDown
+                  className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+                />
+              </button>
+
+              {/* Expanded detail */}
+              {isExpanded && (
+                <div className="space-y-3 px-1 pb-3">
+                  {/* Account lines */}
+                  <div>
+                    <p className="mb-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{t('booking_label')}</p>
+                    {isMultiLine ? (
+                      <div className="space-y-1">
+                        {tt.line_pattern!.map((lp, i) => (
+                          <div key={i} className="flex items-center gap-2 text-xs">
+                            <span className="w-14 shrink-0 text-[10px] uppercase tracking-wider text-muted-foreground">
+                              {lp.side === 'debit' ? t('debit_label') : t('credit_label')}
                             </span>
-                          ) : (
-                            <>
-                              <span className="font-mono">{t.debit_account}</span>
-                              <span className="text-muted-foreground/50">→</span>
-                              <span className="font-mono">{t.credit_account}</span>
-                            </>
-                          )}
-                          {t.vat_treatment && (
-                            <>
-                              <span className="text-muted-foreground/30">·</span>
-                              <span>{VAT_LABELS[t.vat_treatment] || t.vat_treatment}</span>
-                            </>
-                          )}
-                          <span className="text-muted-foreground/30">·</span>
-                          <span>{t.occurrence_count} ggr</span>
-                          <span className={`tabular-nums ${confidenceColor(Number(t.confidence))}`}>
-                            {Math.round(Number(t.confidence) * 100)}%
-                          </span>
-                        </div>
-                      </div>
-                      <ChevronDown className={`h-4 w-4 text-muted-foreground shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
-                    </button>
-
-                    {/* Expanded detail */}
-                    {isExpanded && (
-                      <div className="border-t bg-muted/30 px-4 py-3 space-y-3">
-                        {/* Account lines */}
-                        <div>
-                          <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5">Kontering</p>
-                          {isMultiLine ? (
-                            <div className="space-y-1">
-                              {t.line_pattern!.map((lp, i) => (
-                                <div key={i} className="flex items-center gap-2 text-xs">
-                                  <Badge variant="secondary" className="text-[10px] px-1.5 py-0 w-14 justify-center">
-                                    {lp.side === 'debit' ? 'Debet' : 'Kredit'}
-                                  </Badge>
-                                  <span className="font-mono">{formatAccountWithName(lp.account)}</span>
-                                  {lp.type === 'vat' && lp.vat_rate && (
-                                    <span className="text-muted-foreground">({Math.round(lp.vat_rate * 100)}% moms)</span>
-                                  )}
-                                  {lp.ratio !== undefined && (
-                                    <span className="text-muted-foreground">({Math.round(lp.ratio * 100)}%)</span>
-                                  )}
-                                </div>
-                              ))}
-                            </div>
-                          ) : (
-                            <div className="space-y-1">
-                              <div className="flex items-center gap-2 text-xs">
-                                <Badge variant="secondary" className="text-[10px] px-1.5 py-0 w-14 justify-center">Debet</Badge>
-                                <span className="font-mono">{formatAccountWithName(t.debit_account)}</span>
-                              </div>
-                              <div className="flex items-center gap-2 text-xs">
-                                <Badge variant="secondary" className="text-[10px] px-1.5 py-0 w-14 justify-center">Kredit</Badge>
-                                <span className="font-mono">{formatAccountWithName(t.credit_account)}</span>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Metadata */}
-                        <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs">
-                          {t.vat_treatment && (
-                            <div className="flex justify-between">
-                              <span className="text-muted-foreground">Moms</span>
-                              <span>{VAT_LABELS[t.vat_treatment] || t.vat_treatment}</span>
-                            </div>
-                          )}
-                          <div className="flex justify-between">
-                            <span className="text-muted-foreground">Antal bokföringar</span>
-                            <span className="tabular-nums">{t.occurrence_count}</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-muted-foreground">Säkerhet</span>
-                            <span className={`tabular-nums ${confidenceColor(Number(t.confidence))}`}>
-                              {Math.round(Number(t.confidence) * 100)}%
-                            </span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-muted-foreground">Senast använd</span>
-                            <span>{formatDate(t.last_seen_date)}</span>
-                          </div>
-                          {t.counterparty_aliases && t.counterparty_aliases.length > 1 && (
-                            <div className="col-span-2 flex justify-between">
-                              <span className="text-muted-foreground">Alias</span>
-                              <span className="text-right truncate ml-4">{t.counterparty_aliases.slice(0, 3).join(', ')}{t.counterparty_aliases.length > 3 ? ` +${t.counterparty_aliases.length - 3}` : ''}</span>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Delete */}
-                        <div className="flex justify-end pt-1">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleDelete(t.id)}
-                            disabled={deletingId === t.id}
-                            className="text-destructive hover:text-destructive text-xs h-7"
-                          >
-                            {deletingId === t.id ? (
-                              <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />
-                            ) : (
-                              <Trash2 className="mr-1.5 h-3 w-3" />
+                            <span className="font-mono">{formatAccountWithName(lp.account)}</span>
+                            {lp.type === 'vat' && lp.vat_rate && (
+                              <span className="text-muted-foreground">{t('vat_paren', { rate: Math.round(lp.vat_rate * 100) })}</span>
                             )}
-                            Ta bort mall
-                          </Button>
+                            {lp.ratio !== undefined && (
+                              <span className="text-muted-foreground">({Math.round(lp.ratio * 100)}%)</span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2 text-xs">
+                          <span className="w-14 shrink-0 text-[10px] uppercase tracking-wider text-muted-foreground">{t('debit_label')}</span>
+                          <span className="font-mono">{formatAccountWithName(tt.debit_account)}</span>
+                        </div>
+                        <div className="flex items-center gap-2 text-xs">
+                          <span className="w-14 shrink-0 text-[10px] uppercase tracking-wider text-muted-foreground">{t('credit_label')}</span>
+                          <span className="font-mono">{formatAccountWithName(tt.credit_account)}</span>
                         </div>
                       </div>
                     )}
                   </div>
-                )
-              })}
+
+                  {/* Metadata */}
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs">
+                    {tt.vat_treatment && (
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">{t('vat_label')}</span>
+                        <span>{VAT_LABELS[tt.vat_treatment] || tt.vat_treatment}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">{t('occurrence_count_label')}</span>
+                      <span className="tabular-nums">{tt.occurrence_count}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">{t('confidence_label')}</span>
+                      <span className={`tabular-nums ${confidenceColor(Number(tt.confidence))}`}>
+                        {Math.round(Number(tt.confidence) * 100)}%
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">{t('last_seen_label')}</span>
+                      <span>{formatDate(tt.last_seen_date)}</span>
+                    </div>
+                    {tt.counterparty_aliases && tt.counterparty_aliases.length > 1 && (
+                      <div className="col-span-2 flex justify-between">
+                        <span className="text-muted-foreground">{t('aliases_label')}</span>
+                        <span className="ml-4 truncate text-right">{tt.counterparty_aliases.slice(0, 3).join(', ')}{tt.counterparty_aliases.length > 3 ? ` +${tt.counterparty_aliases.length - 3}` : ''}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Rename + delete */}
+                  {editingId === tt.id ? (
+                    <form
+                      className="flex items-center gap-2 pt-1"
+                      onSubmit={(e) => {
+                        e.preventDefault()
+                        handleRename(tt.id)
+                      }}
+                    >
+                      <Input
+                        value={editName}
+                        onChange={(e) => setEditName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') cancelRename()
+                        }}
+                        maxLength={100}
+                        autoFocus
+                        aria-label={t('rename_label')}
+                        className="h-8 max-w-xs text-sm"
+                      />
+                      <Button
+                        type="submit"
+                        size="sm"
+                        disabled={savingId === tt.id || editName.trim().length < 2}
+                        className="h-7 text-xs"
+                      >
+                        {savingId === tt.id ? <Loader2 className="mr-1.5 h-3 w-3 animate-spin" /> : null}
+                        {t('rename_save')}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={cancelRename}
+                        disabled={savingId === tt.id}
+                        className="h-7 text-xs"
+                      >
+                        {t('rename_cancel')}
+                      </Button>
+                    </form>
+                  ) : (
+                  <div className="flex justify-end gap-2 pt-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => startRename(tt)}
+                      disabled={deletingId === tt.id}
+                      className="h-7 text-xs"
+                    >
+                      <Pencil className="mr-1.5 h-3 w-3" />
+                      {t('rename_button')}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleDelete(tt.id)}
+                      disabled={deletingId === tt.id}
+                      className="h-7 text-xs text-destructive hover:text-destructive"
+                    >
+                      {deletingId === tt.id ? (
+                        <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />
+                      ) : (
+                        <Trash2 className="mr-1.5 h-3 w-3" />
+                      )}
+                      {t('delete_button')}
+                    </Button>
+                  </div>
+                  )}
+                </div>
+              )}
             </div>
-          )}
-        </CardContent>
-      </Card>
-    </div>
+          )
+        })
+      )}
+    </SettingsGroup>
   )
 }
